@@ -32,11 +32,11 @@ router.post('/apply', async (req, res) => {
   if (!b.name || !b.owner_email) return res.status(400).json({ error: 'Store name and owner email are required' });
   const id = uuid();
   const samePerson = !!b.same_person;
-  db.prepare(`INSERT INTO stores (id, org_id, name, address, city, state, zip, phone, manager_name, manager_phone, manager_email,
+  db.prepare(`INSERT INTO stores (id, org_id, name, address, city, state, zip, phone, pos_system, manager_name, manager_phone, manager_email,
       owner_name, owner_phone, owner_email, same_person, comments, setup_status, has_provider_account, source)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,'pending',?, 'application')`)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,'pending',?, 'application')`)
     .run(id, orgId, b.name, b.address || '', b.city || '', b.state || '', b.zip || '',
-      normalizePhone(b.phone || ''),
+      normalizePhone(b.phone || ''), b.pos_system || '',
       samePerson ? b.owner_name || '' : b.manager_name || '', samePerson ? normalizePhone(b.owner_phone || '') : normalizePhone(b.manager_phone || ''), samePerson ? b.owner_email || '' : b.manager_email || '',
       b.owner_name || '', normalizePhone(b.owner_phone || ''), b.owner_email, samePerson ? 1 : 0,
       b.comments || '', b.has_provider_account ? 1 : 0);
@@ -179,10 +179,10 @@ router.post('/', requirePermission('stores', 'can_edit'), (req, res) => {
     if (!isValidPhone(b[f])) return res.status(400).json({ error: `${label} must be a valid phone number (10 digits, or 11 digits starting with 1)` });
   }
   const id = uuid();
-  db.prepare(`INSERT INTO stores (id, org_id, name, address, city, state, zip, phone, manager_name, manager_phone, manager_email,
+  db.prepare(`INSERT INTO stores (id, org_id, name, address, city, state, zip, phone, pos_system, manager_name, manager_phone, manager_email,
       owner_name, owner_phone, owner_email, same_person, comments, setup_status, has_provider_account)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?)`)
-    .run(id, req.user.org_id, b.name, b.address || '', b.city || '', b.state || '', b.zip || '', normalizePhone(b.phone || ''),
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?)`)
+    .run(id, req.user.org_id, b.name, b.address || '', b.city || '', b.state || '', b.zip || '', normalizePhone(b.phone || ''), b.pos_system || '',
       b.manager_name || '', normalizePhone(b.manager_phone || ''), b.manager_email || '', b.owner_name || '', normalizePhone(b.owner_phone || ''), b.owner_email || '',
       b.same_person ? 1 : 0, b.comments || '', b.setup_status || 'pending', b.has_provider_account ? 1 : 0);
   const store = db.prepare('SELECT * FROM stores WHERE id = ?').get(id);
@@ -193,7 +193,7 @@ router.post('/', requirePermission('stores', 'can_edit'), (req, res) => {
 router.put('/:id', requirePermission('stores', 'can_edit'), (req, res) => {
   const store = db.prepare('SELECT * FROM stores WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!store) return res.status(404).json({ error: 'Not found' });
-  const fields = ['name','address','city','state','zip','phone','manager_name','manager_phone','manager_email','owner_name','owner_phone','owner_email','same_person','comments','setup_status','has_provider_account','provider_store_id'];
+  const fields = ['name','address','city','state','zip','phone','pos_system','manager_name','manager_phone','manager_email','owner_name','owner_phone','owner_email','same_person','comments','setup_status','has_provider_account','provider_store_id'];
   const b = req.body || {};
   if (b.phone !== undefined) b.phone = normalizePhone(b.phone);
   if (b.manager_phone !== undefined) b.manager_phone = normalizePhone(b.manager_phone);
