@@ -1,5 +1,6 @@
 import { db, uuid } from '../db.js';
 import { SHUL_APPLICATION_SCHEMA } from './builtinSchemas.js';
+import { isValidPhone } from './phone.js';
 
 // 'header'/'image' are presentational blocks in a form's schema, not real
 // inputs — never required, never validated.
@@ -42,6 +43,12 @@ export function validateBySchema(schema, values, { isAdmin = false } = {}) {
         if (f.min !== undefined && f.min !== null && f.min !== '' && n < +f.min) errors.push(`${f.label || f.key} must be at least ${f.min}`);
         if (f.max !== undefined && f.max !== null && f.max !== '' && n > +f.max) errors.push(`${f.label || f.key} must be at most ${f.max}`);
       }
+    }
+    // Spaces/dashes/parens are still ignored (isValidPhone strips them
+    // before counting) — this only rejects a number that isn't 10 digits,
+    // or 11 digits with a leading country code 1.
+    if (f.type === 'tel' && !empty && !overridable && !isValidPhone(raw)) {
+      errors.push(`${f.label || f.key} must be a valid phone number (10 digits, or 11 digits starting with 1)`);
     }
   }
   return errors;

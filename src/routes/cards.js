@@ -5,7 +5,7 @@ import { requirePermission, redact } from '../middleware/permissions.js';
 import * as giftcard from '../services/giftcard.js';
 import { sendXlsx } from '../services/xlsx.js';
 import { syncOneCard, syncAllCards } from '../services/cardSync.js';
-import { normalizePhone } from '../utils/phone.js';
+import { normalizePhone, isValidPhone } from '../utils/phone.js';
 
 const router = Router();
 router.use(auth, requirePermission('cards'));
@@ -136,6 +136,7 @@ router.post('/:id/activate', requirePermission('cards', 'can_edit'), async (req,
   if (!card) return res.status(404).json({ error: 'Not found' });
   const { phone } = req.body || {};
   if (!phone) return res.status(400).json({ error: 'Activation phone number is required' });
+  if (!isValidPhone(phone)) return res.status(400).json({ error: 'Activation phone number must be a valid phone number (10 digits, or 11 digits starting with 1)' });
   let result;
   try {
     result = await giftcard.activateCard(card.season_id, { providerCardId: card.provider_card_id, phone });

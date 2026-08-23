@@ -9,7 +9,7 @@ import { sendSmsChecked } from '../services/sms.js';
 import * as giftcard from '../services/giftcard.js';
 import { parseSpreadsheet, buildXlsxTemplate, APPLICANT_IMPORT_COLUMNS } from '../services/importer.js';
 import { sendXlsx } from '../services/xlsx.js';
-import { normalizePhone } from '../utils/phone.js';
+import { normalizePhone, isValidPhone } from '../utils/phone.js';
 import { generateApplicantExternalId } from '../utils/externalId.js';
 import { getOrCreateEzrasHabayisShul } from '../utils/ezrasHabayis.js';
 import { getActiveSeasonId } from '../utils/formSchedule.js';
@@ -392,6 +392,9 @@ router.put('/:id', requirePermission('applicants', 'can_edit'), async (req, res)
   if (b.home_phone !== undefined) b.home_phone = normalizePhone(b.home_phone);
   if (b.husband_cell !== undefined) b.husband_cell = normalizePhone(b.husband_cell);
   if (b.wife_cell !== undefined) b.wife_cell = normalizePhone(b.wife_cell);
+  for (const [f, label] of [['home_phone', 'Home Phone'], ['husband_cell', 'Husband Cell'], ['wife_cell', 'Wife Cell']]) {
+    if (!isValidPhone(b[f])) return res.status(400).json({ error: `${label} must be a valid phone number (10 digits, or 11 digits starting with 1)` });
+  }
   if (b.shul_id !== undefined) {
     const targetShul = db.prepare('SELECT id, name_en, season_id FROM shuls WHERE id = ? AND org_id = ?').get(b.shul_id, req.user.org_id);
     if (!targetShul) return res.status(400).json({ error: 'Shul not found' });
@@ -955,7 +958,16 @@ router.post('/import', requirePermission('applicants', 'can_edit'), upload.singl
     .filter(e => !rowExisting[e.row - 2]);
   const shulNameErrors = forcedShul ? [] : rows.map((r, i) => (!rowExisting[i] && !r.shul_name) ? { row: i + 2, error: 'Missing required field: shul_name' } : null).filter(Boolean);
   const idNotFoundErrors = rows.map((r, i) => (r.id && String(r.id).trim() && !rowExisting[i]) ? { row: i + 2, error: `No existing applicant found with id "${r.id}"` } : null).filter(Boolean);
-  const requiredErrors = [...schemaErrors, ...shulNameErrors, ...idNotFoundErrors].sort((a, b) => a.row - b.row);
+  // Update rows (matched by id) skip validateRowsBySchema entirely (see
+  // rowExisting above) since a blank cell there means "leave alone," not
+  // "missing" — but a non-blank phone cell still has to be a real phone
+  // number, so that one check runs separately here.
+  const updatePhoneErrors = rows.map((r, i) => {
+    if (!rowExisting[i]) return null;
+    const bad = [['home_phone', 'Home Phone'], ['husband_cell', 'Husband Cell'], ['wife_cell', 'Wife Cell']].find(([f]) => r[f] && !isValidPhone(r[f]));
+    return bad ? { row: i + 2, error: `${bad[1]} must be a valid phone number (10 digits, or 11 digits starting with 1)` } : null;
+  }).filter(Boolean);
+  const requiredErrors = [...schemaErrors, ...shulNameErrors, ...idNotFoundErrors, ...updatePhoneErrors].sort((a, b) => a.row - b.row);
   if (requiredErrors.length) {
     return res.status(400).json({ error: 'Some rows have errors. Nothing was imported — fix the sheet and re-upload.', errors: requiredErrors });
   }

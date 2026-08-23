@@ -143,7 +143,7 @@ const MASS_ACTIONS = {
       if (slots === null) return null;
       return api('/shuls/mass-approve', { method: 'POST', body: { ids, slots_allocated: +slots } });
     },
-    summarize: r => { let msg = `Approved ${r.approved}, skipped ${r.skipped} (paused)`; if (r.emailErrors) msg += ` — ${r.emailErrors} account setup email(s) failed to send`; return { msg, isError: !!r.emailErrors }; },
+    summarize: r => { let msg = `Approved ${r.approved}, skipped ${r.skipped} (paused, or contract not yet sent)`; if (r.emailErrors) msg += ` — ${r.emailErrors} account setup email(s) failed to send`; return { msg, isError: !!r.emailErrors }; },
   },
   reject: {
     confirm: n => `Reject ${n} selected shul(s)?`,
@@ -355,7 +355,17 @@ window.approveShul = async (id) => {
     const r = await api(`/shuls/${id}/approve`, { method: 'POST', body: { slots_allocated: +slots } });
     toast(r.emailError ? `Shul approved, but the account setup email failed to send: ${r.emailError}` : 'Shul approved. Account setup email sent.', !!r.emailError);
     closeModal(); load();
-  } catch (err) { toast(err.message, true); }
+  } catch (err) {
+    if (err.data?.code === 'CONTRACT_NOT_SENT' && confirm(`${err.message}\n\nClick OK to approve anyway without a contract on file (bypass).`)) {
+      try {
+        const r = await api(`/shuls/${id}/approve`, { method: 'POST', body: { slots_allocated: +slots, bypass_contract: true } });
+        toast(r.emailError ? `Shul approved, but the account setup email failed to send: ${r.emailError}` : 'Shul approved. Account setup email sent.', !!r.emailError);
+        closeModal(); load();
+      } catch (err2) { toast(err2.message, true); }
+      return;
+    }
+    toast(err.message, true);
+  }
 };
 window.rejectShul = async (id) => { if (!confirm('Reject this shul application?')) return; try { await api(`/shuls/${id}/reject`, { method: 'POST' }); closeModal(); load(); } catch (err) { toast(err.message, true); } };
 window.setShulPending = async (id) => { try { await api(`/shuls/${id}/set-pending`, { method: 'POST' }); toast('Moved back to pending'); closeModal(); load(); } catch (err) { toast(err.message, true); } };

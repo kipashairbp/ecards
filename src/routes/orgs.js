@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { db, DEFAULT_ORG_ID } from '../db.js';
 import { auth } from '../middleware/auth.js';
 import { requirePermission } from '../middleware/permissions.js';
-import { normalizePhone } from '../utils/phone.js';
+import { normalizePhone, isValidPhone } from '../utils/phone.js';
 
 const router = Router();
 
@@ -54,6 +54,7 @@ router.put('/me', requirePermission('settings', 'can_edit'), (req, res) => {
   if (!org) return res.status(404).json({ error: 'Not found' });
   const f = req.body || {};
   if (f.support_phone !== undefined) f.support_phone = normalizePhone(f.support_phone);
+  if (!isValidPhone(f.support_phone)) return res.status(400).json({ error: 'Support Phone must be a valid phone number (10 digits, or 11 digits starting with 1)' });
   db.prepare(`UPDATE organizations SET name=COALESCE(?,name), logo_url=COALESCE(?,logo_url),
     primary_color=COALESCE(?,primary_color), accent_color=COALESCE(?,accent_color),
     support_email=COALESCE(?,support_email), support_phone=COALESCE(?,support_phone), address=COALESCE(?,address) WHERE id=?`)

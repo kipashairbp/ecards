@@ -9,7 +9,7 @@ import { sendMailChecked, renderSystemTemplate, notifyNewSignup } from '../servi
 import { sendSmsChecked } from '../services/sms.js';
 import { parseSpreadsheet, buildXlsxTemplate, SHUL_IMPORT_COLUMNS } from '../services/importer.js';
 import { sendXlsx } from '../services/xlsx.js';
-import { normalizePhone } from '../utils/phone.js';
+import { normalizePhone, isValidPhone } from '../utils/phone.js';
 import { getActiveSeasonId } from '../utils/formSchedule.js';
 import { validateBySchema, shulInfoErrors } from '../utils/formValidation.js';
 import { SHUL_APPLICATION_SCHEMA } from '../utils/builtinSchemas.js';
@@ -63,6 +63,20 @@ function shulLoginUrl(user) {
   const expires = new Date(Date.now() + 14 * 24 * 3600 * 1000).toISOString();
   db.prepare('UPDATE users SET invite_token = ?, invite_expires = ? WHERE id = ?').run(token, expires, user.id);
   return `${process.env.APP_URL || ''}/accept-invite?token=${token}`;
+}
+
+// When "Require signing during signup" is ON, /apply already generated the
+// contract automatically (see /:id/generate-contract) before an admin ever
+// gets to approve, so there's nothing to gate here. When it's OFF, nothing
+// generates a contract on its own — an admin has to click "Generate & Email
+// Contract" on the shul's own profile first. Approving before that ever
+// happens would let a shul into the program with no contract on file and no
+// prompt to fix it later, so approve blocks on it (bypassable) instead.
+function shulNeedsContractBeforeApproval(orgId, shul) {
+  const atSignup = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'shul_contract_at_signup'`).get(orgId)?.value !== '0';
+  if (atSignup) return false;
+  const contract = db.prepare('SELECT status FROM contracts WHERE shul_id = ? ORDER BY created_at DESC LIMIT 1').get(shul.id);
+  return !contract || !['sent', 'signed'].includes(contract.status);
 }
 
 // ============================= PUBLIC ==============================
@@ -514,6 +528,8 @@ router.post('/', requirePermission('shuls', 'can_edit'), (req, res) => {
   const b = req.body || {};
   if (b.ruv_phone !== undefined) b.ruv_phone = normalizePhone(b.ruv_phone);
   if (b.gabai_cell !== undefined) b.gabai_cell = normalizePhone(b.gabai_cell);
+  if (!isValidPhone(b.ruv_phone)) return res.status(400).json({ error: 'Rav Phone Number must be a valid phone number (10 digits, or 11 digits starting with 1)' });
+  if (!isValidPhone(b.gabai_cell)) return res.status(400).json({ error: 'Gabai Cell Number must be a valid phone number (10 digits, or 11 digits starting with 1)' });
   for (const f of REQUIRED_SHUL_FIELDS) if (!b[f]) return res.status(400).json({ error: `Missing required field: ${f}` });
   const id = uuid();
   const season = db.prepare('SELECT * FROM seasons WHERE org_id = ? AND is_active = 1 ORDER BY created_at DESC LIMIT 1').get(req.user.org_id);
@@ -544,6 +560,8 @@ router.put('/:id', (req, res) => {
   const b = req.body || {};
   if (b.ruv_phone !== undefined) b.ruv_phone = normalizePhone(b.ruv_phone);
   if (b.gabai_cell !== undefined) b.gabai_cell = normalizePhone(b.gabai_cell);
+  if (!isValidPhone(b.ruv_phone)) return res.status(400).json({ error: 'Rav Phone Number must be a valid phone number (10 digits, or 11 digits starting with 1)' });
+  if (!isValidPhone(b.gabai_cell)) return res.status(400).json({ error: 'Gabai Cell Number must be a valid phone number (10 digits, or 11 digits starting with 1)' });
   const fields = isSelf ? SHUL_SELF_EDITABLE_FIELDS : [...SHUL_SELF_EDITABLE_FIELDS, 'slots_allocated', 'permanent_comments', 'min_contribution_default'];
   const sets = fields.filter(f => b[f] !== undefined);
   if (sets.length) {
@@ -564,6 +582,9 @@ router.post('/:id/approve', requirePermission('shuls', 'can_edit'), async (req, 
   if (shul.is_paused) return res.status(423).json({ error: 'This shul has an unresolved duplicate flag and cannot be approved yet' });
   const slots = req.body?.slots_allocated;
   if (slots === undefined || slots === null) return res.status(400).json({ error: 'slots_allocated is required to approve' });
+  if (!req.body?.bypass_contract && shulNeedsContractBeforeApproval(req.user.org_id, shul)) {
+    return res.status(400).json({ error: "This shul's contract isn't required at signup and hasn't been sent yet. Send it from the Contract tab before approving, or bypass to skip the requirement.", code: 'CONTRACT_NOT_SENT' });
+  }
 
   let user = ensureShulPortalUser(req.user.org_id, shul, req.body.portal_email);
   db.prepare(`UPDATE shuls SET status='approved', slots_allocated=?, portal_user_id=?, updated_at=datetime('now') WHERE id=?`)
@@ -625,13 +646,14 @@ router.post('/mass-reject', requirePermission('shuls', 'can_edit'), (req, res) =
 // practical for a bulk action). Paused shuls (unresolved duplicate flag,
 // same rule as the single-shul approve route) are skipped, not blocked.
 router.post('/mass-approve', requirePermission('shuls', 'can_edit'), async (req, res) => {
-  const { ids, slots_allocated } = req.body || {};
+  const { ids, slots_allocated, bypass_contract } = req.body || {};
   if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids array required' });
   if (slots_allocated === undefined || slots_allocated === null) return res.status(400).json({ error: 'slots_allocated is required to approve' });
   let approved = 0, skipped = 0, emailErrors = 0; const affectedIds = [], names = [];
   for (const id of ids) {
     const shul = db.prepare('SELECT * FROM shuls WHERE id = ? AND org_id = ?').get(id, req.user.org_id);
     if (!shul || shul.is_paused) { skipped++; continue; }
+    if (!bypass_contract && shulNeedsContractBeforeApproval(req.user.org_id, shul)) { skipped++; continue; }
     let user = ensureShulPortalUser(req.user.org_id, shul, null);
     db.prepare(`UPDATE shuls SET status='approved', slots_allocated=?, portal_user_id=?, updated_at=datetime('now') WHERE id=?`)
       .run(slots_allocated, user.id, shul.id);
@@ -933,7 +955,15 @@ router.post('/import', requirePermission('shuls', 'can_edit'), upload.single('fi
   const idNotFoundErrors = rows
     .map((r, i) => (r.id && String(r.id).trim() && !rowExisting[i]) ? { row: i + 2, error: `No existing shul found with id "${r.id}"` } : null)
     .filter(Boolean);
-  const allErrors = [...requiredErrors, ...idNotFoundErrors].sort((a, b) => a.row - b.row);
+  // Update rows skip validateBySchema entirely (see rowExisting above) — a
+  // blank cell there means "leave alone," not "missing" — but a non-blank
+  // phone cell still has to be a real phone number.
+  const updatePhoneErrors = rows.map((r, i) => {
+    if (!rowExisting[i]) return null;
+    const bad = [['ruv_phone', 'Rav Phone Number'], ['gabai_cell', 'Gabai Cell Number']].find(([f]) => r[f] && !isValidPhone(r[f]));
+    return bad ? { row: i + 2, error: `${bad[1]} must be a valid phone number (10 digits, or 11 digits starting with 1)` } : null;
+  }).filter(Boolean);
+  const allErrors = [...requiredErrors, ...idNotFoundErrors, ...updatePhoneErrors].sort((a, b) => a.row - b.row);
   if (allErrors.length) {
     return res.status(400).json({ error: 'Some rows have errors. Nothing was imported — fix the sheet and re-upload.', errors: allErrors });
   }

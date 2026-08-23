@@ -7,7 +7,7 @@ import { auth, requireAdmin } from '../middleware/auth.js';
 import { requirePermission, redact } from '../middleware/permissions.js';
 import { sendMailChecked, renderSystemTemplate, notifyNewSignup } from '../services/mail.js';
 import { sendXlsx } from '../services/xlsx.js';
-import { normalizePhone } from '../utils/phone.js';
+import { normalizePhone, isValidPhone } from '../utils/phone.js';
 import { validateBySchema } from '../utils/formValidation.js';
 import { STORE_APPLICATION_SCHEMA } from '../utils/builtinSchemas.js';
 import { logAudit, logMassAudit, getEntityHistory } from '../services/audit.js';
@@ -175,6 +175,9 @@ router.get('/:id/season-history', requireAdmin, (req, res) => {
 router.post('/', requirePermission('stores', 'can_edit'), (req, res) => {
   const b = req.body || {};
   if (!b.name) return res.status(400).json({ error: 'Store name is required' });
+  for (const [f, label] of [['phone', 'Store Phone'], ['manager_phone', 'Manager Phone'], ['owner_phone', 'Owner Phone']]) {
+    if (!isValidPhone(b[f])) return res.status(400).json({ error: `${label} must be a valid phone number (10 digits, or 11 digits starting with 1)` });
+  }
   const id = uuid();
   db.prepare(`INSERT INTO stores (id, org_id, name, address, city, state, zip, phone, manager_name, manager_phone, manager_email,
       owner_name, owner_phone, owner_email, same_person, comments, setup_status, has_provider_account)
@@ -195,6 +198,9 @@ router.put('/:id', requirePermission('stores', 'can_edit'), (req, res) => {
   if (b.phone !== undefined) b.phone = normalizePhone(b.phone);
   if (b.manager_phone !== undefined) b.manager_phone = normalizePhone(b.manager_phone);
   if (b.owner_phone !== undefined) b.owner_phone = normalizePhone(b.owner_phone);
+  for (const [f, label] of [['phone', 'Store Phone'], ['manager_phone', 'Manager Phone'], ['owner_phone', 'Owner Phone']]) {
+    if (!isValidPhone(b[f])) return res.status(400).json({ error: `${label} must be a valid phone number (10 digits, or 11 digits starting with 1)` });
+  }
   const sets = fields.filter(f => b[f] !== undefined);
   if (sets.length) {
     const vals = sets.map(f => (f === 'has_provider_account' || f === 'same_person') ? (b[f] ? 1 : 0) : b[f]);
@@ -291,22 +297,39 @@ async function inviteStoreToPortal(orgId, store, emailOverride, sentBy = null) {
   return { emailError };
 }
 
+// When "Require signing during signup" is ON, a store signs its agreement
+// itself as part of applying (POST /documents/store-agreement), so there's
+// nothing to gate here by the time an admin invites them. When it's OFF,
+// nothing sends an agreement automatically — an admin has to send one from
+// the store's own Documents tab first, same requirement as shuls have for
+// their contract before approval.
+function storeNeedsAgreementBeforeInvite(orgId, store) {
+  const atSignup = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'store_contract_at_signup'`).get(orgId)?.value !== '0';
+  if (atSignup) return false;
+  const doc = db.prepare(`SELECT status FROM documents WHERE org_id = ? AND entity_type = 'store' AND entity_id = ? ORDER BY created_at DESC LIMIT 1`).get(orgId, store.id);
+  return !doc || !['sent', 'signed'].includes(doc.status);
+}
+
 // Invite a store to their self-service portal.
 router.post('/:id/invite', requirePermission('stores', 'can_edit'), async (req, res) => {
   const store = db.prepare('SELECT * FROM stores WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!store) return res.status(404).json({ error: 'Not found' });
+  if (!req.body?.bypass_contract && storeNeedsAgreementBeforeInvite(req.user.org_id, store)) {
+    return res.status(400).json({ error: "This store's agreement isn't required at signup and hasn't been sent yet. Send it from the Documents tab before inviting, or bypass to skip the requirement.", code: 'CONTRACT_NOT_SENT' });
+  }
   const result = await inviteStoreToPortal(req.user.org_id, store, req.body?.email, req.user.id);
   if (result.error) return res.status(400).json({ error: result.error });
   res.json({ ok: true, emailError: result.emailError });
 });
 
 router.post('/mass-invite', requirePermission('stores', 'can_edit'), async (req, res) => {
-  const { ids } = req.body || {};
+  const { ids, bypass_contract } = req.body || {};
   if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids array required' });
   let invited = 0, skipped = 0, emailErrors = 0;
   for (const id of ids) {
     const store = db.prepare('SELECT * FROM stores WHERE id = ? AND org_id = ?').get(id, req.user.org_id);
     if (!store) { skipped++; continue; }
+    if (!bypass_contract && storeNeedsAgreementBeforeInvite(req.user.org_id, store)) { skipped++; continue; }
     const result = await inviteStoreToPortal(req.user.org_id, store, null, req.user.id);
     if (result.error) { skipped++; continue; }
     if (result.emailError) emailErrors++;
@@ -329,6 +352,9 @@ router.put('/:id/onboarding', (req, res) => {
     if (info.phone !== undefined) info.phone = normalizePhone(info.phone);
     if (info.manager_phone !== undefined) info.manager_phone = normalizePhone(info.manager_phone);
     if (info.owner_phone !== undefined) info.owner_phone = normalizePhone(info.owner_phone);
+    for (const [f, label] of [['phone', 'Store Phone'], ['manager_phone', 'Manager Phone'], ['owner_phone', 'Owner Phone']]) {
+      if (!isValidPhone(info[f])) return res.status(400).json({ error: `${label} must be a valid phone number (10 digits, or 11 digits starting with 1)` });
+    }
     const fields = ['name', 'address', 'city', 'state', 'zip', 'phone', 'manager_name', 'manager_phone', 'manager_email', 'owner_name', 'owner_phone', 'owner_email'];
     const sets = fields.filter(f => info[f] !== undefined);
     if (sets.length) db.prepare(`UPDATE stores SET ${sets.map(f => `${f}=?`).join(',')} WHERE id=?`).run(...sets.map(f => info[f]), store.id);

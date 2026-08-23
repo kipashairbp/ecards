@@ -73,7 +73,7 @@ const MASS_ACTIONS = {
   invite: {
     confirm: n => `Invite ${n} selected store(s) to their portal? Each uses their owner or manager email on file.`,
     run: (ids) => api('/stores/mass-invite', { method: 'POST', body: { ids } }),
-    summarize: r => { let msg = `Invited ${r.invited}, skipped ${r.skipped}`; if (r.emailErrors) msg += ` — ${r.emailErrors} invite email(s) failed to send`; return { msg, isError: !!r.emailErrors }; },
+    summarize: r => { let msg = `Invited ${r.invited}, skipped ${r.skipped} (no email on file, or agreement not yet sent)`; if (r.emailErrors) msg += ` — ${r.emailErrors} invite email(s) failed to send`; return { msg, isError: !!r.emailErrors }; },
   },
   delete: {
     confirm: n => `Permanently delete ${n} selected store(s)? This removes each store and its billing records completely and cannot be undone.`,
@@ -168,7 +168,21 @@ window.saveStore = async (id) => {
   if (body.same_person) { body.manager_name = body.owner_name; body.manager_phone = body.owner_phone; body.manager_email = body.owner_email; }
   try { await api(`/stores/${id}`, { method: 'PUT', body }); toast('Saved'); closeModal(); load(); } catch (err) { toast(err.message, true); }
 };
-window.inviteStore = async (id) => { try { const r = await api(`/stores/${id}/invite`, { method: 'POST' }); toast(r.emailError ? `Invite created, but email failed: ${r.emailError}` : 'Invite sent', !!r.emailError); } catch (err) { toast(err.message, true); } };
+window.inviteStore = async (id) => {
+  try {
+    const r = await api(`/stores/${id}/invite`, { method: 'POST' });
+    toast(r.emailError ? `Invite created, but email failed: ${r.emailError}` : 'Invite sent', !!r.emailError);
+  } catch (err) {
+    if (err.data?.code === 'CONTRACT_NOT_SENT' && confirm(`${err.message}\n\nClick OK to invite anyway without an agreement on file (bypass).`)) {
+      try {
+        const r = await api(`/stores/${id}/invite`, { method: 'POST', body: { bypass_contract: true } });
+        toast(r.emailError ? `Invite created, but email failed: ${r.emailError}` : 'Invite sent', !!r.emailError);
+      } catch (err2) { toast(err2.message, true); }
+      return;
+    }
+    toast(err.message, true);
+  }
+};
 window.deleteStore = async (id) => {
   if (!confirm('Permanently delete this store? This removes the store and its billing records completely and cannot be undone.')) return;
   try { await api(`/stores/${id}/permanent`, { method: 'DELETE' }); toast('Store deleted'); closeModal(); load(); } catch (err) { toast(err.message, true); }

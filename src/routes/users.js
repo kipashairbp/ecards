@@ -4,7 +4,7 @@ import { db, uuid } from '../db.js';
 import { auth, requireRole } from '../middleware/auth.js';
 import { assign, unassign, PERMISSION_RESOURCES } from '../middleware/permissions.js';
 import { sendMailChecked, renderSystemTemplate } from '../services/mail.js';
-import { normalizePhone } from '../utils/phone.js';
+import { normalizePhone, isValidPhone } from '../utils/phone.js';
 import { logAudit, logMassAudit } from '../services/audit.js';
 
 const router = Router();
@@ -62,6 +62,7 @@ router.post('/', async (req, res) => {
   // Granting super_admin is itself an act of controlling a super_admin
   // account (a brand new one) — only an existing super_admin can create one.
   if (role === 'super_admin' && req.user.role !== 'super_admin') return res.status(403).json({ error: 'Only a super admin can create another super admin account' });
+  if (!isValidPhone(phone)) return res.status(400).json({ error: 'Phone must be a valid phone number (10 digits, or 11 digits starting with 1)' });
   if (db.prepare('SELECT 1 FROM users WHERE email = ?').get(email)) return res.status(409).json({ error: 'A user with this email already exists' });
   const id = uuid();
   const token = uuid();
@@ -83,6 +84,7 @@ router.put('/:id', (req, res) => {
   if (!user) return res.status(404).json({ error: 'Not found' });
   if (!canManageTarget(req.user, user.role)) return res.status(403).json({ error: 'A super admin account can only be managed by another super admin' });
   const { first_name, last_name, phone, role, is_active, permissions, assignments } = req.body || {};
+  if (phone !== undefined && !isValidPhone(phone)) return res.status(400).json({ error: 'Phone must be a valid phone number (10 digits, or 11 digits starting with 1)' });
   // Self-service on name/phone/active is fine, but a user granting themselves
   // more access — either directly via their own permissions rows, or in one
   // shot by reassigning their own role — is a privilege-escalation path this
