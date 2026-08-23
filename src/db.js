@@ -367,6 +367,7 @@ CREATE TABLE IF NOT EXISTS card_transactions (
 CREATE TABLE IF NOT EXISTS stores (
   id TEXT PRIMARY KEY,
   org_id TEXT NOT NULL REFERENCES organizations(id),
+  season_id TEXT REFERENCES seasons(id), -- stores are season-scoped like shuls; see Carry Forward
   name TEXT NOT NULL,
   address TEXT, city TEXT, state TEXT, zip TEXT, place_id TEXT,
   phone TEXT,
@@ -589,6 +590,7 @@ safeAlter(`ALTER TABLE stores ADD COLUMN onboarding_completed_at TEXT`);
 safeAlter(`ALTER TABLE stores ADD COLUMN agreed_terms_at TEXT`);
 safeAlter(`ALTER TABLE stores ADD COLUMN same_person INTEGER DEFAULT 0`);
 safeAlter(`ALTER TABLE stores ADD COLUMN pos_system TEXT`);
+safeAlter(`ALTER TABLE stores ADD COLUMN season_id TEXT REFERENCES seasons(id)`);
 safeAlter(`ALTER TABLE seasons ADD COLUMN max_accepted_applicants INTEGER`);
 safeAlter(`ALTER TABLE shuls ADD COLUMN is_locked INTEGER DEFAULT 0`);
 safeAlter(`ALTER TABLE applicants ADD COLUMN external_id TEXT`);

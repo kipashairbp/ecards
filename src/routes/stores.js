@@ -14,9 +14,12 @@ import { logAudit, logMassAudit, getEntityHistory } from '../services/audit.js';
 import { deletePolymorphicRefs } from '../utils/entityDelete.js';
 import { generateGenericDocumentPdf } from '../services/pdf.js';
 import { resolveEntity } from './documents.js';
+import { getActiveSeasonId } from '../utils/formSchedule.js';
+import { parseSpreadsheet, buildXlsxTemplate, STORE_IMPORT_COLUMNS } from '../services/importer.js';
 
 const router = Router();
 const billUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 const BILLS_DIR = join(DATA_DIR, 'store-bills');
 
 // Public: store self-application (mirrors the shul public form) — spec #9 says
@@ -32,10 +35,10 @@ router.post('/apply', async (req, res) => {
   if (!b.name || !b.owner_email) return res.status(400).json({ error: 'Store name and owner email are required' });
   const id = uuid();
   const samePerson = !!b.same_person;
-  db.prepare(`INSERT INTO stores (id, org_id, name, address, city, state, zip, phone, pos_system, manager_name, manager_phone, manager_email,
+  db.prepare(`INSERT INTO stores (id, org_id, season_id, name, address, city, state, zip, phone, pos_system, manager_name, manager_phone, manager_email,
       owner_name, owner_phone, owner_email, same_person, comments, setup_status, has_provider_account, source)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,'pending',?, 'application')`)
-    .run(id, orgId, b.name, b.address || '', b.city || '', b.state || '', b.zip || '',
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,'pending',?, 'application')`)
+    .run(id, orgId, getActiveSeasonId(orgId), b.name, b.address || '', b.city || '', b.state || '', b.zip || '',
       normalizePhone(b.phone || ''), b.pos_system || '',
       samePerson ? b.owner_name || '' : b.manager_name || '', samePerson ? normalizePhone(b.owner_phone || '') : normalizePhone(b.manager_phone || ''), samePerson ? b.owner_email || '' : b.manager_email || '',
       b.owner_name || '', normalizePhone(b.owner_phone || ''), b.owner_email, samePerson ? 1 : 0,
@@ -107,9 +110,10 @@ function scopeWhere(req) {
 }
 
 router.get('/', (req, res) => {
-  const { search, setup_status } = req.query;
+  const { search, setup_status, season_id } = req.query;
   let { where, params } = scopeWhere(req);
   if (setup_status) { where += ' AND setup_status = ?'; params.push(setup_status); }
+  if (season_id) { where += ' AND season_id = ?'; params.push(season_id); }
   if (search) { where += ' AND (name LIKE ? OR city LIKE ?)'; params.push(`%${search}%`, `%${search}%`); }
   const stores = db.prepare(`SELECT * FROM stores ${where} ORDER BY created_at DESC`).all(...params);
   // Live spend per store — computed fresh on every request from the synced
@@ -123,9 +127,10 @@ router.get('/', (req, res) => {
 
 // Full-detail CSV export — every field. Must be registered before /:id.
 router.get('/export', requirePermission('stores', 'can_export'), (req, res) => {
-  const { search, setup_status } = req.query;
+  const { search, setup_status, season_id } = req.query;
   let { where, params } = scopeWhere(req);
   if (setup_status) { where += ' AND setup_status = ?'; params.push(setup_status); }
+  if (season_id) { where += ' AND season_id = ?'; params.push(season_id); }
   if (search) { where += ' AND (name LIKE ? OR city LIKE ?)'; params.push(`%${search}%`, `%${search}%`); }
   const stores = db.prepare(`SELECT * FROM stores ${where} ORDER BY created_at DESC`).all(...params);
   const withSpend = stores.map(s => {
@@ -157,19 +162,20 @@ router.get('/:id/history', requireAdmin, (req, res) => {
   res.json({ history: getEntityHistory(req.user.org_id, 'store', store.id) });
 });
 
-// Stores are one persistent record reused every season (unlike shuls and
-// applicants, which get a fresh record each season) — so "other seasons"
-// for a store means its real per-season activity, derived from the
-// transaction ledger rather than a separate status table.
-router.get('/:id/season-history', requireAdmin, (req, res) => {
+// Stores are season-scoped like shuls (see Carry Forward below) — this
+// finds every other season's record for "the same" store, matched the same
+// way carry-forward reuses a target-season record: owner email, falling
+// back to manager email, falling back to name.
+router.get('/:id/other-seasons', requireAdmin, (req, res) => {
   const store = db.prepare('SELECT * FROM stores WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!store) return res.status(404).json({ error: 'Not found' });
-  const seasons = db.prepare(`SELECT c.season_id, se.name AS season_name, COUNT(*) AS txn_count,
-      COALESCE(SUM(CASE WHEN ct.amount < 0 THEN -ct.amount ELSE 0 END),0) AS total_purchases,
-      COALESCE(SUM(CASE WHEN ct.type='refund' THEN ct.amount ELSE 0 END),0) AS total_refunds
-    FROM card_transactions ct JOIN cards c ON c.id = ct.card_id LEFT JOIN seasons se ON se.id = c.season_id
-    WHERE ct.store_id = ? GROUP BY c.season_id ORDER BY se.created_at DESC`).all(store.id);
-  res.json({ seasons });
+  const email = store.owner_email || store.manager_email;
+  const matches = email
+    ? db.prepare(`SELECT s.id, s.name, s.setup_status AS status, s.season_id, se.name AS season_name FROM stores s LEFT JOIN seasons se ON se.id = s.season_id
+        WHERE s.org_id = ? AND s.id != ? AND (s.owner_email = ? OR s.manager_email = ?) ORDER BY se.created_at DESC`).all(req.user.org_id, store.id, email, email)
+    : db.prepare(`SELECT s.id, s.name, s.setup_status AS status, s.season_id, se.name AS season_name FROM stores s LEFT JOIN seasons se ON se.id = s.season_id
+        WHERE s.org_id = ? AND s.id != ? AND s.name = ? ORDER BY se.created_at DESC`).all(req.user.org_id, store.id, store.name);
+  res.json({ matches });
 });
 
 router.post('/', requirePermission('stores', 'can_edit'), (req, res) => {
@@ -179,10 +185,10 @@ router.post('/', requirePermission('stores', 'can_edit'), (req, res) => {
     if (!isValidPhone(b[f])) return res.status(400).json({ error: `${label} must be a valid phone number (10 digits, or 11 digits starting with 1)` });
   }
   const id = uuid();
-  db.prepare(`INSERT INTO stores (id, org_id, name, address, city, state, zip, phone, pos_system, manager_name, manager_phone, manager_email,
+  db.prepare(`INSERT INTO stores (id, org_id, season_id, name, address, city, state, zip, phone, pos_system, manager_name, manager_phone, manager_email,
       owner_name, owner_phone, owner_email, same_person, comments, setup_status, has_provider_account)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?)`)
-    .run(id, req.user.org_id, b.name, b.address || '', b.city || '', b.state || '', b.zip || '', normalizePhone(b.phone || ''), b.pos_system || '',
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?)`)
+    .run(id, req.user.org_id, getActiveSeasonId(req.user.org_id), b.name, b.address || '', b.city || '', b.state || '', b.zip || '', normalizePhone(b.phone || ''), b.pos_system || '',
       b.manager_name || '', normalizePhone(b.manager_phone || ''), b.manager_email || '', b.owner_name || '', normalizePhone(b.owner_phone || ''), b.owner_email || '',
       b.same_person ? 1 : 0, b.comments || '', b.setup_status || 'pending', b.has_provider_account ? 1 : 0);
   const store = db.prepare('SELECT * FROM stores WHERE id = ?').get(id);
@@ -338,6 +344,130 @@ router.post('/mass-invite', requirePermission('stores', 'can_edit'), async (req,
   res.json({ invited, skipped, emailErrors });
 });
 
+// Reuses an already-active portal login for a returning store (same
+// owner/manager email) by repointing its store_id at the new season's row,
+// instead of colliding with users.email's UNIQUE constraint — same pattern
+// as shuls.js's ensureShulPortalUser, needed because inviteStoreToPortal
+// above only ever looks up a user by the CURRENT store's own id.
+function ensureStorePortalUser(orgId, store, emailOverride) {
+  let user = db.prepare('SELECT * FROM users WHERE store_id = ?').get(store.id);
+  if (user) return user;
+  const email = emailOverride || store.owner_email || store.manager_email;
+  const existing = email ? db.prepare('SELECT * FROM users WHERE org_id = ? AND email = ?').get(orgId, email) : null;
+  if (existing) {
+    db.prepare('UPDATE users SET store_id = ? WHERE id = ?').run(store.id, existing.id);
+    return db.prepare('SELECT * FROM users WHERE id = ?').get(existing.id);
+  }
+  const token = uuid();
+  const expires = new Date(Date.now() + 14 * 24 * 3600 * 1000).toISOString();
+  const uid = uuid();
+  db.prepare(`INSERT INTO users (id, org_id, email, first_name, role, store_id, invite_token, invite_expires, is_active) VALUES (?,?,?,?,'store',?,?,?,0)`)
+    .run(uid, orgId, email, store.manager_name || store.name, store.id, token, expires);
+  return db.prepare('SELECT * FROM users WHERE id = ?').get(uid);
+}
+function storeLoginUrl(user) {
+  if (user.is_active) return `${process.env.APP_URL || ''}/login`;
+  const token = uuid();
+  const expires = new Date(Date.now() + 14 * 24 * 3600 * 1000).toISOString();
+  db.prepare('UPDATE users SET invite_token = ?, invite_expires = ? WHERE id = ?').run(token, expires, user.id);
+  return `${process.env.APP_URL || ''}/accept-invite?token=${token}`;
+}
+
+// Generates + emails a fresh participation agreement for a store — same
+// generic-documents mechanism as the public self-service flow (POST
+// /:id/generate-contract), just admin-triggered with an email step,
+// mirroring shuls.js's sendContractForShul. Shared by carry-forward below.
+async function sendStoreAgreement(orgId, store, toEmail, sentBy = null) {
+  if (!toEmail) return { error: 'No email on file for this store' };
+  const entity = resolveEntity('store', store.id, orgId);
+  const org = db.prepare('SELECT * FROM organizations WHERE id = ?').get(orgId);
+  const templateSetting = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'document_template_text_store'`).get(orgId);
+  const pdfPath = await generateGenericDocumentPdf({
+    entityType: 'store', entityId: store.id, title: 'Store Participation Agreement', fieldLines: entity.fieldLines,
+    templateText: templateSetting?.value, orgName: org?.name,
+    record: entity.record, extra: entity.extra, orgId,
+  });
+  const id = uuid();
+  const token = uuid();
+  const expires = new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString();
+  db.prepare(`INSERT INTO documents (id, org_id, entity_type, entity_id, title, pdf_path, status, sign_token, sign_token_expires, sent_at, created_by)
+    VALUES (?,?,'store',?,?,?,'sent',?,?,datetime('now'),?)`).run(id, orgId, store.id, 'Store Participation Agreement', pdfPath, token, expires, sentBy);
+  const signUrl = `${process.env.APP_URL || ''}/sign-document?token=${token}`;
+  const { subject, body, replyTo } = renderSystemTemplate(orgId, 'documentReady', { docTitle: 'Store Participation Agreement', entityName: store.name, signUrl });
+  const { emailError } = await sendMailChecked(orgId, toEmail, subject, body, { replyTo, sentBy });
+  return { document: db.prepare('SELECT * FROM documents WHERE id = ?').get(id), emailError };
+}
+
+// Core of Carry Forward, shared by the single-store route and
+// /mass-carry-forward: brings one store (a known, returning participant)
+// into a different season without re-running the application. Reuses a
+// matching store record in the target season if one already exists (owner
+// email, falling back to manager email, falling back to name — same
+// heuristic as GET /:id/other-seasons), so this is safe to run more than
+// once without creating duplicates.
+async function carryForwardStore(orgId, userId, source, targetSeason, { ip } = {}) {
+  if (targetSeason.id === source.season_id) return { error: "Target season must be different from the store's current season", status: 400 };
+  const email = source.owner_email || source.manager_email;
+  let target = email
+    ? db.prepare('SELECT * FROM stores WHERE org_id = ? AND season_id = ? AND (owner_email = ? OR manager_email = ?)').get(orgId, targetSeason.id, email, email)
+    : db.prepare('SELECT * FROM stores WHERE org_id = ? AND season_id = ? AND name = ?').get(orgId, targetSeason.id, source.name);
+  let storeCreated = false;
+  let emailError = null, agreementEmailError = null;
+  if (!target) {
+    const id = uuid();
+    db.prepare(`INSERT INTO stores (id, org_id, season_id, name, address, city, state, zip, phone, pos_system, manager_name, manager_phone, manager_email,
+        owner_name, owner_phone, owner_email, same_person, comments, setup_status, has_provider_account, source)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?, 'carried_forward')`)
+      .run(id, orgId, targetSeason.id, source.name, source.address || '', source.city || '', source.state || '', source.zip || '', source.phone || '', source.pos_system || '',
+        source.manager_name || '', source.manager_phone || '', source.manager_email || '', source.owner_name || '', source.owner_phone || '', source.owner_email || '',
+        source.same_person, source.comments || '', source.setup_status || 'pending', source.has_provider_account ? 1 : 0);
+    target = db.prepare('SELECT * FROM stores WHERE id = ?').get(id);
+    storeCreated = true;
+
+    let user = ensureStorePortalUser(orgId, target);
+    db.prepare(`UPDATE stores SET portal_user_id = (SELECT id FROM users WHERE store_id = ?) WHERE id = ?`).run(target.id, target.id);
+    target = db.prepare('SELECT * FROM stores WHERE id = ?').get(target.id);
+
+    const loginUrl = storeLoginUrl(user);
+    const tmpl = renderSystemTemplate(orgId, 'storeSetup', { storeName: target.name, portalUrl: loginUrl });
+    ({ emailError } = await sendMailChecked(orgId, user.email, tmpl.subject, tmpl.body, { replyTo: tmpl.replyTo, sentBy: userId }));
+    if (emailError) console.error('[mail] store carry-forward invite email failed:', emailError);
+
+    const agreementResult = await sendStoreAgreement(orgId, target, email, userId);
+    agreementEmailError = agreementResult.error || agreementResult.emailError || null;
+  }
+  logAudit(orgId, userId, 'carry-forward', 'store', source.id, { season_id: source.season_id }, { target_store_id: target.id, target_season_id: targetSeason.id }, ip);
+  return { store: target, storeCreated, emailError, agreementEmailError };
+}
+
+router.post('/:id/carry-forward', requirePermission('stores', 'can_edit'), async (req, res) => {
+  const source = db.prepare('SELECT * FROM stores WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
+  if (!source) return res.status(404).json({ error: 'Not found' });
+  const targetSeason = db.prepare('SELECT * FROM seasons WHERE id = ? AND org_id = ?').get(req.body?.season_id, req.user.org_id);
+  if (!targetSeason) return res.status(400).json({ error: 'Target season not found' });
+  const result = await carryForwardStore(req.user.org_id, req.user.id, source, targetSeason, { ip: req.ip });
+  if (result.error) return res.status(result.status).json({ error: result.error });
+  res.json(result);
+});
+
+router.post('/mass-carry-forward', requirePermission('stores', 'can_edit'), async (req, res) => {
+  const { ids, season_id } = req.body || {};
+  if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids array required' });
+  const targetSeason = db.prepare('SELECT * FROM seasons WHERE id = ? AND org_id = ?').get(season_id, req.user.org_id);
+  if (!targetSeason) return res.status(400).json({ error: 'Target season not found' });
+  let carried = 0, skipped = 0; const affectedIds = [], names = [];
+  for (const id of ids) {
+    const source = db.prepare('SELECT * FROM stores WHERE id = ? AND org_id = ?').get(id, req.user.org_id);
+    if (!source) { skipped++; continue; }
+    const result = await carryForwardStore(req.user.org_id, req.user.id, source, targetSeason, { ip: req.ip });
+    if (result.error) { skipped++; continue; }
+    affectedIds.push(result.store.id); names.push(result.store.name);
+    carried++;
+  }
+  logMassAudit(req.user.org_id, req.user.id, 'mass-carry-forward', 'store', affectedIds, { skipped, target_season_id: targetSeason.id, names }, req.ip);
+  res.json({ carried, skipped });
+});
+
 // ---- Store portal onboarding wizard ----
 // Steps: 1 = confirm store/contact info, 2 = billing contact + agree to terms, 3 = complete.
 // Callable by the store's own portal login OR an admin walking them through it.
@@ -423,6 +553,132 @@ router.get('/bill-submissions/:billId/file', (req, res) => {
   if (req.user.role === 'store' && row.store_id !== req.user.store_id) return res.status(403).json({ error: 'Not your bill' });
   if (!row.file_path) return res.status(404).json({ error: 'No file attached' });
   res.download(join(BILLS_DIR, row.file_path), row.file_name || 'bill');
+});
+
+router.get('/import/template', requireAdmin, (req, res) => {
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', 'attachment; filename="store_import_template.xlsx"');
+  res.send(buildXlsxTemplate(['id', ...STORE_IMPORT_COLUMNS]));
+});
+
+// Every column an UPDATE row (matched by a filled-in `id` column) can
+// touch, and how to read it off a parsed sheet row — a blank cell means
+// "leave this column alone," not "clear it," same contract as the shuls
+// and applicants imports.
+const STORE_UPDATABLE_FIELDS = {
+  name: r => r.name, address: r => r.address, city: r => r.city, state: r => r.state, zip: r => r.zip,
+  phone: r => r.phone && normalizePhone(r.phone), pos_system: r => r.pos_system,
+  manager_name: r => r.manager_name, manager_phone: r => r.manager_phone && normalizePhone(r.manager_phone), manager_email: r => r.manager_email,
+  owner_name: r => r.owner_name, owner_phone: r => r.owner_phone && normalizePhone(r.owner_phone), owner_email: r => r.owner_email,
+  comments: r => r.comments,
+};
+
+router.post('/import', requirePermission('stores', 'can_edit'), upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  if (!/\.xlsx$/i.test(req.file.originalname || '')) return res.status(400).json({ error: 'Only .xlsx files are accepted (CSV does not reliably support Hebrew text).' });
+  const jobId = uuid();
+  const rows = parseSpreadsheet(req.file.buffer, req.file.originalname);
+  // Defaults to the newest active season same as everywhere else; season_id
+  // lets an admin target a specific (e.g. older/already-superseded) season
+  // instead — for a one-time backfill import that shouldn't land in
+  // whatever season happens to be current right now.
+  const season = req.body.season_id
+    ? db.prepare('SELECT * FROM seasons WHERE id = ? AND org_id = ?').get(req.body.season_id, req.user.org_id)
+    : db.prepare('SELECT * FROM seasons WHERE org_id = ? AND is_active = 1 ORDER BY created_at DESC LIMIT 1').get(req.user.org_id);
+  if (req.body.season_id && !season) return res.status(400).json({ error: 'Season not found' });
+
+  // Spreadsheet cells arrive as strings ("TRUE"/"1"/"yes"), not real
+  // booleans — normalize the two checkbox columns up front so both
+  // validateBySchema's requiredUnless (same_person exempting manager
+  // fields) and the INSERT below see a real boolean either way.
+  const truthy = v => /^(y|yes|true|1)$/i.test(String(v ?? '').trim());
+  for (const r of rows) { r.same_person = truthy(r.same_person); r.has_provider_account = truthy(r.has_provider_account); }
+
+  // A row with a non-blank `id` column that matches an existing store in
+  // this org is an edit, not a new application — same file you get from
+  // Export Excel, edited in place and re-uploaded.
+  const rowExisting = rows.map(r => {
+    const id = r.id ? String(r.id).trim() : '';
+    if (!id) return null;
+    return db.prepare('SELECT * FROM stores WHERE id = ? AND org_id = ?').get(id, req.user.org_id) || null;
+  });
+
+  // All-or-nothing: every true-create row must have every field the fixed
+  // Store Application question set requires, or NOTHING in the sheet is
+  // imported — nothing is written to the database until every row checks
+  // out. bypass_required (admin only) skips this whole check for the
+  // entire sheet; name and owner_email stay hard-required per new row
+  // below regardless, since a store record is meaningless without them.
+  const bypassRequired = req.body.bypass_required === 'true' || req.body.bypass_required === true;
+  const requiredErrors = bypassRequired ? [] : rows
+    .map((r, i) => (rowExisting[i] ? null : { row: i + 2, errors: validateBySchema(STORE_APPLICATION_SCHEMA, r, { isAdmin: true }) }))
+    .filter(x => x && x.errors.length)
+    .map(x => ({ row: x.row, error: x.errors.join('; ') }));
+  const idNotFoundErrors = rows
+    .map((r, i) => (r.id && String(r.id).trim() && !rowExisting[i]) ? { row: i + 2, error: `No existing store found with id "${r.id}"` } : null)
+    .filter(Boolean);
+  // Update rows skip validateBySchema entirely (see rowExisting above) — a
+  // blank cell there means "leave alone," not "missing" — but a non-blank
+  // phone cell still has to be a real phone number.
+  const updatePhoneErrors = rows.map((r, i) => {
+    if (!rowExisting[i]) return null;
+    const bad = [['phone', 'Store Phone'], ['manager_phone', 'Manager Phone'], ['owner_phone', 'Owner Phone']].find(([f]) => r[f] && !isValidPhone(r[f]));
+    return bad ? { row: i + 2, error: `${bad[1]} must be a valid phone number (10 digits, or 11 digits starting with 1)` } : null;
+  }).filter(Boolean);
+  const allErrors = [...requiredErrors, ...idNotFoundErrors, ...updatePhoneErrors].sort((a, b) => a.row - b.row);
+  if (allErrors.length) {
+    return res.status(400).json({ error: 'Some rows have errors. Nothing was imported — fix the sheet and re-upload.', errors: allErrors });
+  }
+
+  let success = 0, updated = 0; const errors = [];
+  const createdIds = [], createdNames = [], updatedIds = [], updatedNames = [];
+  // Per-row "what did this column used to say" snapshot, captured right
+  // before each UPDATE — what makes mass-import undo able to actually
+  // restore an edited row instead of just deleting the newly-created ones.
+  const updatedDiffs = [];
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const existing = rowExisting[i];
+    if (existing) {
+      try {
+        const sets = Object.keys(STORE_UPDATABLE_FIELDS).filter(f => { const v = STORE_UPDATABLE_FIELDS[f](r); return v !== undefined && v !== ''; });
+        if (sets.length) {
+          const vals = sets.map(f => STORE_UPDATABLE_FIELDS[f](r));
+          db.prepare(`UPDATE stores SET ${sets.map(f => `${f}=?`).join(',')} WHERE id=?`).run(...vals, existing.id);
+          updatedIds.push(existing.id); updatedNames.push(existing.name);
+          updatedDiffs.push({ id: existing.id, before: Object.fromEntries(sets.map(f => [f, existing[f]])) });
+        }
+        updated++;
+      } catch (e) {
+        errors.push({ row: i + 2, error: e.message });
+      }
+      continue;
+    }
+    if (!r.name || !r.owner_email) { errors.push({ row: i + 2, error: 'Missing name or owner_email' }); continue; }
+    try {
+      const id = uuid();
+      const samePerson = !!r.same_person;
+      db.prepare(`INSERT INTO stores (id, org_id, season_id, name, address, city, state, zip, phone, pos_system, manager_name, manager_phone, manager_email,
+          owner_name, owner_phone, owner_email, same_person, comments, setup_status, has_provider_account, source)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,'pending',?, 'mass_upload')`)
+        .run(id, req.user.org_id, season?.id || null, r.name, r.address || '', r.city || '', r.state || '', r.zip || '',
+          normalizePhone(r.phone || ''), r.pos_system || '',
+          samePerson ? r.owner_name || '' : r.manager_name || '', samePerson ? normalizePhone(r.owner_phone || '') : normalizePhone(r.manager_phone || ''), samePerson ? r.owner_email || '' : r.manager_email || '',
+          r.owner_name || '', normalizePhone(r.owner_phone || ''), r.owner_email, samePerson ? 1 : 0,
+          r.comments || '', r.has_provider_account ? 1 : 0);
+      const store = db.prepare('SELECT * FROM stores WHERE id = ?').get(id);
+      createdIds.push(id); createdNames.push(store.name);
+      success++;
+    } catch (e) {
+      errors.push({ row: i + 2, error: e.message });
+    }
+  }
+  db.prepare(`INSERT INTO import_jobs (id, org_id, entity_type, file_name, status, total_rows, success_count, error_count, error_log, created_by)
+    VALUES (?,?,?,?,'completed',?,?,?,?,?)`)
+    .run(jobId, req.user.org_id, 'stores', req.file.originalname, rows.length, success, errors.length, JSON.stringify(errors), req.user.id);
+  logMassAudit(req.user.org_id, req.user.id, 'mass-import', 'store', [...createdIds, ...updatedIds],
+    { created: createdIds.length, updated: updatedIds.length, errors: errors.length, names: [...createdNames, ...updatedNames], createdIds, updatedIds, updatedDiffs }, req.ip);
+  res.json({ jobId, total: rows.length, success, updated, errors });
 });
 
 export default router;

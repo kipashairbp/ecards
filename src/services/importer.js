@@ -25,6 +25,11 @@ export const SHUL_IMPORT_COLUMNS = [
   'slots_allocated',
 ];
 
+export const STORE_IMPORT_COLUMNS = [
+  'name', 'address', 'city', 'state', 'zip', 'phone', 'pos_system',
+  'manager_name', 'manager_phone', 'manager_email', 'owner_name', 'owner_phone', 'owner_email', 'comments',
+];
+
 export const APPLICANT_IMPORT_COLUMNS = [
   'first_name', 'last_name', 'marital_status', 'home_phone', 'husband_cell', 'wife_cell', 'email',
   'address', 'city', 'state', 'zip', 'shul_name',

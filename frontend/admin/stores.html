@@ -13,14 +13,16 @@
 <script>
 Auth.requireAdmin();
 renderShell('/admin/stores', `
-  <div class="flex-between"><h2>Participating Stores</h2><div class="pill-row"><button class="btn btn-outline btn-sm" id="btn-export">Export Excel</button><button class="btn btn-primary btn-sm" id="btn-new">+ Add Store</button></div></div>
+  <div class="flex-between"><h2>Participating Stores</h2><div class="pill-row"><button class="btn btn-outline btn-sm" id="btn-template">Download Template</button><button class="btn btn-outline btn-sm" id="btn-import">Mass Upload</button><button class="btn btn-outline btn-sm" id="btn-export">Export Excel</button><button class="btn btn-primary btn-sm" id="btn-new">+ Add Store</button></div></div>
   <div class="toolbar"><input id="f-search" placeholder="Search store name or city…"><select id="f-status"><option value="">All statuses</option><option value="pending">Pending</option><option value="in_progress">In Progress</option><option value="active">Active</option><option value="inactive">Inactive</option></select><select id="f-source"><option value="">All sources</option><option value="application">Self-Applied</option><option value="admin">Admin Added</option></select>
+    <select id="f-season"></select>
     <select id="mass-action">
       <option value="status-pending">Set to Pending</option>
       <option value="status-in_progress">Set to In Progress</option>
       <option value="status-active">Set to Active</option>
       <option value="status-inactive">Set to Inactive</option>
       <option value="invite">Invite to Portal</option>
+      <option value="carry-forward">Carry Forward to Season…</option>
       <option value="delete">Delete Permanently</option>
     </select>
     <button class="btn btn-sm btn-primary" id="btn-mass-apply" disabled>Apply to Selected (0)</button>
@@ -31,10 +33,10 @@ renderShell('/admin/stores', `
   </div>
 `);
 
-let state = { search:'', status:'', source:'' };
+let state = { search:'', status:'', source:'', season_id:'' };
 let selected = new Set();
 async function load() {
-  const params = new URLSearchParams({ search: state.search, setup_status: state.status });
+  const params = new URLSearchParams({ search: state.search, setup_status: state.status, season_id: state.season_id });
   try {
     let { stores } = await api('/stores?' + params);
     if (state.source) stores = stores.filter(s => (s.source || 'admin') === state.source);
@@ -61,9 +63,12 @@ function onCheck(e) {
 qs('#f-source').addEventListener('change', () => { state.source = qs('#f-source').value; load(); });
 qs('#f-search').addEventListener('input', debounce(() => { state.search = qs('#f-search').value; load(); }, 350));
 qs('#f-status').addEventListener('change', () => { state.status = qs('#f-status').value; load(); });
+qs('#f-season').addEventListener('change', () => { state.season_id = qs('#f-season').value; load(); });
 function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
 qs('#btn-new').addEventListener('click', () => openStoreForm());
-qs('#btn-export').addEventListener('click', () => downloadAuthed('/stores/export?' + new URLSearchParams({ search: state.search, setup_status: state.status }), 'stores.xlsx'));
+qs('#btn-template').addEventListener('click', () => downloadAuthed('/stores/import/template', 'store_import_template.xlsx'));
+qs('#btn-import').addEventListener('click', () => openImportModal());
+qs('#btn-export').addEventListener('click', () => downloadAuthed('/stores/export?' + new URLSearchParams({ search: state.search, setup_status: state.status, season_id: state.season_id }), 'stores.xlsx'));
 
 const MASS_ACTIONS = {
   'status-pending': { confirm: n => `Set ${n} selected store(s) to Pending?`, run: (ids) => api('/stores/mass-set-status', { method: 'POST', body: { ids, setup_status: 'pending' } }), summarize: r => ({ msg: `Updated ${r.updated}, skipped ${r.skipped}` }) },
@@ -74,6 +79,11 @@ const MASS_ACTIONS = {
     confirm: n => `Invite ${n} selected store(s) to their portal? Each uses their owner or manager email on file.`,
     run: (ids) => api('/stores/mass-invite', { method: 'POST', body: { ids } }),
     summarize: r => { let msg = `Invited ${r.invited}, skipped ${r.skipped} (no email on file, or agreement not yet sent)`; if (r.emailErrors) msg += ` — ${r.emailErrors} invite email(s) failed to send`; return { msg, isError: !!r.emailErrors }; },
+  },
+  'carry-forward': {
+    confirm: null,
+    run: (ids) => openMassCarryForwardModal(ids),
+    summarize: r => ({ msg: `Carried forward ${r.carried} store(s), skipped ${r.skipped}` }),
   },
   delete: {
     confirm: n => `Permanently delete ${n} selected store(s)? This removes each store and its billing records completely and cannot be undone.`,
@@ -150,7 +160,8 @@ async function openStore(id) {
       <div id="stab-history" style="display:none">
         <div id="stab-history-list"><p class="small-muted">Loading…</p></div>
       </div>`;
-    const footer = `<button class="btn btn-outline btn-sm" onclick="showOtherSeasons('Store', '/stores/${id}/season-history', 'openStore')">View Other Seasons</button><button class="btn btn-outline btn-sm" onclick="inviteStore('${id}')">Invite to Portal</button>${s.portal_user_id && ['super_admin','org_admin'].includes(Auth.user()?.role) ? `<button class="btn btn-outline btn-sm" onclick="openSetPasswordModal('${s.portal_user_id}','${esc(s.name).replace(/'/g,"\\'")}')">Set Password</button>` : ''}${['super_admin','org_admin'].includes(Auth.user()?.role) ? `<button class="btn btn-outline btn-sm" style="color:#b71c1c;border-color:#b71c1c" onclick="deleteStore('${id}')">Delete Permanently</button>` : ''}<button class="btn btn-primary btn-sm" onclick="saveStore('${id}')">Save</button>`;
+    const footer = `<button class="btn btn-outline btn-sm" onclick="showOtherSeasons('Store', '/stores/${id}/other-seasons', 'openStore')">View Other Seasons</button><button class="btn btn-outline btn-sm" onclick="openCarryForwardModal()">Carry Forward to Season…</button><button class="btn btn-outline btn-sm" onclick="inviteStore('${id}')">Invite to Portal</button>${s.portal_user_id && ['super_admin','org_admin'].includes(Auth.user()?.role) ? `<button class="btn btn-outline btn-sm" onclick="openSetPasswordModal('${s.portal_user_id}','${esc(s.name).replace(/'/g,"\\'")}')">Set Password</button>` : ''}${['super_admin','org_admin'].includes(Auth.user()?.role) ? `<button class="btn btn-outline btn-sm" style="color:#b71c1c;border-color:#b71c1c" onclick="deleteStore('${id}')">Delete Permanently</button>` : ''}<button class="btn btn-primary btn-sm" onclick="saveStore('${id}')">Save</button>`;
+    carryForwardContext = { id, name: s.name };
     openModal(s.name, body, footer);
     qsa('#stabs button').forEach(b => b.addEventListener('click', () => {
       qsa('#stabs button').forEach(x => x.classList.remove('active')); b.classList.add('active');
@@ -239,7 +250,100 @@ window.createStore = async () => {
   try { await api('/stores', { method: 'POST', body }); toast('Store created'); closeModal(); load(); } catch (err) { toast(err.message, true); }
 };
 
-load();
+// Carry-forward: a known, returning store into a different season without a
+// fresh application — mirrors shuls.js's carry-forward, minus the
+// applicant-carrying step (stores don't have applicants under them).
+// carryForwardContext is set by openStore() right before its modal opens.
+let carryForwardContext = null;
+window.openCarryForwardModal = async () => {
+  const { id, name } = carryForwardContext || {};
+  if (!id) return;
+  let seasons = [];
+  try { ({ seasons } = await api('/seasons')); } catch { /* season list just won't show options if this fails */ }
+  const body = `<p class="small-muted">Carries <strong>${esc(name)}</strong> into a different season — reuses a matching store there if one already exists (by owner/manager email, else name), otherwise creates one, emails a link to set up their account password, and sends a fresh participation agreement to sign.</p>
+    <label>Target Season</label>
+    <select id="cf-season">${seasons.map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join('')}</select>
+    <div id="cf-result" style="margin-top:14px"></div>`;
+  openModal('Carry Forward to Season', body, `<button class="btn btn-primary btn-sm" onclick="runCarryForward()">Carry Forward</button>`);
+};
+window.runCarryForward = async () => {
+  const { id } = carryForwardContext || {};
+  const seasonId = qs('#cf-season')?.value;
+  if (!seasonId) return toast('No season selected', true);
+  try {
+    const r = await api(`/stores/${id}/carry-forward`, { method: 'POST', body: { season_id: seasonId } });
+    qs('#cf-result').innerHTML = `<p><strong>${r.storeCreated ? 'Created' : 'Reused'}</strong> the store in the target season.${r.emailError ? ` <span style="color:var(--danger)">Password setup email failed: ${esc(r.emailError)}</span>` : ''}${r.agreementEmailError ? ` <span style="color:var(--danger)">Agreement email failed: ${esc(r.agreementEmailError)}</span>` : ''}</p>`;
+    load();
+  } catch (err) { toast(err.message, true); }
+};
+
+// Same action as the single-store button, run across every selected store
+// at once. Resolves to null (aborting the mass-action, matching the
+// cancelled-prompt behavior elsewhere) if the admin closes the modal
+// without submitting.
+function openMassCarryForwardModal(ids) {
+  return new Promise(async (resolve) => {
+    let seasons = [];
+    try { ({ seasons } = await api('/seasons')); } catch { /* season list just won't show options if this fails */ }
+    const body = `<p class="small-muted">Carries all <strong>${ids.length}</strong> selected store(s) into a different season. Each store reuses a matching store there if one already exists (by owner/manager email, else name), otherwise creates one and sends the usual invite + agreement emails.</p>
+      <label>Target Season</label>
+      <select id="mcf-season">${seasons.map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join('')}</select>`;
+    openModal('Carry Forward to Season (Mass)', body, `<button class="btn btn-primary btn-sm" id="mcf-go">Carry Forward</button>`);
+    let resolved = false;
+    const finish = (val) => { if (!resolved) { resolved = true; resolve(val); } };
+    const modalEl = document.getElementById('ec-modal');
+    const observer = new MutationObserver(() => {
+      if (modalEl && !document.body.contains(modalEl)) { observer.disconnect(); finish(null); }
+    });
+    observer.observe(document.body, { childList: true });
+    qs('#mcf-go').addEventListener('click', async () => {
+      const season_id = qs('#mcf-season')?.value;
+      if (!season_id) return toast('No season selected', true);
+      try {
+        const r = await api('/stores/mass-carry-forward', { method: 'POST', body: { ids, season_id } });
+        observer.disconnect();
+        closeModal();
+        finish(r);
+      } catch (err) { toast(err.message, true); }
+    });
+  });
+}
+
+async function openImportModal() {
+  let seasons = [];
+  try { ({ seasons } = await api('/seasons')); } catch { /* season picker just won't show options if this fails */ }
+  const body = `<p class="small-muted">Upload an Excel (.xlsx) file using the template — CSV isn't accepted, since it doesn't reliably support Hebrew text. To mass-edit existing stores, export first, edit cells in Excel, and re-upload — a row with a filled-in <code>id</code> column updates that store (only the cells you actually changed), instead of creating a new one. Nothing is imported until you click Upload below, and if any row has an error the whole file is rejected — no partial imports.</p>
+    <input type="file" id="import-file" accept=".xlsx">
+    <label style="margin-top:12px">Season <span class="small-muted">(for a one-time backfill of a past/other season — defaults to the current season)</span></label>
+    <select id="import-season">${seasons.map(s => `<option value="${s.id}" ${s.is_active ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}</select>
+    <div class="checkbox-row" style="margin-top:12px"><input type="checkbox" id="import-bypass"><label style="margin:0">Bypass missing required fields (admin only — rows with blanks are still imported; name and owner email still required)</label></div>
+    <div id="import-result" style="margin-top:14px"></div>`;
+  openModal('Mass Upload Stores', body, `<button class="btn btn-primary btn-sm" id="btn-run-import" onclick="runImport()">Upload</button>`);
+}
+window.runImport = async () => {
+  const btn = qs('#btn-run-import');
+  if (btn.disabled) return;
+  const file = qs('#import-file').files[0];
+  if (!file) return toast('Choose a file first', true);
+  const fd = new FormData(); fd.append('file', file); fd.append('bypass_required', qs('#import-bypass').checked);
+  const seasonId = qs('#import-season')?.value;
+  if (seasonId) fd.append('season_id', seasonId);
+  btn.disabled = true; btn.textContent = 'Uploading…';
+  try {
+    const r = await api('/stores/import', { method: 'POST', isForm: true, body: fd });
+    qs('#import-result').innerHTML = `<p><strong>${r.success}</strong> created, <strong>${r.updated}</strong> updated, <strong>${r.errors.length}</strong> errors.</p>` +
+      (r.errors.length ? `<ul>${r.errors.slice(0,20).map(e=>`<li>Row ${e.row}: ${esc(e.error)}</li>`).join('')}</ul>` : '');
+    load();
+  } catch (err) {
+    if (err.data?.errors) {
+      qs('#import-result').innerHTML = `<p style="color:var(--danger)"><strong>${esc(err.message)}</strong></p><ul>${err.data.errors.slice(0,20).map(e=>`<li>Row ${e.row}: ${esc(e.error)}</li>`).join('')}</ul>`;
+    } else toast(err.message, true);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Upload';
+  }
+};
+
+populateSeasonFilter('f-season').then(activeId => { state.season_id = activeId; load(); });
 </script>
 </body>
 </html>
