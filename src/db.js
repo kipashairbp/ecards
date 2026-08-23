@@ -805,5 +805,14 @@ db.prepare(`UPDATE forms SET season_id = (
     SELECT id FROM seasons WHERE seasons.org_id = forms.org_id AND seasons.is_active = 1 ORDER BY seasons.created_at DESC LIMIT 1
   ) WHERE season_id IS NULL`).run();
 
+// Same idea for stores: they used to be one persistent record shared across
+// every season (no season_id at all) — now they're season-scoped like
+// shuls, with Carry Forward bringing a returning store into a new season.
+// Any store created before this existed gets its org's current active
+// season so it doesn't just vanish from a season-filtered list.
+db.prepare(`UPDATE stores SET season_id = (
+    SELECT id FROM seasons WHERE seasons.org_id = stores.org_id AND seasons.is_active = 1 ORDER BY seasons.created_at DESC LIMIT 1
+  ) WHERE season_id IS NULL`).run();
+
 export const DEFAULT_ORG_ID = defaultOrgId;
 export function uuid() { return randomUUID(); }
