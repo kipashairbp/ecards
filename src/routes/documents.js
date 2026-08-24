@@ -1,7 +1,8 @@
 import { Router } from 'express';
 import multer from 'multer';
-import { writeFileSync } from 'fs';
+import { writeFileSync, readFileSync } from 'fs';
 import { join } from 'path';
+import { PDFDocument } from 'pdf-lib';
 import { db, uuid } from '../db.js';
 import { auth } from '../middleware/auth.js';
 import { requirePermission } from '../middleware/permissions.js';
@@ -11,6 +12,20 @@ import { sendMailChecked, renderSystemTemplate } from '../services/mail.js';
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
 const DATA_DIR = process.env.DATA_DIR || join(process.cwd(), 'data');
+
+// Field/signature placement for a standalone document has no per-kind
+// setting to fall back to (see documents.fields_json's comment in db.js) —
+// this reads a real page size straight off that document's own PDF instead
+// of the templatePageSize()-by-kind guesswork contractSettings.js uses.
+async function documentPageSize(pdfPath) {
+  try {
+    const doc = await PDFDocument.load(readFileSync(pdfPath));
+    const pages = doc.getPages();
+    const { width, height } = pages[pages.length - 1].getSize();
+    return { width, height };
+  } catch { return { width: 612, height: 792 }; } // our generated Letter-size default (services/pdf.js buildSimplePdf)
+}
+const SIG_FIELD_TYPES = ['signature', 'initial', 'date', 'text'];
 
 export function resolveEntity(entityType, entityId, orgId) {
   if (entityType === 'applicant') {
@@ -211,6 +226,44 @@ router.get('/:id/pdf', auth, requirePermission('documents'), (req, res) => {
   res.sendFile(path);
 });
 
+// Field/signature placement editor for one specific standalone document —
+// same drag/resize mechanics as the shared per-kind signature-box editor
+// (contractSettings.js), just scoped to a single document row instead of an
+// org-wide setting, since a standalone document has no fixed template to
+// share placement across.
+router.get('/:id/fields', auth, requirePermission('documents'), async (req, res) => {
+  const document = db.prepare('SELECT * FROM documents WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
+  if (!document) return res.status(404).json({ error: 'Not found' });
+  if (!document.pdf_path) return res.status(400).json({ error: 'This document has no PDF yet' });
+  const fields = document.fields_json ? JSON.parse(document.fields_json) : [];
+  const pageSize = await documentPageSize(document.pdf_path);
+  res.json({ fields, pageSize });
+});
+
+router.put('/:id/fields', auth, requirePermission('documents', 'can_edit'), (req, res) => {
+  const document = db.prepare('SELECT * FROM documents WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
+  if (!document) return res.status(404).json({ error: 'Not found' });
+  if (document.status === 'signed') return res.status(400).json({ error: 'This document has already been signed — field placement can no longer be changed.' });
+  const fields = req.body?.fields;
+  if (!Array.isArray(fields) || !fields.length) return res.status(400).json({ error: 'At least one field is required' });
+  for (const f of fields) {
+    if (!f.id || !SIG_FIELD_TYPES.includes(f.type)) return res.status(400).json({ error: 'Each field needs a valid id and type' });
+    if ([f.x, f.y, f.width, f.height].some(v => typeof v !== 'number' || v < 0 || v > 1)) return res.status(400).json({ error: 'x/y/width/height must be numbers between 0 and 1' });
+  }
+  const value = JSON.stringify(fields.map(f => ({ id: f.id, type: f.type, label: f.label || '', required: f.required !== false, x: f.x, y: f.y, width: f.width, height: f.height })));
+  db.prepare('UPDATE documents SET fields_json = ? WHERE id = ?').run(value, document.id);
+  res.json({ ok: true, fields: JSON.parse(value) });
+});
+
+// A standalone document has no shared per-kind setting to fall back to
+// (there's no "the" standalone template — every one can be a different
+// PDF) — its own fields_json is the only source of truth. Everything else
+// keeps using the org-wide signature_box_<kind> setting as before.
+function resolveSignFields(document) {
+  if (document.entity_type === 'standalone') return document.fields_json ? JSON.parse(document.fields_json) : [];
+  return getSignatureFields(document.org_id, document.entity_type);
+}
+
 // ============================= PUBLIC (token-based signing) ==============================
 router.get('/sign/:token', (req, res) => {
   const document = db.prepare('SELECT * FROM documents WHERE sign_token = ?').get(req.params.token);
@@ -219,7 +272,7 @@ router.get('/sign/:token', (req, res) => {
   if (document.status === 'void') return res.status(410).json({ error: 'This document has been voided.' });
   if (document.sign_token_expires && new Date(document.sign_token_expires) < new Date()) return res.status(410).json({ error: 'This signing link has expired. Contact us for a new one.' });
   const entityName = document.entity_type === 'standalone' ? document.recipient_name : resolveEntity(document.entity_type, document.entity_id, document.org_id)?.displayName;
-  const fields = getSignatureFields(document.org_id, document.entity_type);
+  const fields = resolveSignFields(document);
   res.json({ document, entityName: entityName || '', fields });
 });
 
@@ -238,8 +291,11 @@ router.post('/sign/:token/sign', async (req, res) => {
   if (document.status === 'void') return res.status(410).json({ error: 'This document has been voided' });
   const { signer_name, signer_title, consent } = req.body || {};
   if (!signer_name) return res.status(400).json({ error: 'Signer name is required' });
+  // Same e-sign consent + IP + timestamp capture as shul contracts
+  // (routes/shuls.js POST /contract/:token/sign) — required for this to
+  // hold up as a legally binding signature, not just a "typed name".
   if (!consent) return res.status(400).json({ error: 'You must consent to sign electronically before submitting.' });
-  const fields = getSignatureFields(document.org_id, document.entity_type);
+  const fields = resolveSignFields(document);
   const { values, missing } = resolveSignatureValues(fields, req.body);
   if (missing.length) return res.status(400).json({ error: `Please complete: ${missing.join(', ')}` });
 
@@ -252,6 +308,19 @@ router.post('/sign/:token/sign', async (req, res) => {
   const signatureData = primary ? values[primary.id] : null;
   db.prepare(`UPDATE documents SET status='signed', signature_data=?, signer_name=?, signer_title=?, signed_at=?, ip_address=?, signed_pdf_path=?, field_values=?, esign_consent_at=? WHERE id=?`)
     .run(signatureData, signer_name, signer_title || '', signedAt, req.ip, signedPath, JSON.stringify(values), signedAt, document.id);
+
+  // A copy for the signer's own records — same "review & sign" link, which
+  // now shows the signed state with a download button (sign-document.html).
+  const isStandalone = document.entity_type === 'standalone';
+  const entity = isStandalone ? null : resolveEntity(document.entity_type, document.entity_id, document.org_id);
+  const toEmail = isStandalone ? document.recipient_email : entity?.contactEmail;
+  const entityName = isStandalone ? document.recipient_name : entity?.displayName;
+  if (toEmail) {
+    const signedUrl = `${process.env.APP_URL || ''}/sign-document?token=${document.sign_token}`;
+    const tmpl = renderSystemTemplate(document.org_id, 'documentSigned', { docTitle: document.title || 'Document', entityName: entityName || '', signedUrl });
+    const { emailError } = await sendMailChecked(document.org_id, toEmail, tmpl.subject, tmpl.body, { replyTo: tmpl.replyTo });
+    if (emailError) console.error('[mail] signed-document link email failed:', emailError);
+  }
   res.json({ ok: true, message: 'Document signed. Thank you.' });
 });
 

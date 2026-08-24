@@ -275,6 +275,7 @@ async function openApplicant(id) {
       <button class="btn btn-primary btn-sm" onclick="saveApplicant('${id}')">Save</button>`;
     openModal(`${a.first_name} ${a.last_name}`, body, footer);
     attachShulSelect('e-shul_id', a.shul_id || '', a.season_id || '');
+    loadGoogleMaps().then(() => { attachPlacesAutocomplete('e-address', { address: 'e-address', city: 'e-city', state: 'e-state', zip: 'e-zip' }); });
     qsa('#atabs button').forEach(b => b.addEventListener('click', () => {
       qsa('#atabs button').forEach(x => x.classList.remove('active')); b.classList.add('active');
       ['info','notes','cards','documents','messages','history'].forEach(t => qs('#atab-'+t).style.display = t === b.dataset.t ? 'block' : 'none');
@@ -369,6 +370,7 @@ function openApplicantForm() {
   `;
   openModal('Add Applicant', body, `<button class="btn btn-primary btn-sm" onclick="createApplicant()">Create</button>`);
   attachShulSelect('n-shul_id', '', state.season_id);
+  loadGoogleMaps().then(() => { attachPlacesAutocomplete('n-address', { address: 'n-address', city: 'n-city', state: 'n-state', zip: 'n-zip' }); });
 }
 window.createApplicant = async () => {
   const body = {

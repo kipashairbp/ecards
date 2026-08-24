@@ -707,6 +707,13 @@ safeAlter(`ALTER TABLE documents ADD COLUMN recipient_email TEXT`);
 // signature value was submitted.
 safeAlter(`ALTER TABLE contracts ADD COLUMN esign_consent_at TEXT`);
 safeAlter(`ALTER TABLE documents ADD COLUMN esign_consent_at TEXT`);
+// Per-document field/signature placement for standalone e-signature
+// requests (no linked shul/applicant/store record, so the shared per-kind
+// signature_box_* setting doesn't apply — every standalone document can be
+// a totally different PDF). Same {id,type,label,x,y,width,height,required}
+// shape as signature_box_*, just stored on the row itself. NULL/empty means
+// "use the single default signature box" (see GET/POST /documents/sign).
+safeAlter(`ALTER TABLE documents ADD COLUMN fields_json TEXT`);
 
 // One-time normalization of pre-existing phone numbers to the canonical
 // 123-456-7890 display format (see utils/phone.js). Cheap and idempotent —
@@ -803,15 +810,6 @@ db.prepare(`DELETE FROM forms WHERE is_default = 1 AND type IN ('shul_applicatio
 // forms are required to set season_id going forward (see routes/forms.js).
 db.prepare(`UPDATE forms SET season_id = (
     SELECT id FROM seasons WHERE seasons.org_id = forms.org_id AND seasons.is_active = 1 ORDER BY seasons.created_at DESC LIMIT 1
-  ) WHERE season_id IS NULL`).run();
-
-// Same idea for stores: they used to be one persistent record shared across
-// every season (no season_id at all) — now they're season-scoped like
-// shuls, with Carry Forward bringing a returning store into a new season.
-// Any store created before this existed gets its org's current active
-// season so it doesn't just vanish from a season-filtered list.
-db.prepare(`UPDATE stores SET season_id = (
-    SELECT id FROM seasons WHERE seasons.org_id = stores.org_id AND seasons.is_active = 1 ORDER BY seasons.created_at DESC LIMIT 1
   ) WHERE season_id IS NULL`).run();
 
 export const DEFAULT_ORG_ID = defaultOrgId;

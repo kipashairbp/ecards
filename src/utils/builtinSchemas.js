@@ -27,9 +27,9 @@ export const SHUL_APPLICATION_SCHEMA = [
 ];
 export const STORE_APPLICATION_SCHEMA = [
   { key: 'name', label: 'Store Name', type: 'text', required: true },
-  { key: 'address', label: 'Address', type: 'text', required: false }, { key: 'city', label: 'City', type: 'text', required: false },
+  { key: 'address', label: 'Address', type: 'text', required: true }, { key: 'city', label: 'City', type: 'text', required: false },
   { key: 'state', label: 'State', type: 'text', required: false }, { key: 'zip', label: 'Zip', type: 'text', required: false },
-  { key: 'phone', label: 'Store Phone', type: 'tel', required: false },
+  { key: 'phone', label: 'Store Phone', type: 'tel', required: true },
   { key: 'pos_system', label: 'Which POS system do you have?', type: 'text', required: true },
   { key: 'same_person', label: 'The manager and owner are the same person', type: 'checkbox', required: false },
   // Owner fields are always required — they double as "the one person"'s

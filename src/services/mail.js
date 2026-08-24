@@ -165,6 +165,13 @@ export const SYSTEM_EMAIL_TEMPLATES = {
       <p style="text-align:center;margin:28px 0;"><a href="{{signUrl}}" style="background:#c9a76a;color:#241a15;padding:12px 28px;border-radius:6px;text-decoration:none;font-weight:bold;">Review &amp; Sign</a></p>
       <p>If the button doesn't work, copy this link: {{signUrl}}</p>`,
   },
+  documentSigned: {
+    label: 'Document Signed (copy for signer)', vars: ['docTitle', 'entityName', 'signedUrl'],
+    subject: 'Signed: {{docTitle}}',
+    body: `<p>Shalom,</p><p>This confirms <strong>{{docTitle}}</strong> has been signed. You can view or download your copy here:</p>
+      <p style="text-align:center;margin:28px 0;"><a href="{{signedUrl}}" style="background:#c9a76a;color:#241a15;padding:12px 28px;border-radius:6px;text-decoration:none;font-weight:bold;">View Signed Document</a></p>
+      <p>If the button doesn't work, copy this link: {{signedUrl}}</p>`,
+  },
   applicationReceived: {
     label: 'Application Received (no contract yet)', vars: ['entityName'],
     subject: 'Application received: {{entityName}}',

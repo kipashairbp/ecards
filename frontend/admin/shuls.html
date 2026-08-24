@@ -332,6 +332,11 @@ async function openShul(id) {
     }));
     loadMessagesTab('shul', id, 'tab-messages-list', shul.gabai_cell || shul.ruv_phone || '', shul.gabai_email || '', shul);
     loadHistoryTab('shul', id, 'tab-history-list');
+    loadGoogleMaps().then(() => {
+      attachPlacesAutocomplete('e-address', { address: 'e-address', city: 'e-city', state: 'e-state', zip: 'e-zip' });
+      attachPlacesAutocomplete('e-ruv_address', { address: 'e-ruv_address', city: 'e-ruv_city', state: 'e-ruv_state', zip: 'e-ruv_zip' });
+      attachPlacesAutocomplete('e-gabai_address', { address: 'e-gabai_address', city: 'e-gabai_city', state: 'e-gabai_state', zip: 'e-gabai_zip' });
+    });
   } catch (err) { toast(err.message, true); }
 }
 
@@ -406,6 +411,7 @@ function openShulForm() {
     <div class="grid-2"><div><label>Gabai Cell *</label><input id="n-gabai_cell"></div><div><label>Gabai Email *</label><input id="n-gabai_email"></div></div>
     <label>Slots Allocated</label><input id="n-slots_allocated" type="number" value="0" style="max-width:160px">`;
   openModal('Add Shul', body, `<button class="btn btn-primary btn-sm" onclick="createShul()">Create</button>`);
+  loadGoogleMaps().then(() => { attachPlacesAutocomplete('n-address', { address: 'n-address', city: 'n-city', state: 'n-state', zip: 'n-zip' }); });
 }
 window.createShul = async () => {
   const fields = ['name_en','name_he','address','city','state','zip','ruv_first_name','ruv_last_name','ruv_phone','gabai_first_name','gabai_last_name','gabai_cell','gabai_email','slots_allocated'];
