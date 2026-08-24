@@ -425,7 +425,10 @@ export async function stampSignatureFields({ unsignedPath, shulId, fields, value
     const isPrimarySignature = field.type === 'signature' && !metaDrawn;
     const lineY = boxTop - boxH * 0.06;
     page.drawLine({ start: { x: boxX, y: lineY }, end: { x: boxX + boxW, y: lineY }, thickness: 1, color: rgb(0.3, 0.25, 0.2) });
-    const drawAreaH = boxH * (isPrimarySignature ? 0.48 : 0.8);
+    // The whole box below the line belongs to the signature/initial image
+    // (or typed-name fallback) — nothing else is ever drawn inside it, so
+    // it can never be covered, no matter how small the admin makes the box.
+    const drawAreaH = Math.max(10, lineY - 4 - boxBottom);
     if (value && value.startsWith('data:image/png;base64,')) {
       const pngBytes = Buffer.from(value.split(',')[1], 'base64');
       const png = await doc.embedPng(pngBytes);
@@ -438,12 +441,15 @@ export async function stampSignatureFields({ unsignedPath, shulId, fields, value
 
     if (isPrimarySignature) {
       metaDrawn = true;
-      const lineGap = Math.max(9, boxH * 0.13);
-      let textY = boxBottom + boxH * 0.4;
-      page.drawText(`Signed by: ${signerName || ''}`, { x: boxX, y: textY, size: 10, font });
-      textY = Math.max(boxBottom, textY - lineGap);
-      page.drawText(`Date: ${signedAt}`, { x: boxX, y: textY, size: 9, font, color: rgb(0.4, 0.35, 0.3) });
-      textY = Math.max(boxBottom - 4, textY - lineGap * 0.85);
+      // Signed-by / date / IP always render below the box itself — never
+      // sharing its space with the signature — so they can't crowd or
+      // partially cover it.
+      const lineGap = 10;
+      let textY = boxBottom - lineGap;
+      page.drawText(`Signed by: ${signerName || ''}`, { x: boxX, y: textY, size: 9, font });
+      textY -= lineGap;
+      page.drawText(`Date: ${signedAt}`, { x: boxX, y: textY, size: 8, font, color: rgb(0.4, 0.35, 0.3) });
+      textY -= lineGap * 0.9;
       page.drawText(`IP: ${ip || 'n/a'}`, { x: boxX, y: textY, size: 8, font, color: rgb(0.5, 0.45, 0.4) });
     }
   }
