@@ -22,6 +22,14 @@ import { lockApplicantCards } from '../services/cardSync.js';
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
+// Coerces a home_for_yomtov value to a real 0/1 — it arrives as a real
+// checkbox boolean from the shul-portal's own "Add Applicant" form, but as
+// the schema-driven Yes/No select's string '0'/'1' from every other
+// submission path (apply.html, apply-store.html, complete-reenrollment, the
+// shul-portal edit form). A plain `v ? 1 : 0` treats the string "0" as
+// truthy, silently saving every "No" answer as "Yes".
+function yomtovBit(v) { return v === '0' || v === 0 || !v ? 0 : 1; }
+
 const EDITABLE_FIELDS = ['first_name','last_name','marital_status','home_phone','husband_cell','wife_cell','email',
   'address','city','state','zip','preferred_contact_method','preferred_number','num_children','home_for_yomtov','comments','card_amount','provider_exempt',
   'shul_contribution_amount','shul_contribution_confirmed'];
@@ -120,7 +128,7 @@ router.post('/apply-ezras-habayis', (req, res) => {
       address, city, state, zip, preferred_contact_method, preferred_number, num_children, home_for_yomtov, comments, source, approval_status)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?, 'public_form', ?)`)
     .run(id, orgId, shul.id, shul.season_id, generateApplicantExternalId(db), b.first_name, b.last_name, b.marital_status || '', b.home_phone || '', b.husband_cell || '', b.wife_cell || '', b.email || '',
-      b.address || '', b.city || '', b.state || '', b.zip || '', b.preferred_contact_method || '', b.preferred_number || '', +b.num_children || 0, b.home_for_yomtov ? 1 : 0, b.comments || '', initialStatus);
+      b.address || '', b.city || '', b.state || '', b.zip || '', b.preferred_contact_method || '', b.preferred_number || '', +b.num_children || 0, yomtovBit(b.home_for_yomtov), b.comments || '', initialStatus);
   const created = db.prepare('SELECT * FROM applicants WHERE id = ?').get(id);
   detectAndFlag(orgId, 'applicant', created);
   res.status(201).json({ ok: true, message: 'Application received. You will be contacted if any additional information is needed.' });
@@ -407,7 +415,7 @@ router.post('/', requirePermission('applicants', 'can_edit'), (req, res) => {
       address, city, state, zip, preferred_contact_method, preferred_number, num_children, home_for_yomtov, card_amount, comments, source, approval_status)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?, ?, ?)`)
     .run(id, req.user.org_id, shulId, shul.season_id, generateApplicantExternalId(db), b.first_name, b.last_name, b.marital_status || '', b.home_phone || '', b.husband_cell || '', b.wife_cell || '', b.email || '',
-      b.address || '', b.city || '', b.state || '', b.zip || '', b.preferred_contact_method || '', b.preferred_number || '', +b.num_children || 0, b.home_for_yomtov ? 1 : 0, cardAmount, b.comments || '',
+      b.address || '', b.city || '', b.state || '', b.zip || '', b.preferred_contact_method || '', b.preferred_number || '', +b.num_children || 0, yomtovBit(b.home_for_yomtov), cardAmount, b.comments || '',
       req.user.role === 'shul' ? 'shul_upload' : 'admin', initialStatus);
   const applicant = db.prepare('SELECT * FROM applicants WHERE id = ?').get(id);
   const flag = detectAndFlag(req.user.org_id, 'applicant', applicant);
@@ -419,6 +427,12 @@ router.put('/:id', requirePermission('applicants', 'can_edit'), async (req, res)
   const applicant = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!applicant) return res.status(404).json({ error: 'Not found' });
   if (req.user.role === 'shul' && applicant.shul_id !== req.user.shul_id) return res.status(403).json({ error: 'Not your applicant' });
+  // A shul can edit its own applicant's info right up until an admin has
+  // actually reviewed it — once approved, the record is locked to the shul
+  // (an admin can still edit anything, any time, via requirePermission above).
+  if (req.user.role === 'shul' && applicant.approval_status === 'approved') {
+    return res.status(403).json({ error: 'This applicant has already been approved — contact your admin for changes.' });
+  }
   const b = req.body || {};
   if (b.home_phone !== undefined) b.home_phone = normalizePhone(b.home_phone);
   if (b.husband_cell !== undefined) b.husband_cell = normalizePhone(b.husband_cell);
@@ -446,7 +460,8 @@ router.put('/:id', requirePermission('applicants', 'can_edit'), async (req, res)
   const fields = req.user.role === 'shul' ? EDITABLE_FIELDS.filter(f => f !== 'card_amount' && f !== 'provider_exempt') : [...EDITABLE_FIELDS, 'shul_id', 'permanent_comments', 'min_contribution_override'];
   const sets = fields.filter(f => b[f] !== undefined);
   if (sets.length) {
-    const vals = sets.map(f => (f === 'home_for_yomtov' || f === 'provider_exempt' || f === 'shul_contribution_confirmed') ? (b[f] ? 1 : 0) : b[f]);
+    const vals = sets.map(f => f === 'home_for_yomtov' ? yomtovBit(b[f])
+      : (f === 'provider_exempt' || f === 'shul_contribution_confirmed') ? (b[f] ? 1 : 0) : b[f]);
     db.prepare(`UPDATE applicants SET ${sets.map(f => `${f}=?`).join(',')}, updated_at=datetime('now') WHERE id=?`).run(...vals, applicant.id);
     logAudit(req.user.org_id, req.user.id, 'update', 'applicant', applicant.id,
       Object.fromEntries(sets.map(f => [f, applicant[f]])), Object.fromEntries(sets.map((f, i) => [f, vals[i]])), req.ip);
@@ -527,7 +542,7 @@ router.post('/:id/complete-reenrollment', requirePermission('applicants', 'can_e
       approval_status=?, updated_at=datetime('now') WHERE id=?`)
     .run(merged.first_name, merged.last_name, merged.marital_status || '', merged.home_phone || '', merged.husband_cell || '', merged.wife_cell || '', merged.email || '',
       merged.address || '', merged.city || '', merged.state || '', merged.zip || '', merged.preferred_contact_method || '', merged.preferred_number || '',
-      +merged.num_children || 0, merged.home_for_yomtov ? 1 : 0, merged.comments || '', initialStatus, applicant.id);
+      +merged.num_children || 0, yomtovBit(merged.home_for_yomtov), merged.comments || '', initialStatus, applicant.id);
   const updated = db.prepare('SELECT * FROM applicants WHERE id = ?').get(applicant.id);
   detectAndFlag(req.user.org_id, 'applicant', updated);
   logAudit(req.user.org_id, req.user.id, 'complete-reenrollment', 'applicant', applicant.id, { approval_status: 'incomplete' }, { approval_status: initialStatus }, req.ip);
@@ -609,12 +624,19 @@ router.post('/mass-submit-drafts', requirePermission('applicants', 'can_edit'), 
   const { ids } = req.body || {};
   if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids array required' });
   const candidates = db.prepare(`SELECT * FROM applicants WHERE shul_id = ? AND approval_status = 'draft' AND id IN (${ids.map(() => '?').join(',')})`).all(shul.id, ...ids);
-  let submitted = 0, skippedSlotsFull = 0; const affectedIds = [], names = [];
+  let submitted = 0, skippedIncomplete = 0, skippedSlotsFull = 0; const affectedIds = [], names = [];
   for (const applicant of candidates) {
     if (shul.slots_allocated) {
       const used = db.prepare(`SELECT COUNT(*) c FROM applicants WHERE shul_id = ? AND approval_status NOT IN ('rejected','incomplete','draft')`).get(shul.id).c;
       if (used >= shul.slots_allocated) { skippedSlotsFull++; continue; }
     }
+    // Same required-field gate as mass-complete-reenrollment just above —
+    // a draft is only a placeholder until this moment, so nothing stops a
+    // shul from creating one with just a name and leaving the rest blank;
+    // this is where it actually becomes a real submission, same as any
+    // other, so it has to pass the same schema every other submission does.
+    const errors = validateBySchema(APPLICANT_APPLICATION_SCHEMA, applicant, { isAdmin: false });
+    if (errors.length) { skippedIncomplete++; continue; }
     const initialStatus = isZipAllowed(req.user.org_id, applicant.zip) ? 'pending' : 'rejected';
     db.prepare(`UPDATE applicants SET approval_status=?, updated_at=datetime('now') WHERE id=?`).run(initialStatus, applicant.id);
     const updated = db.prepare('SELECT * FROM applicants WHERE id = ?').get(applicant.id);
@@ -622,8 +644,8 @@ router.post('/mass-submit-drafts', requirePermission('applicants', 'can_edit'), 
     affectedIds.push(applicant.id); names.push(`${applicant.first_name} ${applicant.last_name}`.trim());
     submitted++;
   }
-  logMassAudit(req.user.org_id, req.user.id, 'mass-submit-drafts', 'applicant', affectedIds, { skippedSlotsFull, names }, req.ip);
-  res.json({ submitted, skippedSlotsFull });
+  logMassAudit(req.user.org_id, req.user.id, 'mass-submit-drafts', 'applicant', affectedIds, { skippedIncomplete, skippedSlotsFull, names }, req.ip);
+  res.json({ submitted, skippedIncomplete, skippedSlotsFull });
 });
 
 // Manually move an applicant back to 'pending' — for un-rejecting one after

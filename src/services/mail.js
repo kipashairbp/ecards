@@ -212,10 +212,11 @@ export const SYSTEM_EMAIL_TEMPLATES = {
       {{details}}`,
   },
   docSigned: {
-    label: 'Internal Notice: Document Signed', vars: ['docTitle', 'entityName', 'signerName', 'signedAt'],
+    label: 'Internal Notice: Document Signed', vars: ['docTitle', 'entityName', 'signerName', 'signedAt', 'entityUrl'],
     subject: 'Signed: {{docTitle}} ({{entityName}})',
     body: `<p><strong>{{entityName}}</strong> just signed <strong>{{docTitle}}</strong>.</p>
-      <p><strong>Signed by:</strong> {{signerName}}<br><strong>Signed at:</strong> {{signedAt}}</p>`,
+      <p><strong>Signed by:</strong> {{signerName}}<br><strong>Signed at:</strong> {{signedAt}}</p>
+      <p><a href="{{entityUrl}}">View in the admin portal</a></p>`,
   },
 };
 

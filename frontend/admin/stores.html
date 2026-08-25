@@ -350,6 +350,16 @@ window.runImport = async () => {
 };
 
 populateSeasonFilter('f-season').then(activeId => { state.season_id = activeId; load(); });
+
+// Deep link from the "Notify on Document Signed" admin email (?id=<storeId>)
+// straight into that store's popup.
+const deepLinkStoreId = new URLSearchParams(location.search).get('id');
+if (deepLinkStoreId) openStore(deepLinkStoreId);
+
+// A record can change status entirely outside this admin's session (e.g.
+// a document signed via a public link) — re-fetch the list whenever the
+// tab regains focus so it doesn't sit stale indefinitely.
+document.addEventListener('visibilitychange', () => { if (!document.hidden) load(); });
 </script>
 </body>
 </html>

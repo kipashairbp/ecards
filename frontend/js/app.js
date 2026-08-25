@@ -1297,7 +1297,7 @@ async function renderPdfSigningPages(pdfUrl, fields, containerId) {
             <button type="button" class="sig-mode-btn" data-fid="${f.id}" data-mode="draw" style="font-size:9px;padding:2px 6px;border:1px solid var(--brand-gold-dark);border-radius:3px;cursor:pointer">Draw</button>
           </div>
           <div style="position:absolute;top:2px;left:4px;font-size:10px;color:var(--brand-gold-dark);pointer-events:none;font-weight:600;z-index:2">${esc(f.label || (f.type === 'signature' ? 'Signature' : 'Initial'))}${f.required !== false ? ' *' : ''}</div>
-          <input type="text" class="sig-type-input" data-fid="${f.id}" placeholder="${isInitial ? 'Type your initials' : 'Type your full name'}"
+          <input type="text" class="sig-type-input" data-fid="${f.id}" dir="auto" placeholder="${isInitial ? 'Type your initials' : 'Type your full name'}"
             style="width:100%;height:100%;box-sizing:border-box;padding:16px 8px 4px;border:1.5px dashed var(--brand-gold-dark);border-radius:4px;background:rgba(255,247,225,.65);font-family:${SIGNATURE_FONT_FAMILY};font-weight:700;font-size:${isInitial ? 18 : 22}px;color:#241a15">
           <canvas id="sig-${f.id}" class="sign-field-canvas" style="display:none;width:100%;height:100%;background:rgba(255,247,225,.65);border:1.5px dashed var(--brand-gold-dark);border-radius:4px;cursor:crosshair"></canvas>`;
       } else {
@@ -1312,7 +1312,7 @@ async function renderPdfSigningPages(pdfUrl, fields, containerId) {
         if (f.type === 'date') {
           overlay.innerHTML = `<input type="date" class="sign-field-text" data-fid="${f.id}" value="${new Date().toISOString().slice(0, 10)}" style="${fieldStyle}">`;
         } else {
-          overlay.innerHTML = `<input type="text" class="sign-field-text" data-fid="${f.id}" placeholder="${esc(f.label || 'Text')}${f.required !== false ? ' *' : ''}" style="${fieldStyle}">`;
+          overlay.innerHTML = `<input type="text" class="sign-field-text" data-fid="${f.id}" dir="auto" placeholder="${esc(f.label || 'Text')}${f.required !== false ? ' *' : ''}" style="${fieldStyle}">`;
         }
       }
       pageWrap.appendChild(overlay);

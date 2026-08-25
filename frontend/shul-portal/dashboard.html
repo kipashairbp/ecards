@@ -153,8 +153,11 @@ window.submitDrafts = async () => {
   try {
     const r = await api('/applicants/mass-submit-drafts', { method: 'POST', body: { ids: [...selectedDrafts] } });
     let msg = `Submitted ${r.submitted}`;
-    if (r.skippedSlotsFull) msg += ` (${r.skippedSlotsFull} skipped — all slots used)`;
-    toast(msg, !r.submitted && r.skippedSlotsFull);
+    const notes = [];
+    if (r.skippedIncomplete) notes.push(`${r.skippedIncomplete} still missing information`);
+    if (r.skippedSlotsFull) notes.push(`${r.skippedSlotsFull} skipped — all slots used`);
+    if (notes.length) msg += ` (${notes.join(', ')})`;
+    toast(msg, !r.submitted && (r.skippedIncomplete || r.skippedSlotsFull));
     load();
   } catch (err) { toast(err.message, true); }
 };
@@ -240,58 +243,92 @@ async function openApplicant(id) {
   try {
     const { applicant: a } = await api(`/applicants/${id}`);
     if (a.approval_status === 'incomplete') return openReenrollment(a);
-    openModal(`${a.first_name} ${a.last_name}`, `
-      <div class="grid-2">
-        <div><strong>Applicant ID</strong><br><code>${esc(a.external_id||'')}</code></div>
-        <div><strong>Status</strong><br>${badge(a.approval_status,a.approval_status)}</div>
-      </div>
-      <div class="divider"></div>
-      <div class="grid-2">
-        <div><strong>First Name</strong><br>${esc(a.first_name||'')}</div>
-        <div><strong>Last Name</strong><br>${esc(a.last_name||'')}</div>
-      </div>
-      <div class="grid-2">
-        <div><strong>Marital Status</strong><br>${esc(a.marital_status||'')}</div>
-        <div><strong>Children</strong><br>${a.num_children??0}</div>
-      </div>
-      <div class="grid-2">
-        <div><strong>Home Phone</strong><br>${esc(a.home_phone||'')}</div>
-        <div><strong>Email</strong><br>${esc(a.email||'')}</div>
-      </div>
-      <div class="grid-2">
-        <div><strong>Husband Cell</strong><br>${esc(a.husband_cell||'')}</div>
-        <div><strong>Wife Cell</strong><br>${esc(a.wife_cell||'')}</div>
-      </div>
-      <div class="grid-2">
-        <div><strong>Preferred Contact</strong><br>${esc(a.preferred_contact_method||'')}</div>
-        <div><strong>Number To Use</strong><br>${esc(a.preferred_number||'')}</div>
-      </div>
-      <div class="divider"></div>
-      <p><strong>Address</strong><br>${esc(a.address||'')}</p>
-      <div class="grid-2">
-        <div><strong>City</strong><br>${esc(a.city||'')}</div>
-        <div><strong>State</strong><br>${esc(a.state||'')}</div>
-      </div>
-      <p><strong>Zip</strong><br>${esc(a.zip||'')}</p>
-      <p><strong>Home for Yom Tov</strong><br>${a.home_for_yomtov?'Yes':'No'}</p>
-      <p><strong>Comments</strong><br>${esc(a.comments||'')||'<span class="small-muted">None</span>'}</p>
-      ${'card_amount' in a ? `<div class="divider"></div><p><strong>Card Amount</strong><br>${a.card_amount!=null?fmtMoney(a.card_amount):'Not yet set'}</p>` : ''}
-      ${a.requiresShulContribution ? `<div class="divider"></div>
-      <label>Amount Your Shul Gave This Family ($)</label>
-      <input id="e-shul-contrib-amount" type="number" step="0.01" min="0" value="${a.shul_contribution_amount ?? ''}">
-      <div class="checkbox-row" style="margin-top:10px"><input type="checkbox" id="e-shul-contrib-confirmed" ${a.shul_contribution_confirmed?'checked':''}>
-        <label for="e-shul-contrib-confirmed" style="margin:0">I confirm this amount is accurate</label></div>
-      <p class="small-muted">This must be entered and confirmed before this applicant can be approved.</p>` : ''}
-      <p class="small-muted">Editable fields are locked once reviewed by the administrator; contact your admin for changes.</p>
-    `, a.requiresShulContribution ? `<button class="btn btn-primary btn-sm" onclick="saveShulContribution('${id}')">Save</button>` : '');
+    if (a.approval_status === 'approved') return openApplicantReadOnly(a);
+    return openApplicantEdit(a);
   } catch (err) { toast(err.message, true); }
 }
-window.saveShulContribution = async (id) => {
-  const amountEl = qs('#e-shul-contrib-amount');
-  const body = {
-    shul_contribution_amount: amountEl.value === '' ? null : +amountEl.value,
-    shul_contribution_confirmed: qs('#e-shul-contrib-confirmed').checked,
-  };
+// Once an admin has approved the applicant, the record is locked to the
+// shul — read-only display, same fields the editable view below shows.
+function openApplicantReadOnly(a) {
+  openModal(`${esc(a.first_name)} ${esc(a.last_name)}`, `
+    <div class="grid-2">
+      <div><strong>Applicant ID</strong><br><code>${esc(a.external_id||'')}</code></div>
+      <div><strong>Status</strong><br>${badge(a.approval_status,a.approval_status)}</div>
+    </div>
+    <div class="divider"></div>
+    <div class="grid-2">
+      <div><strong>First Name</strong><br>${esc(a.first_name||'')}</div>
+      <div><strong>Last Name</strong><br>${esc(a.last_name||'')}</div>
+    </div>
+    <div class="grid-2">
+      <div><strong>Marital Status</strong><br>${esc(a.marital_status||'')}</div>
+      <div><strong>Children</strong><br>${a.num_children??0}</div>
+    </div>
+    <div class="grid-2">
+      <div><strong>Home Phone</strong><br>${esc(a.home_phone||'')}</div>
+      <div><strong>Email</strong><br>${esc(a.email||'')}</div>
+    </div>
+    <div class="grid-2">
+      <div><strong>Husband Cell</strong><br>${esc(a.husband_cell||'')}</div>
+      <div><strong>Wife Cell</strong><br>${esc(a.wife_cell||'')}</div>
+    </div>
+    <div class="grid-2">
+      <div><strong>Preferred Contact</strong><br>${esc(a.preferred_contact_method||'')}</div>
+      <div><strong>Number To Use</strong><br>${esc(a.preferred_number||'')}</div>
+    </div>
+    <div class="divider"></div>
+    <p><strong>Address</strong><br>${esc(a.address||'')}</p>
+    <div class="grid-2">
+      <div><strong>City</strong><br>${esc(a.city||'')}</div>
+      <div><strong>State</strong><br>${esc(a.state||'')}</div>
+    </div>
+    <p><strong>Zip</strong><br>${esc(a.zip||'')}</p>
+    <p><strong>Home for Yom Tov</strong><br>${a.home_for_yomtov?'Yes':'No'}</p>
+    <p><strong>Comments</strong><br>${esc(a.comments||'')||'<span class="small-muted">None</span>'}</p>
+    ${'card_amount' in a ? `<div class="divider"></div><p><strong>Card Amount</strong><br>${a.card_amount!=null?fmtMoney(a.card_amount):'Not yet set'}</p>` : ''}
+    ${a.requiresShulContribution ? `<div class="divider"></div><p><strong>Amount Your Shul Gave This Family</strong><br>${a.shul_contribution_amount!=null?fmtMoney(a.shul_contribution_amount):'Not entered'}</p>` : ''}
+    <p class="small-muted">This applicant has been approved and is locked; contact your admin for changes.</p>
+  `, '');
+}
+// Anything not yet approved (draft/pending/rejected) stays editable by the
+// shul — same schema-driven form the public application and re-enrollment
+// flows use, pre-filled with what's already on file. Saving doesn't require
+// every field to be complete (an in-progress edit isn't a submission), only
+// actually submitting (mass-submit-drafts) does.
+async function openApplicantEdit(a) {
+  const schema = await loadBuiltinSchema('applicant_application');
+  if (!schema) { toast('Could not load the application form — try again shortly.', true); return; }
+  openModal(`${esc(a.first_name)} ${esc(a.last_name)}`, `
+    <div class="grid-2">
+      <div><strong>Applicant ID</strong><br><code>${esc(a.external_id||'')}</code></div>
+      <div><strong>Status</strong><br>${badge(a.approval_status,a.approval_status)}</div>
+    </div>
+    <div class="divider"></div>
+    <form id="edit-applicant-form">${schema.map(f => fieldHtml(f)).join('')}</form>
+    ${a.requiresShulContribution ? `<div class="divider"></div>
+    <label>Amount Your Shul Gave This Family ($)</label>
+    <input id="e-shul-contrib-amount" type="number" step="0.01" min="0" value="${a.shul_contribution_amount ?? ''}">
+    <div class="checkbox-row" style="margin-top:10px"><input type="checkbox" id="e-shul-contrib-confirmed" ${a.shul_contribution_confirmed?'checked':''}>
+      <label for="e-shul-contrib-confirmed" style="margin:0">I confirm this amount is accurate</label></div>
+    <p class="small-muted">This must be entered and confirmed before this applicant can be approved.</p>` : ''}
+  `, `<button class="btn btn-primary btn-sm" onclick="saveApplicantEdit('${a.id}')">Save</button>`);
+  loadGoogleMaps().then(() => { attachPlacesAutocomplete('address', { address: 'address', city: 'city', state: 'state', zip: 'zip' }); });
+  for (const f of schema) {
+    const el = qs('#' + f.key);
+    if (!el || a[f.key] === undefined || a[f.key] === null) continue;
+    if (f.type === 'checkbox') el.checked = !!a[f.key];
+    else el.value = a[f.key];
+  }
+}
+window.saveApplicantEdit = async (id) => {
+  const fd = new FormData(qs('#edit-applicant-form'));
+  const body = {};
+  for (const [k, v] of fd.entries()) body[k] = v;
+  qsa('input[type=checkbox]', qs('#edit-applicant-form')).forEach(c => body[c.name] = c.checked);
+  if (qs('#e-shul-contrib-amount')) {
+    body.shul_contribution_amount = qs('#e-shul-contrib-amount').value === '' ? null : +qs('#e-shul-contrib-amount').value;
+    body.shul_contribution_confirmed = qs('#e-shul-contrib-confirmed').checked;
+  }
   try { await api(`/applicants/${id}`, { method: 'PUT', body }); toast('Saved'); closeModal(); load(); } catch (err) { toast(err.message, true); }
 };
 load();

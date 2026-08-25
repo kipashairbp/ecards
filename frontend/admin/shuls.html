@@ -648,6 +648,18 @@ window.submitShulMerge = async (flagId) => {
 attachColumnCustomizer('btn-columns', 'columns_shuls', SHUL_COLUMNS, DEFAULT_SHUL_COLUMNS, (order) => { activeColumns = order; renderThead(); load(); })
   .then(order => { activeColumns = order; renderThead(); });
 populateSeasonFilter('f-season').then(activeId => { state.season_id = activeId; load(); });
+
+// Deep link from the "Notify on Document Signed" admin email (?id=<shulId>)
+// straight into that shul's popup.
+const deepLinkShulId = new URLSearchParams(location.search).get('id');
+if (deepLinkShulId) openShul(deepLinkShulId);
+
+// A shul can sign their contract entirely outside this admin's session
+// (their own public link) — patchShulRow() catches that the moment this
+// admin views that shul's popup, but if the list was just left open and
+// nothing was ever clicked, re-fetch it whenever the tab regains focus so
+// it doesn't sit stale indefinitely.
+document.addEventListener('visibilitychange', () => { if (!document.hidden) load(); });
 attachLiveRefresh('live-banner', async () => {
   const params = new URLSearchParams({ search: state.search, status: state.status, season_id: state.season_id, pageSize: 1 });
   const { total } = await api('/shuls?' + params);

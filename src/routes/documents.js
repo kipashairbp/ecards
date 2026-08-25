@@ -321,8 +321,12 @@ router.post('/sign/:token/sign', async (req, res) => {
     const { emailError } = await sendMailChecked(document.org_id, toEmail, tmpl.subject, tmpl.body, { replyTo: tmpl.replyTo });
     if (emailError) console.error('[mail] signed-document link email failed:', emailError);
   }
+  const entityUrlPath = document.entity_type === 'applicant' ? `/admin/applicants?id=${document.entity_id}`
+    : document.entity_type === 'store' ? `/admin/stores?id=${document.entity_id}`
+    : '/admin/esignatures';
   await notifyNewSignup(document.org_id, 'notify_doc_signed_email', 'docSigned', {
     docTitle: document.title || 'Document', entityName: entityName || '', signerName: signer_name, signedAt,
+    entityUrl: `${process.env.APP_URL || ''}${entityUrlPath}`,
   });
   res.json({ ok: true, message: 'Document signed. Thank you.' });
 });

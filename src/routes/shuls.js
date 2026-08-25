@@ -205,6 +205,7 @@ router.post('/contract/:token/sign', async (req, res) => {
   logAudit(shul.org_id, null, 'esign', 'contract', contract.id, null, { signer_name, signedAt }, req.ip);
   await notifyNewSignup(shul.org_id, 'notify_doc_signed_email', 'docSigned', {
     docTitle: 'Shul Contract', entityName: shul.name_en || '', signerName: signer_name, signedAt,
+    entityUrl: `${process.env.APP_URL || ''}/admin/shuls?id=${shul.id}`,
   });
   res.json({ ok: true, message: 'Contract signed. An administrator will review and set up your account.' });
 });
