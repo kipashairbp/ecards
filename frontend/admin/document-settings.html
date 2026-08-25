@@ -27,10 +27,12 @@ renderShell('/admin/document-settings', `
       <button class="btn btn-sm btn-primary" style="margin-bottom:16px" onclick="saveContractAtSignup('shul')">Save</button>
       <p class="small-muted" id="pdf-status">Checking…</p>
       <input type="file" id="contract-pdf-file" accept="application/pdf">
-      <div style="margin-top:12px;display:flex;gap:8px">
+      <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn btn-sm btn-primary" onclick="uploadContractPdf()">Upload PDF</button>
         <button class="btn btn-sm btn-outline" id="btn-remove-pdf" style="display:none" onclick="removeContractPdf()">Remove & Use Generated Template</button>
+        <button class="btn btn-sm btn-outline" onclick="overrideSentContracts()">Override Sent, Unsigned Contracts</button>
       </div>
+      <p class="small-muted" style="margin-top:6px">Uploading a new PDF or changing the text below only affects contracts sent from now on. Use "Override Sent, Unsigned Contracts" to update every contract that's already been sent but not yet signed — their existing links keep working, no new email is sent. Signed contracts are never touched.</p>
       <label style="margin-top:16px">Template Text <span class="small-muted">(used only if no PDF is uploaded above)</span></label>
       <textarea id="contract-text" rows="8"></textarea>
       <div style="margin-top:14px;display:flex;gap:8px">
@@ -110,6 +112,13 @@ window.uploadContractPdf = async () => {
 window.removeContractPdf = async () => {
   if (!confirm('Remove the custom PDF and go back to the generated text template?')) return;
   try { await api('/contract-settings/contract-pdf', { method: 'DELETE' }); toast('Removed'); loadContractPdfStatus(); } catch (err) { toast(err.message, true); }
+};
+window.overrideSentContracts = async () => {
+  if (!confirm('Update every sent-but-unsigned contract to the current template? Existing signing links keep working — no new email is sent. Signed contracts are never touched.')) return;
+  try {
+    const { updated } = await api('/shuls/contracts/regenerate-unsigned', { method: 'POST' });
+    toast(updated ? `Updated ${updated} unsigned contract${updated === 1 ? '' : 's'}` : 'No sent-but-unsigned contracts to update');
+  } catch (err) { toast(err.message, true); }
 };
 
 async function loadDocPdfStatus(entityType) {

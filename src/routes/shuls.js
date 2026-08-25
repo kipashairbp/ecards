@@ -226,7 +226,7 @@ router.get('/all-list', (req, res) => {
 });
 
 router.get('/', (req, res) => {
-  const { search, status, season_id, sort = 'created_at', dir = 'DESC', page = 1, pageSize = 50 } = req.query;
+  const { search, status, paused, season_id, sort = 'created_at', dir = 'DESC', page = 1, pageSize = 50 } = req.query;
   // Locked system shuls (e.g. "Ezras Habayis") are excluded from the normal
   // shul-management list — they're not a real shul to review/approve/edit.
   let where = 'WHERE org_id = ? AND is_locked = 0';
@@ -236,6 +236,9 @@ router.get('/', (req, res) => {
     params.push(req.user.id);
   }
   if (status) { where += ' AND status = ?'; params.push(status); }
+  // is_paused is orthogonal to status (a shul can be paused at any status),
+  // so this is a separate filter, not one of the status dropdown's values.
+  if (paused === '1' || paused === '0') { where += ' AND is_paused = ?'; params.push(+paused); }
   if (season_id) { where += ' AND season_id = ?'; params.push(season_id); }
   if (search) {
     where += ` AND (name_en LIKE ? OR name_he LIKE ? OR address LIKE ? OR city LIKE ? OR state LIKE ? OR zip LIKE ?
@@ -261,10 +264,11 @@ router.get('/', (req, res) => {
 // Full-detail CSV export — every field, no pagination, respects the same
 // filters as the list view. Must be registered before /:id.
 router.get('/export', requirePermission('shuls', 'can_export'), (req, res) => {
-  const { search, status, season_id } = req.query;
+  const { search, status, paused, season_id } = req.query;
   let where = 'WHERE org_id = ? AND is_locked = 0';
   const params = [req.user.org_id];
   if (status) { where += ' AND status = ?'; params.push(status); }
+  if (paused === '1' || paused === '0') { where += ' AND is_paused = ?'; params.push(+paused); }
   if (season_id) { where += ' AND season_id = ?'; params.push(season_id); }
   if (search) {
     where += ` AND (name_en LIKE ? OR name_he LIKE ? OR address LIKE ? OR city LIKE ? OR state LIKE ? OR zip LIKE ?
@@ -733,6 +737,35 @@ router.post('/mass-send-contract', requirePermission('shuls', 'can_edit'), async
   }
   logMassAudit(req.user.org_id, req.user.id, 'mass-send-contract', 'shul', affectedIds, { skipped, emailErrors, names }, req.ip);
   res.json({ sent, skipped, emailErrors });
+});
+
+// Overrides every already-sent-but-not-yet-signed contract's PDF in place
+// with whatever the contract template (uploaded PDF or generated text)
+// currently is — for "I just fixed a typo in the template, get it onto the
+// links that are already out" without re-sending anything. Deliberately
+// does NOT touch sign_token, sent_at, or create a new contract row — the
+// shul's existing email link keeps working and now serves the updated
+// file, since generateContractPdf always writes to the same shul-id-keyed
+// path a 'sent' contract's pdf_path already points to. Signed contracts are
+// never selected here at all (same protection sendContractForShul already
+// gives them) — this can't touch an executed agreement.
+router.post('/contracts/regenerate-unsigned', requirePermission('shuls', 'can_edit'), async (req, res) => {
+  if (req.user.role === 'shul') return res.status(403).json({ error: 'Not permitted' });
+  const shulIds = db.prepare(`SELECT DISTINCT c.shul_id FROM contracts c JOIN shuls s ON s.id = c.shul_id WHERE c.status = 'sent' AND s.org_id = ?`).all(req.user.org_id).map(r => r.shul_id);
+  if (!shulIds.length) return res.json({ updated: 0 });
+  const org = db.prepare('SELECT * FROM organizations WHERE id = ?').get(req.user.org_id);
+  const templateSetting = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'contract_template_text'`).get(req.user.org_id);
+  let updated = 0; const affectedIds = [], names = [];
+  for (const shulId of shulIds) {
+    const shul = db.prepare('SELECT * FROM shuls WHERE id = ?').get(shulId);
+    if (!shul) continue;
+    const season = db.prepare('SELECT * FROM seasons WHERE id = ?').get(shul.season_id);
+    await generateContractPdf({ shul, season, templateText: templateSetting?.value, orgName: org.name });
+    affectedIds.push(shul.id); names.push(shul.name_en);
+    updated++;
+  }
+  logMassAudit(req.user.org_id, req.user.id, 'regenerate-unsigned-contracts', 'shul', affectedIds, { names }, req.ip);
+  res.json({ updated });
 });
 
 // Manually move a shul back to 'submitted' (the pending-review state before

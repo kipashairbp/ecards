@@ -14,13 +14,14 @@
 Auth.requireAdmin();
 renderShell('/admin/stores', `
   <div class="flex-between"><h2>Participating Stores</h2><div class="pill-row"><button class="btn btn-outline btn-sm" id="btn-template">Download Template</button><button class="btn btn-outline btn-sm" id="btn-import">Mass Upload</button><button class="btn btn-outline btn-sm" id="btn-export">Export Excel</button><button class="btn btn-primary btn-sm" id="btn-new">+ Add Store</button></div></div>
-  <div class="toolbar"><input id="f-search" placeholder="Search store name or city…"><select id="f-status"><option value="">All statuses</option><option value="pending">Pending</option><option value="in_progress">In Progress</option><option value="active">Active</option><option value="inactive">Inactive</option></select><select id="f-source"><option value="">All sources</option><option value="application">Self-Applied</option><option value="admin">Admin Added</option></select>
+  <div class="toolbar"><input id="f-search" placeholder="Search store name or city…"><select id="f-status"><option value="">All statuses</option><option value="pending">Pending</option><option value="in_progress">In Progress</option><option value="active">Active</option><option value="inactive">Inactive</option><option value="rejected">Rejected</option></select><select id="f-source"><option value="">All sources</option><option value="application">Self-Applied</option><option value="admin">Admin Added</option></select>
     <select id="f-season"></select>
     <select id="mass-action">
       <option value="status-pending">Set to Pending</option>
       <option value="status-in_progress">Set to In Progress</option>
       <option value="status-active">Set to Active</option>
       <option value="status-inactive">Set to Inactive</option>
+      <option value="status-rejected">Reject</option>
       <option value="invite">Invite to Portal</option>
       <option value="carry-forward">Carry Forward to Season…</option>
       <option value="delete">Delete Permanently</option>
@@ -77,6 +78,7 @@ const MASS_ACTIONS = {
   'status-in_progress': { confirm: n => `Set ${n} selected store(s) to In Progress?`, run: (ids) => api('/stores/mass-set-status', { method: 'POST', body: { ids, setup_status: 'in_progress' } }), summarize: r => ({ msg: `Updated ${r.updated}, skipped ${r.skipped}` }) },
   'status-active': { confirm: n => `Set ${n} selected store(s) to Active?`, run: (ids) => api('/stores/mass-set-status', { method: 'POST', body: { ids, setup_status: 'active' } }), summarize: r => ({ msg: `Updated ${r.updated}, skipped ${r.skipped}` }) },
   'status-inactive': { confirm: n => `Set ${n} selected store(s) to Inactive?`, run: (ids) => api('/stores/mass-set-status', { method: 'POST', body: { ids, setup_status: 'inactive' } }), summarize: r => ({ msg: `Updated ${r.updated}, skipped ${r.skipped}` }) },
+  'status-rejected': { confirm: n => `Reject ${n} selected store(s)?`, run: (ids) => api('/stores/mass-set-status', { method: 'POST', body: { ids, setup_status: 'rejected' } }), summarize: r => ({ msg: `Rejected ${r.updated}, skipped ${r.skipped}` }) },
   invite: {
     confirm: n => `Invite ${n} selected store(s) to their portal? Each uses their owner or manager email on file.`,
     run: (ids) => api('/stores/mass-invite', { method: 'POST', body: { ids } }),
@@ -116,7 +118,7 @@ async function openStore(id) {
       <div id="stab-info">
         <div class="grid-2">
           <div><label>Store Name</label><input id="e-name" value="${esc(s.name)}"></div>
-          <div><label>Setup Status</label><select id="e-status"><option ${s.setup_status==='pending'?'selected':''}>pending</option><option ${s.setup_status==='in_progress'?'selected':''}>in_progress</option><option ${s.setup_status==='active'?'selected':''}>active</option><option ${s.setup_status==='inactive'?'selected':''}>inactive</option></select></div>
+          <div><label>Setup Status</label><select id="e-status"><option ${s.setup_status==='pending'?'selected':''}>pending</option><option ${s.setup_status==='in_progress'?'selected':''}>in_progress</option><option ${s.setup_status==='active'?'selected':''}>active</option><option ${s.setup_status==='inactive'?'selected':''}>inactive</option><option ${s.setup_status==='rejected'?'selected':''}>rejected</option></select></div>
         </div>
         <p class="small-muted">Source: ${s.source === 'application' ? 'Self-applied' : 'Added by admin'} · Onboarding: ${(s.onboarding_step||0) >= 3 ? 'Complete' : (s.portal_user_id ? `Step ${s.onboarding_step||0} of 3` : 'Not yet invited to portal')}</p>
         <label>Address</label><input id="e-address" value="${esc(s.address||'')}">

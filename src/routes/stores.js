@@ -232,7 +232,7 @@ router.put('/:id', requirePermission('stores', 'can_edit'), (req, res) => {
   res.json({ store: db.prepare('SELECT * FROM stores WHERE id = ?').get(store.id) });
 });
 
-const STORE_STATUSES = ['pending', 'in_progress', 'active', 'inactive'];
+const STORE_STATUSES = ['pending', 'in_progress', 'active', 'inactive', 'rejected'];
 router.post('/mass-set-status', requirePermission('stores', 'can_edit'), (req, res) => {
   const { ids, setup_status } = req.body || {};
   if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids array required' });

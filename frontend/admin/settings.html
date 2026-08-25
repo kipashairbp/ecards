@@ -270,20 +270,22 @@ async function loadEmailTemplates() {
   emailTemplatesCache = templates;
 }
 let emailTemplatesCache = [];
+let etBodyEditor = null;
 window.openEditEmailTemplate = (key) => {
   const t = emailTemplatesCache.find(x => x.key === key);
   if (!t) return;
   const body = `
     <label>Subject</label><input id="et-subject" value="${esc(t.subject)}">
-    <label>Body (HTML)</label><textarea id="et-body" rows="10">${esc(t.body)}</textarea>
-    <label>Reply-To <span class="small-muted">(leave blank to use ${t.defaultReplyTo ? 'the org default, ' + esc(t.defaultReplyTo) : 'the sending address'})</span></label>
+    <label>Body</label><div id="et-body-rte"></div>
+    <label style="margin-top:14px">Reply-To <span class="small-muted">(leave blank to use ${t.defaultReplyTo ? 'the org default, ' + esc(t.defaultReplyTo) : 'the sending address'})</span></label>
     <input id="et-replyto" value="${esc(t.replyTo || '')}" placeholder="e.g. approvals@yourorg.org">
     <p class="small-muted" style="margin-top:10px">Available placeholders: ${t.vars.map(v => `<code>{{${esc(v)}}}</code>`).join(' ')}</p>
   `;
   openModal(t.label, body, `<button class="btn btn-primary btn-sm" onclick="saveEmailTemplate('${key}')">Save</button>`);
+  etBodyEditor = createRichTextEditor('et-body-rte', t.body);
 };
 window.saveEmailTemplate = async (key) => {
-  const body = { subject: qs('#et-subject').value, body: qs('#et-body').value, reply_to: qs('#et-replyto').value };
+  const body = { subject: qs('#et-subject').value, body: etBodyEditor.getHtml(), reply_to: qs('#et-replyto').value };
   try { await api(`/settings/email-templates/${key}`, { method: 'PUT', body }); toast('Saved'); closeModal(); loadEmailTemplates(); } catch (err) { toast(err.message, true); }
 };
 window.resetEmailTemplate = async (key) => {

@@ -907,7 +907,7 @@ async function loadMessagesTab(entityType, entityId, containerId, defaultPhone, 
         </div>
         ${emailTemplates.length ? `<label>Use Template</label><select id="msg-email-template-${entityId}" onchange="applyQuickSendTemplate('email','${entityType}','${entityId}')">${emailTemplateOptions}</select>` : ''}
         <label>Subject</label><input id="msg-email-subject-${entityId}" placeholder="Subject">
-        <label>Message</label><textarea id="msg-email-body-${entityId}" rows="3" placeholder="Type a message…"></textarea>
+        <label>Message</label><div id="msg-email-body-${entityId}"></div>
         <p class="small-muted" style="margin-top:4px">Available variables: ${varsHintHtml(entityType, vars)}</p>
         <button class="btn btn-sm btn-primary" style="margin-top:8px" onclick="sendQuickEmail('${entityType}','${entityId}','${containerId}','${safePhone}','${safeEmail}')">Send Email</button>
       </div>
@@ -917,6 +917,8 @@ async function loadMessagesTab(entityType, entityId, containerId, defaultPhone, 
           <div class="small-muted">${fmtDateTime(m.created_at)}${m.error_message ? ' · ' + esc(m.error_message) : ''}</div>
         </div>`).join('') : '<p class="small-muted">No emails sent yet.</p>'}</div>
     `;
+    window.__msgEmailEditors = window.__msgEmailEditors || {};
+    window.__msgEmailEditors[entityId] = createRichTextEditor(`msg-email-body-${entityId}`);
   } catch (err) { container.innerHTML = `<p class="small-muted">${esc(err.message)}</p>`; }
 }
 window.applyQuickSendTemplate = (kind, entityType, entityId) => {
@@ -928,7 +930,7 @@ window.applyQuickSendTemplate = (kind, entityType, entityId) => {
   } else {
     const t = store.email.find(x => x.id === qs(`#msg-email-template-${entityId}`).value);
     qs(`#msg-email-subject-${entityId}`).value = t ? substituteVars(t.subject, store.vars) : '';
-    qs(`#msg-email-body-${entityId}`).value = t ? substituteVars(t.body_html, store.vars) : '';
+    window.__msgEmailEditors?.[entityId]?.setHtml(t ? substituteVars(t.body_html, store.vars) : '');
   }
 };
 window.sendQuickSms = async (entityType, entityId, containerId, defaultPhone, defaultEmail) => {
@@ -944,7 +946,7 @@ window.sendQuickSms = async (entityType, entityId, containerId, defaultPhone, de
 window.sendQuickEmail = async (entityType, entityId, containerId, defaultPhone, defaultEmail) => {
   const to = qs(`#msg-email-to-${entityId}`).value.trim();
   const subject = qs(`#msg-email-subject-${entityId}`).value.trim();
-  const body = qs(`#msg-email-body-${entityId}`).value.trim();
+  const body = window.__msgEmailEditors?.[entityId]?.getHtml().trim() || '';
   if (!subject || !body) return toast('Enter a subject and message', true);
   try {
     const r = await api(`/${entityType}s/${entityId}/send-email`, { method: 'POST', body: { to, subject, body } });

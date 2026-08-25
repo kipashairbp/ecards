@@ -26,6 +26,7 @@ renderShell('/admin/shuls', `
   <div class="toolbar">
     <input id="f-search" placeholder="Search name, city, Rav, Gabai…">
     <select id="f-status"><option value="">All statuses</option><option value="submitted">Submitted</option><option value="contract_sent">Contract Sent</option><option value="contract_signed">Contract Signed</option><option value="approved">Approved</option><option value="rejected">Rejected</option></select>
+    <select id="f-paused"><option value="">Paused: All</option><option value="1">Paused only</option><option value="0">Not paused</option></select>
     <select id="f-season"></select>
     <button class="btn btn-outline btn-sm" id="f-dupes">Duplicates</button>
     <select id="f-pagesize"><option value="25">25 / page</option><option value="50">50 / page</option><option value="100">100 / page</option><option value="200">200 / page</option></select>
@@ -52,7 +53,7 @@ renderShell('/admin/shuls', `
   <div class="paginator" id="pager"></div>
 `);
 
-let state = { search:'', status:'', season_id:'', sort:'created_at', dir:'DESC', page:1, pageSize:25 };
+let state = { search:'', status:'', paused:'', season_id:'', sort:'created_at', dir:'DESC', page:1, pageSize:25 };
 let selected = new Set();
 if (new URLSearchParams(location.search).get('dup') === '1') showDuplicates();
 
@@ -113,7 +114,7 @@ qs('#thead').parentElement.addEventListener('click', (e) => {
 });
 
 async function load() {
-  const params = new URLSearchParams({ search: state.search, status: state.status, season_id: state.season_id, sort: state.sort, dir: state.dir, page: state.page, pageSize: state.pageSize });
+  const params = new URLSearchParams({ search: state.search, status: state.status, paused: state.paused, season_id: state.season_id, sort: state.sort, dir: state.dir, page: state.page, pageSize: state.pageSize });
   try {
     const { shuls, total } = await api('/shuls?' + params);
     const cols = activeColumns.map(k => SHUL_COLUMNS.find(c => c.key === k)).filter(Boolean);
@@ -161,6 +162,7 @@ function onCheck(e) {
 
 qs('#f-search').addEventListener('input', debounce(() => { state.search = qs('#f-search').value; state.page = 1; load(); }, 350));
 qs('#f-status').addEventListener('change', () => { state.status = qs('#f-status').value; state.page = 1; load(); });
+qs('#f-paused').addEventListener('change', () => { state.paused = qs('#f-paused').value; state.page = 1; load(); });
 qs('#f-season').addEventListener('change', () => { state.season_id = qs('#f-season').value; state.page = 1; load(); });
 qs('#f-pagesize').value = state.pageSize;
 qs('#f-pagesize').addEventListener('change', () => { state.pageSize = +qs('#f-pagesize').value; state.page = 1; load(); });
@@ -169,7 +171,7 @@ function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTi
 qs('#btn-template').addEventListener('click', () => downloadAuthed('/shuls/import/template', 'shul_import_template.xlsx'));
 qs('#btn-new').addEventListener('click', () => openShulForm());
 qs('#btn-import').addEventListener('click', () => openImportModal());
-qs('#btn-export').addEventListener('click', () => downloadAuthed('/shuls/export?' + new URLSearchParams({ search: state.search, status: state.status, season_id: state.season_id }), 'shuls.xlsx'));
+qs('#btn-export').addEventListener('click', () => downloadAuthed('/shuls/export?' + new URLSearchParams({ search: state.search, status: state.status, paused: state.paused, season_id: state.season_id }), 'shuls.xlsx'));
 qs('#f-dupes').addEventListener('click', showDuplicates);
 // One entry per option in #mass-action — confirm() is skipped when null
 // (approve prompts for slots instead, which doubles as its own gate: a
