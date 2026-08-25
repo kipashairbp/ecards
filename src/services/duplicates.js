@@ -11,6 +11,13 @@ const MERGE_FIELDS = ['first_name', 'last_name', 'marital_status', 'home_phone',
   'address', 'city', 'state', 'zip', 'preferred_contact_method', 'preferred_number', 'num_children', 'home_for_yomtov',
   'comments', 'card_amount'];
 
+// Same idea for shuls (see mergeShuls below) — real identity/contact data
+// only, never status/slots_allocated/source/portal_user_id, which aren't
+// something to "merge" (the surviving record keeps its own).
+const SHUL_MERGE_FIELDS = ['name_en', 'name_he', 'address', 'city', 'state', 'zip',
+  'ruv_first_name', 'ruv_last_name', 'ruv_phone', 'ruv_address', 'ruv_city', 'ruv_state', 'ruv_zip',
+  'gabai_first_name', 'gabai_last_name', 'gabai_cell', 'gabai_email', 'gabai_address', 'gabai_city', 'gabai_state', 'gabai_zip'];
+
 // Freezes both the newly-created record's owning account AND the matched record's
 // owning account (per spec: "pause both accounts from doing any action or using
 // the card until the duplicate is fixed or bypassed").
@@ -111,10 +118,12 @@ export function applicantsSharePhone(a, b) {
 //    both records exactly as they are. Refused outright if the two records
 //    share an actual phone number — that's never a coincidence, so bypass
 //    isn't offered as an option; mergeApplicants() below is the only path.
-//  - shul duplicates (entity_type 'shul') keep the original simple
-//    bypass/resolve behavior — shuls are a single persistent record per
-//    real shul, not something that spans multiple "accounts" the way an
-//    applicant can span several shuls, so there's no merge concept for them.
+//  - shul duplicates (entity_type 'shul') additionally keep the original
+//    simple bypass/resolve actions on top of mergeShuls() below — either
+//    "these are genuinely two different shuls" (bypass) or "handled some
+//    other way, not by merging" (resolve), for the cases where a real merge
+//    (moving one shul's applicants onto the other, one surviving record)
+//    isn't actually what happened.
 export function resolveFlag(flagId, resolvedByUserId, action) {
   const flag = db.prepare('SELECT * FROM duplicate_flags WHERE id = ?').get(flagId);
   if (!flag) return null;
@@ -202,4 +211,80 @@ export function mergeApplicants(orgId, userId, { primaryId, values } = {}) {
     db.prepare(`UPDATE duplicate_flags SET status='resolved', resolved_by=?, resolved_at=datetime('now') WHERE id IN (${fp})`).run(userId, ...flagIds);
   }
   return { primaryId, memberIds: groupIds };
+}
+
+// Same idea as getMergeGroupIds above, but for shuls: chains through open
+// shul flags AND through duplicate_of_shul_id (shuls have no dedicated
+// merge_group_id column — this reuses the same field a flag already sets,
+// since after a merge it means the same thing: "this record's real,
+// surviving self is that other one"), so re-flagging a shul against one
+// already-merged member pulls the whole existing group back in.
+export function getShulMergeGroupIds(orgId, startIds) {
+  const ids = new Set(startIds);
+  let grew = true;
+  while (grew) {
+    grew = false;
+    const list = [...ids];
+    const placeholders = list.map(() => '?').join(',');
+    for (const r of db.prepare(`SELECT duplicate_of_shul_id FROM shuls WHERE id IN (${placeholders}) AND duplicate_of_shul_id IS NOT NULL`).all(...list)) {
+      if (!ids.has(r.duplicate_of_shul_id)) { ids.add(r.duplicate_of_shul_id); grew = true; }
+    }
+    const list2 = [...ids];
+    const placeholders2 = list2.map(() => '?').join(',');
+    for (const r of db.prepare(`SELECT id FROM shuls WHERE duplicate_of_shul_id IN (${placeholders2})`).all(...list2)) {
+      if (!ids.has(r.id)) { ids.add(r.id); grew = true; }
+    }
+    for (const f of db.prepare(`SELECT entity_id, matched_entity_id FROM duplicate_flags
+        WHERE org_id = ? AND entity_type='shul' AND status='open' AND (entity_id IN (${placeholders}) OR matched_entity_id IN (${placeholders}))`)
+        .all(orgId, ...list, ...list)) {
+      if (!ids.has(f.entity_id)) { ids.add(f.entity_id); grew = true; }
+      if (!ids.has(f.matched_entity_id)) { ids.add(f.matched_entity_id); grew = true; }
+    }
+  }
+  return [...ids];
+}
+
+// Forced resolution for a shul duplicate: admin has confirmed two (or more,
+// chained) shul records are really the same real-world shul. `primaryId`
+// picks which record survives going forward; `values` is the admin's
+// per-field composite (mixed and matched from whichever member's data is
+// correct), written onto the primary only. Every other member's own
+// applicants — the ones actually in the primary's season, since an
+// applicant can never be reassigned across seasons (see applicants.js
+// PUT /:id's identical rule) — are moved onto the primary so nothing
+// submitted under the duplicate is orphaned; the duplicate row itself is
+// left in place (never deleted) as a historical record, marked
+// duplicate_status='merged' and pointed at the primary via
+// duplicate_of_shul_id, unpaused along with its portal login.
+export function mergeShuls(orgId, userId, { primaryId, values } = {}) {
+  if (!primaryId) throw new Error('primaryId is required');
+  const groupIds = getShulMergeGroupIds(orgId, [primaryId]);
+  const placeholders = groupIds.map(() => '?').join(',');
+  const members = db.prepare(`SELECT * FROM shuls WHERE id IN (${placeholders}) AND org_id = ?`).all(...groupIds, orgId);
+  if (members.length < 2) throw new Error('Need at least two related records to merge');
+  const primary = members.find(m => m.id === primaryId);
+  if (!primary) throw new Error('Primary record not found in this group');
+
+  let applicantsReassigned = 0;
+  for (const m of members) {
+    if (m.id === primaryId) continue;
+    const result = db.prepare(`UPDATE applicants SET shul_id = ?, updated_at = datetime('now') WHERE shul_id = ? AND season_id = ?`)
+      .run(primaryId, m.id, primary.season_id);
+    applicantsReassigned += result.changes;
+    db.prepare(`UPDATE shuls SET duplicate_of_shul_id = ?, duplicate_status = 'merged', is_paused = 0, updated_at = datetime('now') WHERE id = ?`).run(primaryId, m.id);
+    db.prepare(`UPDATE users SET is_paused = 0 WHERE shul_id = ?`).run(m.id);
+  }
+  const sets = Object.keys(values || {}).filter(k => SHUL_MERGE_FIELDS.includes(k));
+  const setSql = sets.length ? `, ${sets.map(k => `${k} = ?`).join(', ')}` : '';
+  db.prepare(`UPDATE shuls SET duplicate_status = 'merged', is_paused = 0, updated_at = datetime('now')${setSql} WHERE id = ?`)
+    .run(...sets.map(k => values[k]), primaryId);
+  db.prepare(`UPDATE users SET is_paused = 0 WHERE shul_id = ?`).run(primaryId);
+
+  const flagIds = db.prepare(`SELECT id FROM duplicate_flags WHERE org_id = ? AND entity_type='shul' AND status='open'
+      AND entity_id IN (${placeholders}) AND matched_entity_id IN (${placeholders})`).all(orgId, ...groupIds, ...groupIds).map(r => r.id);
+  if (flagIds.length) {
+    const fp = flagIds.map(() => '?').join(',');
+    db.prepare(`UPDATE duplicate_flags SET status='resolved', resolved_by=?, resolved_at=datetime('now') WHERE id IN (${fp})`).run(userId, ...flagIds);
+  }
+  return { primaryId, memberIds: groupIds, applicantsReassigned };
 }

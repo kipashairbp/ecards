@@ -3,7 +3,7 @@ import multer from 'multer';
 import { db, uuid, DEFAULT_ORG_ID } from '../db.js';
 import { auth, requireAdmin } from '../middleware/auth.js';
 import { requirePermission, redact } from '../middleware/permissions.js';
-import { detectAndFlag, resolveFlag } from '../services/duplicates.js';
+import { detectAndFlag, resolveFlag, getShulMergeGroupIds, mergeShuls } from '../services/duplicates.js';
 import { generateContractPdf, stampSignatureFields, getSignatureFields, resolveSignatureValues } from '../services/pdf.js';
 import { sendMailChecked, renderSystemTemplate, notifyNewSignup, renderSignupDetails } from '../services/mail.js';
 import { sendSmsChecked } from '../services/sms.js';
@@ -961,10 +961,42 @@ router.get('/duplicates/open', requireAdmin, (req, res) => {
 
 router.post('/duplicates/:flagId/resolve', requirePermission('shuls', 'can_edit'), (req, res) => {
   const { action } = req.body || {}; // 'bypass' | 'resolve'
-  const flag = resolveFlag(req.params.flagId, req.user.id, action);
+  try {
+    const flag = resolveFlag(req.params.flagId, req.user.id, action);
+    if (!flag) return res.status(404).json({ error: 'Not found' });
+    logAudit(req.user.org_id, req.user.id, 'resolve_duplicate', 'duplicate_flag', flag.id, null, flag, req.ip);
+    res.json({ flag });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// Full merge group for a flag — usually just the pair, but can chain
+// further if one of them was already merged into a third shul earlier (see
+// getShulMergeGroupIds) — so the compare view always shows every connected
+// record, not just the two the flag itself names.
+router.get('/duplicates/:flagId/group', requireAdmin, (req, res) => {
+  const flag = db.prepare(`SELECT * FROM duplicate_flags WHERE id = ? AND org_id = ? AND entity_type='shul'`).get(req.params.flagId, req.user.org_id);
   if (!flag) return res.status(404).json({ error: 'Not found' });
-  logAudit(req.user.org_id, req.user.id, 'resolve_duplicate', 'duplicate_flag', flag.id, null, flag, req.ip);
-  res.json({ flag });
+  const ids = getShulMergeGroupIds(req.user.org_id, [flag.entity_id, flag.matched_entity_id]);
+  const placeholders = ids.map(() => '?').join(',');
+  const members = db.prepare(`SELECT * FROM shuls WHERE id IN (${placeholders})`).all(...ids)
+    .map(s => ({ ...s, applicant_count: db.prepare('SELECT COUNT(*) c FROM applicants WHERE shul_id = ?').get(s.id).c }));
+  res.json({ flag, members });
+});
+
+// Forces this flag's whole merge group to be resolved as one confirmed
+// duplicate. `primaryId` picks which shul record survives going forward;
+// `values` is the admin's field-by-field chosen composite. Every other
+// member's applicants (in the primary's season) move onto the primary — see
+// mergeShuls in services/duplicates.js for the full behavior.
+router.post('/duplicates/:flagId/merge', requirePermission('shuls', 'can_edit'), (req, res) => {
+  const flag = db.prepare(`SELECT * FROM duplicate_flags WHERE id = ? AND org_id = ? AND entity_type='shul'`).get(req.params.flagId, req.user.org_id);
+  if (!flag) return res.status(404).json({ error: 'Not found' });
+  const { primaryId, values } = req.body || {};
+  try {
+    const result = mergeShuls(req.user.org_id, req.user.id, { primaryId, values });
+    logAudit(req.user.org_id, req.user.id, 'merge', 'shul', primaryId, null, result, req.ip);
+    res.json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 // Mass upload template + import — spec #3: shuls uploaded from the back end

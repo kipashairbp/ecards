@@ -144,7 +144,8 @@ router.put('/signature-box/:kind', requirePermission('contract_settings', 'can_e
     if (!f.id || !SIG_FIELD_TYPES.includes(f.type)) return res.status(400).json({ error: 'Each field needs a valid id and type' });
     if ([f.x, f.y, f.width, f.height].some(v => typeof v !== 'number' || v < 0 || v > 1)) return res.status(400).json({ error: 'x/y/width/height must be numbers between 0 and 1' });
   }
-  const value = JSON.stringify(fields.map(f => ({ id: f.id, type: f.type, label: f.label || '', required: f.required !== false, x: f.x, y: f.y, width: f.width, height: f.height })));
+  const value = JSON.stringify(fields.map(f => ({ id: f.id, type: f.type, label: f.label || '', required: f.required !== false, x: f.x, y: f.y, width: f.width, height: f.height,
+    align: ['center', 'right'].includes(f.align) ? f.align : null })));
   db.prepare(`INSERT INTO settings (org_id, key, value) VALUES (?,?,?)
     ON CONFLICT(org_id, key) DO UPDATE SET value = excluded.value`).run(req.user.org_id, `signature_box_${kind}`, value);
   res.json({ ok: true, fields: JSON.parse(value) });
@@ -175,7 +176,8 @@ router.put('/contract-fields/:kind', requirePermission('contract_settings', 'can
     if (!f.id || !validKeys.has(f.dataField)) return res.status(400).json({ error: 'Each field needs a valid id and a recognized dataField' });
     if ([f.x, f.y, f.width, f.height].some(v => typeof v !== 'number' || v < 0 || v > 1)) return res.status(400).json({ error: 'x/y/width/height must be numbers between 0 and 1' });
   }
-  const value = JSON.stringify(fields.map(f => ({ id: f.id, dataField: f.dataField, x: f.x, y: f.y, width: f.width, height: f.height, fontSize: f.fontSize || null })));
+  const value = JSON.stringify(fields.map(f => ({ id: f.id, dataField: f.dataField, x: f.x, y: f.y, width: f.width, height: f.height, fontSize: f.fontSize || null,
+    align: ['center', 'right'].includes(f.align) ? f.align : null })));
   db.prepare(`INSERT INTO settings (org_id, key, value) VALUES (?,?,?)
     ON CONFLICT(org_id, key) DO UPDATE SET value = excluded.value`).run(req.user.org_id, `contract_data_fields_${kind}`, value);
   res.json({ ok: true, fields: JSON.parse(value) });

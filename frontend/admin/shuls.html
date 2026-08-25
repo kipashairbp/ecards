@@ -534,6 +534,17 @@ const SHUL_COMPARE_FIELDS = [
   ['gabai_first_name','Gabai First Name'], ['gabai_last_name','Gabai Last Name'], ['gabai_cell','Gabai Cell'], ['gabai_email','Gabai Email'],
   ['status','Status'], ['slots_allocated','Slots Allocated'], ['source','Source'],
 ];
+// Keep in sync with SHUL_MERGE_FIELDS in services/duplicates.js — real
+// identity/contact data an admin can pick a per-field winner for when
+// merging. status/slots_allocated/source/portal_user_id aren't "merged";
+// the surviving (primary) record keeps its own.
+const SHUL_MERGE_FIELDS = [
+  ['name_en','Name (English)'], ['name_he','Name (Hebrew)'], ['address','Address'], ['city','City'], ['state','State'], ['zip','Zip'],
+  ['ruv_first_name','Rav First Name'], ['ruv_last_name','Rav Last Name'], ['ruv_phone','Rav Phone'],
+  ['ruv_address','Rav Address'], ['ruv_city','Rav City'], ['ruv_state','Rav State'], ['ruv_zip','Rav Zip'],
+  ['gabai_first_name','Gabai First Name'], ['gabai_last_name','Gabai Last Name'], ['gabai_cell','Gabai Cell'], ['gabai_email','Gabai Email'],
+  ['gabai_address','Gabai Address'], ['gabai_city','Gabai City'], ['gabai_state','Gabai State'], ['gabai_zip','Gabai Zip'],
+];
 
 async function showDuplicates() {
   try {
@@ -544,8 +555,9 @@ async function showDuplicates() {
         <span class="small-muted">Reason: ${esc(f.reason)}</span>
         <div style="margin-top:10px">
           <button class="btn btn-sm btn-outline" onclick="compareDup('${f.id}')">Compare Side-by-Side</button>
+          <button class="btn btn-sm btn-primary" onclick="openMergeView('${f.id}')">Merge &amp; Resolve</button>
           <button class="btn btn-sm btn-outline" onclick="resolveDup('${f.id}','bypass')">Bypass (not a duplicate)</button>
-          <button class="btn btn-sm btn-primary" onclick="resolveDup('${f.id}','resolve')">Mark Resolved</button>
+          <button class="btn btn-sm btn-outline" onclick="resolveDup('${f.id}','resolve')">Mark Resolved</button>
         </div>
       </div>`).join('') : '<p class="small-muted">No open duplicate flags.</p>';
     openModal('Duplicate Shul Flags', body);
@@ -556,11 +568,63 @@ window.compareDup = (flagId) => {
   if (!f) return;
   const body = `<p class="small-muted">Reason flagged: ${esc(f.reason)}</p>` + renderCompareTable(SHUL_COMPARE_FIELDS, f.entity, f.matched);
   const footer = `<button class="btn btn-outline btn-sm" onclick="showDuplicates()">Back to List</button>
+    <button class="btn btn-outline btn-sm" onclick="openMergeView('${flagId}')">Merge &amp; Resolve</button>
     <button class="btn btn-outline btn-sm" onclick="resolveDup('${flagId}','bypass')">Bypass</button>
     <button class="btn btn-primary btn-sm" onclick="resolveDup('${flagId}','resolve')">Mark Resolved</button>`;
   openModal('Compare Records', body, footer);
 };
 window.resolveDup = async (id, action) => { try { await api(`/shuls/duplicates/${id}/resolve`, { method: 'POST', body: { action } }); closeModal(); showDuplicates(); load(); } catch (err) { toast(err.message, true); } };
+
+// The merge group can chain past just the flag's original pair if one of
+// them was already merged into a third shul earlier (see
+// getShulMergeGroupIds server-side) — always fetches the full connected
+// group, not just the two entities the flag itself names.
+let shulMergeGroupCache = null;
+window.openMergeView = async (flagId) => {
+  try {
+    const group = await api(`/shuls/duplicates/${flagId}/group`);
+    shulMergeGroupCache = group;
+    renderShulMergeView();
+  } catch (err) { toast(err.message, true); }
+};
+function renderShulMergeView() {
+  const { flag, members } = shulMergeGroupCache;
+  const cols = members.map((m, i) => `<th style="min-width:180px">
+      <div class="checkbox-row" style="margin-bottom:4px"><input type="radio" name="shul-merge-primary" value="${esc(m.id)}" id="smp-${i}" ${i===0?'checked':''}>
+        <label for="smp-${i}" style="margin:0"><strong>${esc(m.name_en)}</strong></label></div>
+      <span class="small-muted">${esc(m.status)}${m.applicant_count!=null?` · ${m.applicant_count} applicant(s)`:''}</span>
+    </th>`).join('');
+  const rows = SHUL_MERGE_FIELDS.map(([key, label]) => {
+    const cells = members.map((m, i) => {
+      const v = m[key];
+      return `<td><label class="checkbox-row" style="margin:0"><input type="radio" name="smf-${key}" value="${esc(String(v ?? ''))}" ${i===0?'checked':''}> <span>${esc(String(v ?? ''))}</span></label></td>`;
+    }).join('');
+    return `<tr><td class="small-muted" style="white-space:nowrap">${esc(label)}</td>${cells}</tr>`;
+  }).join('');
+  const body = `
+    <p class="small-muted">Reason flagged: ${esc(flag.reason)}. ${members.length > 2 ? `This is a group of ${members.length} records.` : ''}
+    Pick which record is <strong>Primary</strong> (that's the one that keeps going forward) — every other member's applicants (in the primary's season) move onto it, and it's never deleted, just marked merged. Then pick which value to keep for each field — you can mix and match from any record.</p>
+    <div style="overflow-x:auto"><table><thead><tr><th></th>${cols}</tr></thead><tbody>${rows}</tbody></table></div>
+  `;
+  const footer = `<button class="btn btn-outline btn-sm" onclick="showDuplicates()">Back to List</button>
+    <button class="btn btn-outline btn-sm" onclick="resolveDup('${flag.id}','bypass')">Bypass (not a duplicate)</button>
+    <button class="btn btn-primary btn-sm" onclick="submitShulMerge('${flag.id}')">Merge &amp; Resolve</button>`;
+  openModal('Compare & Merge Shuls', body, footer);
+}
+window.submitShulMerge = async (flagId) => {
+  const primaryId = qs('input[name="shul-merge-primary"]:checked')?.value;
+  if (!primaryId) return toast('Pick a primary record', true);
+  const values = {};
+  for (const [key] of SHUL_MERGE_FIELDS) {
+    const el = qs(`input[name="smf-${key}"]:checked`);
+    if (el) values[key] = el.value;
+  }
+  try {
+    const r = await api(`/shuls/duplicates/${flagId}/merge`, { method: 'POST', body: { primaryId, values } });
+    toast(`Merged — ${r.applicantsReassigned} applicant(s) moved to the surviving shul`);
+    closeModal(); showDuplicates(); load();
+  } catch (err) { toast(err.message, true); }
+};
 
 attachColumnCustomizer('btn-columns', 'columns_shuls', SHUL_COLUMNS, DEFAULT_SHUL_COLUMNS, (order) => { activeColumns = order; renderThead(); load(); })
   .then(order => { activeColumns = order; renderThead(); });
