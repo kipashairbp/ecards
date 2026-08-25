@@ -28,8 +28,8 @@ renderShell('/admin/stores', `
     <button class="btn btn-sm btn-primary" id="btn-mass-apply" disabled>Apply to Selected (0)</button>
   </div>
   <div class="card" style="padding:0;overflow-x:auto">
-    <table><thead><tr><th style="width:34px"><input type="checkbox" id="chk-all"></th><th>Store</th><th>POS System</th><th>Manager</th><th>Owner</th><th>Setup Status</th><th>Onboarding</th><th>Live Spend</th><th></th></tr></thead>
-    <tbody id="tbody"><tr><td colspan="9" class="empty-state">Loading…</td></tr></tbody></table>
+    <table><thead><tr><th style="width:34px"><input type="checkbox" id="chk-all"></th><th>Store</th><th>POS System</th><th>Discount</th><th>Manager</th><th>Owner</th><th>Setup Status</th><th>Onboarding</th><th>Live Spend</th><th></th></tr></thead>
+    <tbody id="tbody"><tr><td colspan="10" class="empty-state">Loading…</td></tr></tbody></table>
   </div>
 `);
 
@@ -44,13 +44,14 @@ async function load() {
         <td onclick="event.stopPropagation()"><input type="checkbox" class="row-chk" data-id="${s.id}"></td>
         <td><strong>${esc(s.name)}</strong>${s.source === 'application' ? ' ' + badge('applied','pending') : ''}<br><span class="small-muted">${esc(s.address||'')} ${esc(s.city||'')}, ${esc(s.state||'')}</span></td>
         <td>${esc(s.pos_system||'')}</td>
+        <td>${esc(s.discount||'')}</td>
         <td>${esc(s.manager_name||'')}<br><span class="small-muted">${esc(s.manager_phone||'')}</span></td>
         <td>${esc(s.owner_name||'')}<br><span class="small-muted">${esc(s.owner_phone||'')}</span></td>
         <td>${badge(s.setup_status,s.setup_status)}${s.has_provider_account ? ' <span class="small-muted">(existing account)</span>' : ''}</td>
         <td>${(s.onboarding_step||0) >= 3 ? badge('complete','active') : (s.portal_user_id ? `Step ${s.onboarding_step||0} of 3` : 'Not invited')}</td>
         <td><strong>${fmtMoney(s.total_purchases)}</strong>${s.total_refunds ? `<br><span class="small-muted">Refunds: ${fmtMoney(s.total_refunds)}</span>` : ''}<br><span class="small-muted">${s.txn_count} txn${s.txn_count===1?'':'s'}</span></td>
         <td><button class="btn btn-sm btn-outline" onclick="openStore('${s.id}')">Manage</button></td>
-      </tr>`).join('') : '<tr><td colspan="9" class="empty-state">No stores yet.</td></tr>';
+      </tr>`).join('') : '<tr><td colspan="10" class="empty-state">No stores yet.</td></tr>';
     qsa('.row-chk').forEach(c => c.addEventListener('change', onCheck));
   } catch (err) { toast(err.message, true); }
 }
@@ -123,6 +124,7 @@ async function openStore(id) {
         <label>Zip</label><input id="e-zip" value="${esc(s.zip||'')}" style="max-width:160px">
         <label>Phone</label><input id="e-phone" value="${esc(s.phone||'')}">
         <label>Which POS system do you have? <span class="req">*</span></label><input id="e-pos_system" value="${esc(s.pos_system||'')}">
+        <label>Discount <span class="small-muted">(admin only — never shown to the store)</span></label><input id="e-discount" value="${esc(s.discount||'')}">
         <div class="divider"></div>
         <div class="checkbox-row"><input type="checkbox" id="e-same_person" ${s.same_person?'checked':''} onchange="qs('#e-manager-fields').style.display=this.checked?'none':''"><label style="margin:0">Manager and owner are the same person</label></div>
         <div id="e-manager-fields" style="display:${s.same_person?'none':''}">
@@ -175,7 +177,7 @@ async function openStore(id) {
 }
 
 window.saveStore = async (id) => {
-  const fields = ['name','address','city','state','zip','phone','pos_system','manager_name','manager_phone','manager_email','owner_name','owner_phone','owner_email','comments'];
+  const fields = ['name','address','city','state','zip','phone','pos_system','discount','manager_name','manager_phone','manager_email','owner_name','owner_phone','owner_email','comments'];
   const body = Object.fromEntries(fields.map(f => [f, qs('#e-'+f).value]));
   body.setup_status = qs('#e-status').value; body.has_provider_account = qs('#e-has_account').checked;
   body.same_person = qs('#e-same_person').checked;

@@ -118,9 +118,9 @@ router.get('/', (req, res) => {
   if (search) {
     where += ` AND (name LIKE ? OR address LIKE ? OR city LIKE ? OR state LIKE ? OR zip LIKE ? OR phone LIKE ?
       OR manager_name LIKE ? OR manager_phone LIKE ? OR manager_email LIKE ? OR owner_name LIKE ? OR owner_phone LIKE ? OR owner_email LIKE ?
-      OR pos_system LIKE ? OR comments LIKE ?)`;
+      OR pos_system LIKE ? OR comments LIKE ? OR discount LIKE ?)`;
     const like = `%${search}%`;
-    params.push(like, like, like, like, like, like, like, like, like, like, like, like, like, like);
+    params.push(like, like, like, like, like, like, like, like, like, like, like, like, like, like, like);
   }
   const stores = db.prepare(`SELECT * FROM stores ${where} ORDER BY created_at DESC`).all(...params);
   // Live spend per store — computed fresh on every request from the synced
@@ -129,6 +129,9 @@ router.get('/', (req, res) => {
     COALESCE(SUM(CASE WHEN type='refund' THEN amount ELSE 0 END),0) total_refunds, COUNT(*) txn_count
     FROM card_transactions WHERE store_id = ?`);
   const withSpend = stores.map(s => ({ ...s, ...spendStmt.get(s.id) }));
+  // discount is admin-only info about the store, not something the store's
+  // own portal login should ever see about itself.
+  if (req.user.role === 'store') withSpend.forEach(s => { delete s.discount; });
   res.json({ stores: redact(withSpend, req.permission.hidden_fields) });
 });
 
@@ -141,9 +144,9 @@ router.get('/export', requirePermission('stores', 'can_export'), (req, res) => {
   if (search) {
     where += ` AND (name LIKE ? OR address LIKE ? OR city LIKE ? OR state LIKE ? OR zip LIKE ? OR phone LIKE ?
       OR manager_name LIKE ? OR manager_phone LIKE ? OR manager_email LIKE ? OR owner_name LIKE ? OR owner_phone LIKE ? OR owner_email LIKE ?
-      OR pos_system LIKE ? OR comments LIKE ?)`;
+      OR pos_system LIKE ? OR comments LIKE ? OR discount LIKE ?)`;
     const like = `%${search}%`;
-    params.push(like, like, like, like, like, like, like, like, like, like, like, like, like, like);
+    params.push(like, like, like, like, like, like, like, like, like, like, like, like, like, like, like);
   }
   const stores = db.prepare(`SELECT * FROM stores ${where} ORDER BY created_at DESC`).all(...params);
   const withSpend = stores.map(s => {
@@ -164,7 +167,7 @@ router.get('/:id', (req, res) => {
   // figure) but not transaction count or refund totals — internal-only
   // numbers a store shouldn't be able to reconstruct their transaction
   // history's shape from.
-  if (req.user.role === 'store') { delete transactionTotals.count; delete transactionTotals.total_refunds; }
+  if (req.user.role === 'store') { delete transactionTotals.count; delete transactionTotals.total_refunds; delete store.discount; }
   res.json({ store: redact(store, req.permission.hidden_fields), transactionTotals });
 });
 
@@ -199,11 +202,11 @@ router.post('/', requirePermission('stores', 'can_edit'), (req, res) => {
   }
   const id = uuid();
   db.prepare(`INSERT INTO stores (id, org_id, season_id, name, address, city, state, zip, phone, pos_system, manager_name, manager_phone, manager_email,
-      owner_name, owner_phone, owner_email, same_person, comments, setup_status, has_provider_account)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?)`)
+      owner_name, owner_phone, owner_email, same_person, comments, setup_status, has_provider_account, discount)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?)`)
     .run(id, req.user.org_id, getActiveSeasonId(req.user.org_id), b.name, b.address || '', b.city || '', b.state || '', b.zip || '', normalizePhone(b.phone || ''), b.pos_system || '',
       b.manager_name || '', normalizePhone(b.manager_phone || ''), b.manager_email || '', b.owner_name || '', normalizePhone(b.owner_phone || ''), b.owner_email || '',
-      b.same_person ? 1 : 0, b.comments || '', b.setup_status || 'pending', b.has_provider_account ? 1 : 0);
+      b.same_person ? 1 : 0, b.comments || '', b.setup_status || 'pending', b.has_provider_account ? 1 : 0, b.discount || '');
   const store = db.prepare('SELECT * FROM stores WHERE id = ?').get(id);
   logAudit(req.user.org_id, req.user.id, 'create', 'store', id, null, store, req.ip);
   res.status(201).json({ store });
@@ -212,7 +215,7 @@ router.post('/', requirePermission('stores', 'can_edit'), (req, res) => {
 router.put('/:id', requirePermission('stores', 'can_edit'), (req, res) => {
   const store = db.prepare('SELECT * FROM stores WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!store) return res.status(404).json({ error: 'Not found' });
-  const fields = ['name','address','city','state','zip','phone','pos_system','manager_name','manager_phone','manager_email','owner_name','owner_phone','owner_email','same_person','comments','setup_status','has_provider_account','provider_store_id'];
+  const fields = ['name','address','city','state','zip','phone','pos_system','manager_name','manager_phone','manager_email','owner_name','owner_phone','owner_email','same_person','comments','setup_status','has_provider_account','provider_store_id','discount'];
   const b = req.body || {};
   if (b.phone !== undefined) b.phone = normalizePhone(b.phone);
   if (b.manager_phone !== undefined) b.manager_phone = normalizePhone(b.manager_phone);

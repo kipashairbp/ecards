@@ -591,6 +591,10 @@ safeAlter(`ALTER TABLE stores ADD COLUMN agreed_terms_at TEXT`);
 safeAlter(`ALTER TABLE stores ADD COLUMN same_person INTEGER DEFAULT 0`);
 safeAlter(`ALTER TABLE stores ADD COLUMN pos_system TEXT`);
 safeAlter(`ALTER TABLE stores ADD COLUMN season_id TEXT REFERENCES seasons(id)`);
+// Admin-only note on the discount this store gives (e.g. "10% off" or a
+// dollar policy) — never returned to the store's own portal login (see
+// routes/stores.js GET / and GET /:id, which strip it for role==='store').
+safeAlter(`ALTER TABLE stores ADD COLUMN discount TEXT`);
 safeAlter(`ALTER TABLE seasons ADD COLUMN max_accepted_applicants INTEGER`);
 safeAlter(`ALTER TABLE shuls ADD COLUMN is_locked INTEGER DEFAULT 0`);
 safeAlter(`ALTER TABLE applicants ADD COLUMN external_id TEXT`);
