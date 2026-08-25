@@ -5,13 +5,13 @@ import { writeFileSync } from 'fs';
 import { db, uuid, DEFAULT_ORG_ID, DATA_DIR } from '../db.js';
 import { auth, requireAdmin } from '../middleware/auth.js';
 import { requirePermission, redact } from '../middleware/permissions.js';
-import { sendMailChecked, renderSystemTemplate, notifyNewSignup } from '../services/mail.js';
+import { sendMailChecked, renderSystemTemplate, notifyNewSignup, renderSignupDetails } from '../services/mail.js';
 import { sendXlsx } from '../services/xlsx.js';
 import { normalizePhone, isValidPhone } from '../utils/phone.js';
 import { validateBySchema } from '../utils/formValidation.js';
 import { STORE_APPLICATION_SCHEMA } from '../utils/builtinSchemas.js';
 import { logAudit, logMassAudit, getEntityHistory } from '../services/audit.js';
-import { deletePolymorphicRefs } from '../utils/entityDelete.js';
+import { hardDeleteStore, captureStoreSnapshot } from '../utils/entityDelete.js';
 import { generateGenericDocumentPdf } from '../services/pdf.js';
 import { resolveEntity } from './documents.js';
 import { getActiveSeasonId } from '../utils/formSchedule.js';
@@ -47,6 +47,7 @@ router.post('/apply', async (req, res) => {
   await notifyNewSignup(orgId, 'notify_new_store_signup_email', 'newStoreSignup', {
     storeName: store.name, contactName: store.owner_name || store.manager_name || '',
     contactEmail: store.owner_email || store.manager_email || '', contactPhone: store.owner_phone || store.manager_phone || '',
+    details: renderSignupDetails(store),
   });
 
   const signAtSignup = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'store_contract_at_signup'`).get(orgId)?.value !== '0';
@@ -114,7 +115,13 @@ router.get('/', (req, res) => {
   let { where, params } = scopeWhere(req);
   if (setup_status) { where += ' AND setup_status = ?'; params.push(setup_status); }
   if (season_id) { where += ' AND season_id = ?'; params.push(season_id); }
-  if (search) { where += ' AND (name LIKE ? OR city LIKE ?)'; params.push(`%${search}%`, `%${search}%`); }
+  if (search) {
+    where += ` AND (name LIKE ? OR address LIKE ? OR city LIKE ? OR state LIKE ? OR zip LIKE ? OR phone LIKE ?
+      OR manager_name LIKE ? OR manager_phone LIKE ? OR manager_email LIKE ? OR owner_name LIKE ? OR owner_phone LIKE ? OR owner_email LIKE ?
+      OR pos_system LIKE ? OR comments LIKE ?)`;
+    const like = `%${search}%`;
+    params.push(like, like, like, like, like, like, like, like, like, like, like, like, like, like);
+  }
   const stores = db.prepare(`SELECT * FROM stores ${where} ORDER BY created_at DESC`).all(...params);
   // Live spend per store — computed fresh on every request from the synced
   // transaction ledger, not cached, so it's always current as of the last sync.
@@ -131,7 +138,13 @@ router.get('/export', requirePermission('stores', 'can_export'), (req, res) => {
   let { where, params } = scopeWhere(req);
   if (setup_status) { where += ' AND setup_status = ?'; params.push(setup_status); }
   if (season_id) { where += ' AND season_id = ?'; params.push(season_id); }
-  if (search) { where += ' AND (name LIKE ? OR city LIKE ?)'; params.push(`%${search}%`, `%${search}%`); }
+  if (search) {
+    where += ` AND (name LIKE ? OR address LIKE ? OR city LIKE ? OR state LIKE ? OR zip LIKE ? OR phone LIKE ?
+      OR manager_name LIKE ? OR manager_phone LIKE ? OR manager_email LIKE ? OR owner_name LIKE ? OR owner_phone LIKE ? OR owner_email LIKE ?
+      OR pos_system LIKE ? OR comments LIKE ?)`;
+    const like = `%${search}%`;
+    params.push(like, like, like, like, like, like, like, like, like, like, like, like, like, like);
+  }
   const stores = db.prepare(`SELECT * FROM stores ${where} ORDER BY created_at DESC`).all(...params);
   const withSpend = stores.map(s => {
     const totals = db.prepare(`SELECT COALESCE(SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END),0) total_purchases, COALESCE(SUM(CASE WHEN type='refund' THEN amount ELSE 0 END),0) total_refunds FROM card_transactions WHERE store_id = ?`).get(s.id);
@@ -244,15 +257,15 @@ router.post('/mass-set-status', requirePermission('stores', 'can_edit'), (req, r
 router.delete('/:id/permanent', requirePermission('stores', 'can_edit'), (req, res) => {
   const store = db.prepare('SELECT * FROM stores WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!store) return res.status(404).json({ error: 'Not found' });
-  const del = db.transaction(() => {
-    db.prepare('UPDATE card_transactions SET store_id = NULL WHERE store_id = ?').run(store.id);
-    db.prepare('DELETE FROM store_billing WHERE store_id = ?').run(store.id);
-    if (store.portal_user_id) db.prepare('UPDATE users SET is_active = 0, token_version = token_version + 1 WHERE id = ?').run(store.portal_user_id);
-    deletePolymorphicRefs('store', store.id);
-    db.prepare('DELETE FROM stores WHERE id = ?').run(store.id);
-  });
+  // Snapshot every related row before the cascade removes/unlinks it, so a
+  // super_admin can fully undo this from Recent Actions — "Delete
+  // Permanently" still reads and behaves as a real permanent delete, this
+  // is purely a safety net (see utils/entityDelete.js's snapshot/restore
+  // comment block).
+  const snapshot = captureStoreSnapshot(store);
+  const del = db.transaction(() => hardDeleteStore(store));
   del();
-  logAudit(req.user.org_id, req.user.id, 'delete', 'store', store.id, store, null, req.ip);
+  logAudit(req.user.org_id, req.user.id, 'delete', 'store', store.id, snapshot, null, req.ip);
   res.json({ ok: true });
 });
 
@@ -260,22 +273,21 @@ router.post('/mass-delete-permanent', requirePermission('stores', 'can_edit'), (
   const { ids } = req.body || {};
   if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids array required' });
   let deleted = 0, skipped = 0;
-  const affectedIds = [], names = [];
+  const affectedIds = [], names = [], snapshots = [];
   for (const id of ids) {
     const store = db.prepare('SELECT * FROM stores WHERE id = ? AND org_id = ?').get(id, req.user.org_id);
     if (!store) { skipped++; continue; }
-    const del = db.transaction(() => {
-      db.prepare('UPDATE card_transactions SET store_id = NULL WHERE store_id = ?').run(store.id);
-      db.prepare('DELETE FROM store_billing WHERE store_id = ?').run(store.id);
-      if (store.portal_user_id) db.prepare('UPDATE users SET is_active = 0, token_version = token_version + 1 WHERE id = ?').run(store.portal_user_id);
-      deletePolymorphicRefs('store', store.id);
-      db.prepare('DELETE FROM stores WHERE id = ?').run(store.id);
-    });
+    const snapshot = captureStoreSnapshot(store);
+    const del = db.transaction(() => hardDeleteStore(store));
     del();
+    snapshots.push(snapshot);
     affectedIds.push(store.id); names.push(store.name);
     deleted++;
   }
-  logMassAudit(req.user.org_id, req.user.id, 'mass-delete', 'store', affectedIds, { skipped, names }, req.ip);
+  // snapshots carries the full undo data for this whole click (see
+  // undoMassDeleteEntry in services/audit.js) — names/count stay separate
+  // since those are what the Recent Actions headline reads.
+  logMassAudit(req.user.org_id, req.user.id, 'mass-delete', 'store', affectedIds, { skipped, names, snapshots }, req.ip);
   res.json({ deleted, skipped });
 });
 

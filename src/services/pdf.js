@@ -422,10 +422,12 @@ export async function stampSignatureFields({ unsignedPath, shulId, fields, value
     }
 
     // signature | initial
+    // No ruled line above the signature — it's purely decorative (legal
+    // validity here comes from the captured consent/IP/timestamp, not a
+    // printed line), so we just reserve the box's top margin unmarked.
     const isPrimarySignature = field.type === 'signature' && !metaDrawn;
     const lineY = boxTop - boxH * 0.06;
-    page.drawLine({ start: { x: boxX, y: lineY }, end: { x: boxX + boxW, y: lineY }, thickness: 1, color: rgb(0.3, 0.25, 0.2) });
-    // The whole box below the line belongs to the signature/initial image
+    // The whole box below that reserved margin belongs to the signature/initial image
     // (or typed-name fallback) — nothing else is ever drawn inside it, so
     // it can never be covered, no matter how small the admin makes the box.
     const drawAreaH = Math.max(10, lineY - 4 - boxBottom);

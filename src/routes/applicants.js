@@ -16,7 +16,7 @@ import { getActiveSeasonId } from '../utils/formSchedule.js';
 import { validateBySchema, validateRowsBySchema, shulInfoErrors } from '../utils/formValidation.js';
 import { APPLICANT_APPLICATION_SCHEMA } from '../utils/builtinSchemas.js';
 import { logAudit, logMassAudit, getEntityHistory } from '../services/audit.js';
-import { hardDeleteApplicant } from '../utils/entityDelete.js';
+import { hardDeleteApplicant, captureApplicantSnapshot } from '../utils/entityDelete.js';
 import { lockApplicantCards } from '../services/cardSync.js';
 
 const router = Router();
@@ -210,9 +210,10 @@ router.get('/', (req, res) => {
   if (marital_status) { where += ' AND a.marital_status = ?'; params.push(marital_status); }
   if (home_for_yomtov !== undefined && home_for_yomtov !== '') { where += ' AND a.home_for_yomtov = ?'; params.push(home_for_yomtov === 'true' || home_for_yomtov === '1' ? 1 : 0); }
   if (search) {
-    where += ` AND (a.first_name LIKE ? OR a.last_name LIKE ? OR a.email LIKE ? OR a.home_phone LIKE ? OR a.husband_cell LIKE ? OR a.wife_cell LIKE ? OR a.external_id LIKE ?)`;
+    where += ` AND (a.first_name LIKE ? OR a.last_name LIKE ? OR a.email LIKE ? OR a.home_phone LIKE ? OR a.husband_cell LIKE ? OR a.wife_cell LIKE ? OR a.external_id LIKE ?
+      OR a.address LIKE ? OR a.city LIKE ? OR a.state LIKE ? OR a.zip LIKE ? OR a.comments LIKE ? OR a.permanent_comments LIKE ?)`;
     const like = `%${search}%`;
-    params.push(like, like, like, like, like, like, like);
+    params.push(like, like, like, like, like, like, like, like, like, like, like, like, like);
   }
   const allowedSort = ['created_at','last_name','approval_status','num_children','card_amount','external_id'];
   const sortCol = allowedSort.includes(sort) ? `a.${sort}` : 'a.created_at';
@@ -234,9 +235,10 @@ router.get('/export', requirePermission('applicants', 'can_export'), (req, res) 
   if (marital_status) { where += ' AND a.marital_status = ?'; params.push(marital_status); }
   if (home_for_yomtov !== undefined && home_for_yomtov !== '') { where += ' AND a.home_for_yomtov = ?'; params.push(home_for_yomtov === 'true' || home_for_yomtov === '1' ? 1 : 0); }
   if (search) {
-    where += ` AND (a.first_name LIKE ? OR a.last_name LIKE ? OR a.email LIKE ? OR a.home_phone LIKE ? OR a.husband_cell LIKE ? OR a.wife_cell LIKE ? OR a.external_id LIKE ?)`;
+    where += ` AND (a.first_name LIKE ? OR a.last_name LIKE ? OR a.email LIKE ? OR a.home_phone LIKE ? OR a.husband_cell LIKE ? OR a.wife_cell LIKE ? OR a.external_id LIKE ?
+      OR a.address LIKE ? OR a.city LIKE ? OR a.state LIKE ? OR a.zip LIKE ? OR a.comments LIKE ? OR a.permanent_comments LIKE ?)`;
     const like = `%${search}%`;
-    params.push(like, like, like, like, like, like, like);
+    params.push(like, like, like, like, like, like, like, like, like, like, like, like, like);
   }
   const rows = db.prepare(`SELECT a.*, s.name_en as shul_name FROM applicants a LEFT JOIN shuls s ON s.id = a.shul_id ${where} ORDER BY a.created_at DESC`).all(...params);
   sendXlsx(res, `applicants-${Date.now()}.xlsx`, redact(rows, req.permission.hidden_fields));
@@ -609,9 +611,15 @@ router.delete('/:id/permanent', requirePermission('applicants', 'can_edit'), asy
   const applicant = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!applicant) return res.status(404).json({ error: 'Not found' });
   const { errors: cardLockErrors } = await lockApplicantCards(req.user.org_id, applicant);
+  // Snapshot every related row before the cascade removes it, so a
+  // super_admin can fully undo this from Recent Actions — "Delete
+  // Permanently" still reads and behaves as a real permanent delete, this
+  // is purely a safety net (see utils/entityDelete.js's snapshot/restore
+  // comment block).
+  const snapshot = captureApplicantSnapshot(applicant);
   const del = db.transaction(() => hardDeleteApplicant(applicant));
   del();
-  logAudit(req.user.org_id, req.user.id, 'delete', 'applicant', applicant.id, applicant, null, req.ip);
+  logAudit(req.user.org_id, req.user.id, 'delete', 'applicant', applicant.id, snapshot, null, req.ip);
   res.json({ ok: true, cardLockErrors });
 });
 
@@ -619,18 +627,20 @@ router.post('/mass-delete-permanent', requirePermission('applicants', 'can_edit'
   const { ids } = req.body || {};
   if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids array required' });
   let deleted = 0, skipped = 0, cardLockErrors = 0;
-  const affectedIds = [], names = [];
+  const affectedIds = [], names = [], snapshots = [];
   for (const id of ids) {
     const applicant = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(id, req.user.org_id);
     if (!applicant) { skipped++; continue; }
     const { errors } = await lockApplicantCards(req.user.org_id, applicant);
     if (errors?.length) cardLockErrors++;
+    const snapshot = captureApplicantSnapshot(applicant);
     const del = db.transaction(() => hardDeleteApplicant(applicant));
     del();
+    snapshots.push(snapshot);
     affectedIds.push(applicant.id); names.push(`${applicant.first_name} ${applicant.last_name}`.trim());
     deleted++;
   }
-  logMassAudit(req.user.org_id, req.user.id, 'mass-delete', 'applicant', affectedIds, { skipped, names }, req.ip);
+  logMassAudit(req.user.org_id, req.user.id, 'mass-delete', 'applicant', affectedIds, { skipped, names, snapshots }, req.ip);
   res.json({ deleted, skipped, cardLockErrors });
 });
 

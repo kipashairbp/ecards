@@ -5,7 +5,7 @@ import { auth, requireAdmin } from '../middleware/auth.js';
 import { requirePermission, redact } from '../middleware/permissions.js';
 import { detectAndFlag, resolveFlag } from '../services/duplicates.js';
 import { generateContractPdf, stampSignatureFields, getSignatureFields, resolveSignatureValues } from '../services/pdf.js';
-import { sendMailChecked, renderSystemTemplate, notifyNewSignup } from '../services/mail.js';
+import { sendMailChecked, renderSystemTemplate, notifyNewSignup, renderSignupDetails } from '../services/mail.js';
 import { sendSmsChecked } from '../services/sms.js';
 import { parseSpreadsheet, buildXlsxTemplate, SHUL_IMPORT_COLUMNS } from '../services/importer.js';
 import { sendXlsx } from '../services/xlsx.js';
@@ -14,7 +14,7 @@ import { getActiveSeasonId } from '../utils/formSchedule.js';
 import { validateBySchema, shulInfoErrors } from '../utils/formValidation.js';
 import { SHUL_APPLICATION_SCHEMA } from '../utils/builtinSchemas.js';
 import { logAudit, logMassAudit, getEntityHistory } from '../services/audit.js';
-import { hardDeleteShul } from '../utils/entityDelete.js';
+import { hardDeleteShul, captureShulSnapshot } from '../utils/entityDelete.js';
 import { generateApplicantExternalId } from '../utils/externalId.js';
 
 const router = Router();
@@ -112,6 +112,7 @@ router.post('/apply', async (req, res) => {
   await notifyNewSignup(orgId, 'notify_new_shul_signup_email', 'newShulSignup', {
     shulName: shulRow.name_en, contactName: `${shulRow.gabai_first_name} ${shulRow.gabai_last_name}`,
     contactEmail: shulRow.gabai_email || '', contactPhone: shulRow.gabai_cell || '',
+    details: renderSignupDetails(shulRow),
   });
   if (flag) return res.status(201).json({ shul: shulRow, duplicate: true, message: 'Your application was received, but a similar shul is already on file. Our team will follow up.' });
 
@@ -233,9 +234,12 @@ router.get('/', (req, res) => {
   if (status) { where += ' AND status = ?'; params.push(status); }
   if (season_id) { where += ' AND season_id = ?'; params.push(season_id); }
   if (search) {
-    where += ` AND (name_en LIKE ? OR name_he LIKE ? OR city LIKE ? OR ruv_last_name LIKE ? OR gabai_last_name LIKE ?)`;
+    where += ` AND (name_en LIKE ? OR name_he LIKE ? OR address LIKE ? OR city LIKE ? OR state LIKE ? OR zip LIKE ?
+      OR ruv_first_name LIKE ? OR ruv_last_name LIKE ? OR ruv_phone LIKE ? OR ruv_address LIKE ? OR ruv_city LIKE ?
+      OR gabai_first_name LIKE ? OR gabai_last_name LIKE ? OR gabai_cell LIKE ? OR gabai_email LIKE ? OR gabai_address LIKE ? OR gabai_city LIKE ?
+      OR permanent_comments LIKE ?)`;
     const like = `%${search}%`;
-    params.push(like, like, like, like, like);
+    params.push(like, like, like, like, like, like, like, like, like, like, like, like, like, like, like, like, like, like);
   }
   const allowedSort = ['created_at', 'name_en', 'status', 'city', 'slots_allocated'];
   const sortCol = allowedSort.includes(sort) ? sort : 'created_at';
@@ -259,9 +263,12 @@ router.get('/export', requirePermission('shuls', 'can_export'), (req, res) => {
   if (status) { where += ' AND status = ?'; params.push(status); }
   if (season_id) { where += ' AND season_id = ?'; params.push(season_id); }
   if (search) {
-    where += ` AND (name_en LIKE ? OR name_he LIKE ? OR city LIKE ? OR ruv_last_name LIKE ? OR gabai_last_name LIKE ?)`;
+    where += ` AND (name_en LIKE ? OR name_he LIKE ? OR address LIKE ? OR city LIKE ? OR state LIKE ? OR zip LIKE ?
+      OR ruv_first_name LIKE ? OR ruv_last_name LIKE ? OR ruv_phone LIKE ? OR ruv_address LIKE ? OR ruv_city LIKE ?
+      OR gabai_first_name LIKE ? OR gabai_last_name LIKE ? OR gabai_cell LIKE ? OR gabai_email LIKE ? OR gabai_address LIKE ? OR gabai_city LIKE ?
+      OR permanent_comments LIKE ?)`;
     const like = `%${search}%`;
-    params.push(like, like, like, like, like);
+    params.push(like, like, like, like, like, like, like, like, like, like, like, like, like, like, like, like, like, like);
   }
   const rows = db.prepare(`SELECT * FROM shuls ${where} ORDER BY created_at DESC`).all(...params);
   sendXlsx(res, `shuls-${Date.now()}.xlsx`, redact(rows, req.permission.hidden_fields));
@@ -705,21 +712,29 @@ router.post('/mass-set-pending', requirePermission('shuls', 'can_edit'), (req, r
 router.delete('/:id/permanent', requirePermission('shuls', 'can_edit'), (req, res) => {
   const shul = db.prepare('SELECT * FROM shuls WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!shul) return res.status(404).json({ error: 'Not found' });
+  // Snapshot every related row before the cascade removes/unlinks it, so a
+  // super_admin can fully undo this from Recent Actions — "Delete
+  // Permanently" still reads and behaves as a real permanent delete, this
+  // is purely a safety net (see utils/entityDelete.js's snapshot/restore
+  // comment block).
+  const snapshot = captureShulSnapshot(shul);
   const del = db.transaction(() => hardDeleteShul(shul));
   del();
-  logAudit(req.user.org_id, req.user.id, 'delete', 'shul', shul.id, shul, null, req.ip);
+  logAudit(req.user.org_id, req.user.id, 'delete', 'shul', shul.id, snapshot, null, req.ip);
   res.json({ ok: true });
 });
 
 router.post('/mass-delete-permanent', requirePermission('shuls', 'can_edit'), (req, res) => {
   const { ids } = req.body || {};
   if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids array required' });
-  let deleted = 0, skipped = 0; const affectedIds = [], names = [];
+  let deleted = 0, skipped = 0; const affectedIds = [], names = [], snapshots = [];
   for (const id of ids) {
     const shul = db.prepare('SELECT * FROM shuls WHERE id = ? AND org_id = ?').get(id, req.user.org_id);
     if (!shul) { skipped++; continue; }
+    const snapshot = captureShulSnapshot(shul);
     const del = db.transaction(() => hardDeleteShul(shul));
     del();
+    snapshots.push(snapshot);
     affectedIds.push(shul.id); names.push(shul.name_en);
     deleted++;
   }
@@ -727,7 +742,8 @@ router.post('/mass-delete-permanent', requirePermission('shuls', 'can_edit'), (r
   // left to look up by them), but logMassAudit still needs a non-empty list
   // to know a mass-delete entry is worth logging at all — names is what
   // actually matters here, ids is just the "how many / which ones" record.
-  logMassAudit(req.user.org_id, req.user.id, 'mass-delete', 'shul', affectedIds, { skipped, names }, req.ip);
+  // snapshots carries the full undo data for this click (undoMassDeleteEntry).
+  logMassAudit(req.user.org_id, req.user.id, 'mass-delete', 'shul', affectedIds, { skipped, names, snapshots }, req.ip);
   res.json({ deleted, skipped });
 });
 

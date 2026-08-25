@@ -236,23 +236,65 @@ window.createForm = async () => {
 // admin-only config (see the field editor above) — it's checked here, on
 // the admin-only Responses view, and never sent to the public form itself
 // (routes/forms.js strips it before any public response).
+let responsesState = null;
+
+// Rebuilds just the response rows against the current search filter — a
+// plain client-side substring match across every visible field (plus the
+// submitted date and which record type it created, if any), since these
+// response tables are rarely more than a few hundred rows.
+function renderResponseRows() {
+  const { schema, responses, filter } = responsesState;
+  const q = (filter || '').trim().toLowerCase();
+  const filtered = !q ? responses : responses.filter(r => {
+    if (String(r.entity_type || 'response only').toLowerCase().includes(q)) return true;
+    if (fmtDateTime(r.created_at).toLowerCase().includes(q)) return true;
+    return schema.some(fld => String(r.data[fld.key] ?? '').toLowerCase().includes(q));
+  });
+  if (!filtered.length) return `<p class="small-muted">${responses.length ? 'No responses match your search.' : 'No responses yet.'}</p>`;
+  return `<div style="overflow-x:auto"><table><thead><tr><th>Submitted</th><th>Record</th>${schema.map(fld => `<th>${esc(fld.label || fld.key)}</th>`).join('')}<th></th></tr></thead><tbody>
+      ${filtered.map(r => `<tr><td>${fmtDateTime(r.created_at)}</td><td>${r.entity_type ? esc(r.entity_type) : '<span class="small-muted">response only</span>'}</td>
+        ${schema.map(fld => {
+          const val = r.data[fld.key];
+          const matched = fld.expectedAnswer !== undefined && fld.expectedAnswer !== '' && String(val ?? '') === String(fld.expectedAnswer);
+          return `<td>${esc(val ?? '')}${matched ? ' ' + badge('matches expected', 'active') : ''}</td>`;
+        }).join('')}
+        <td><button class="btn btn-sm btn-outline" style="color:#b71c1c;border-color:#b71c1c" onclick="deleteResponse('${r.id}')">Delete</button></td>
+      </tr>`).join('')}
+    </tbody></table></div>`;
+}
+// Updates the already-open modal in place (row count in the title, the
+// table body) — never re-opens it, so filtering/deleting never stacks a
+// second modal on top of the first.
+function refreshResponsesUI() {
+  const table = qs('#resp-table');
+  if (table) table.innerHTML = renderResponseRows();
+  const titleEl = document.querySelector('#ec-modal .modal-header h3');
+  if (titleEl) titleEl.textContent = `${responsesState.name}: Responses (${responsesState.responses.length})`;
+}
+
 window.openResponses = async (id) => {
   const f = formsCache.find(x => x.id === id);
   if (!f) return;
   try {
     const { responses } = await api(`/forms/${id}/responses`);
     const schema = f.schema_json.filter(fld => !['header', 'image'].includes(fld.type));
-    const body = responses.length ? `<div style="overflow-x:auto"><table><thead><tr><th>Submitted</th><th>Record</th>${schema.map(fld => `<th>${esc(fld.label || fld.key)}</th>`).join('')}</tr></thead><tbody>
-        ${responses.map(r => `<tr><td>${fmtDateTime(r.created_at)}</td><td>${r.entity_type ? esc(r.entity_type) : '<span class="small-muted">response only</span>'}</td>
-          ${schema.map(fld => {
-            const val = r.data[fld.key];
-            const matched = fld.expectedAnswer !== undefined && fld.expectedAnswer !== '' && String(val ?? '') === String(fld.expectedAnswer);
-            return `<td>${esc(val ?? '')}${matched ? ' ' + badge('matches expected', 'active') : ''}</td>`;
-          }).join('')}
-        </tr>`).join('')}
-      </tbody></table></div>` : '<p class="small-muted">No responses yet.</p>';
+    responsesState = { formId: id, name: f.name, slug: f.slug, schema, responses, filter: '' };
+    const body = `<input id="resp-filter" placeholder="Search responses…" style="margin-bottom:12px;width:100%;max-width:340px">
+      <div id="resp-table">${renderResponseRows()}</div>`;
     const footer = `<button class="btn btn-outline btn-sm" onclick="downloadAuthed('/forms/${id}/responses/export','${esc(f.slug || 'form')}-responses.xlsx')">Export Excel</button>`;
-    openModal(`${f.name}: Responses (${responses.length})`, body, footer);
+    openModal(`${f.name}: Responses (${responses.length})`, body, footer, { wide: true });
+    qs('#resp-filter').addEventListener('input', (e) => { responsesState.filter = e.target.value; refreshResponsesUI(); });
+  } catch (err) { toast(err.message, true); }
+};
+
+window.deleteResponse = async (responseId) => {
+  if (!responsesState) return;
+  if (!confirm('Delete this response? This removes only the logged submission row — any shul/applicant/store record it created stays and must be deleted separately from its own list.')) return;
+  try {
+    await api(`/forms/${responsesState.formId}/responses/${responseId}`, { method: 'DELETE' });
+    responsesState.responses = responsesState.responses.filter(r => r.id !== responseId);
+    refreshResponsesUI();
+    toast('Response deleted');
   } catch (err) { toast(err.message, true); }
 };
 

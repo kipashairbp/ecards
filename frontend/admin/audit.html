@@ -38,7 +38,7 @@ const ACTION_VERBS = { create: 'Created', update: 'Updated', delete: 'Deleted', 
 // and the record ids/names/counts live in after_json instead of a normal
 // before/after diff. Rendered with their own headline/detail below rather
 // than forced through headline()/changeList(), which assume a single entity.
-const MASS_VERBS = { 'mass-approve': 'Approved', 'mass-reject': 'Rejected', 'mass-set-pending': 'Set to pending', 'mass-delete': 'Deleted', 'mass-import': 'Imported', 'mass-set-status': 'Updated status for', 'mass-deactivate': 'Deactivated', 'mass-activate': 'Activated' };
+const MASS_VERBS = { 'mass-approve': 'Approved', 'mass-reject': 'Rejected', 'mass-set-pending': 'Set to pending', 'mass-delete': 'Deleted', 'mass-delete-undo': 'Restored', 'mass-import': 'Imported', 'mass-set-status': 'Updated status for', 'mass-deactivate': 'Deactivated', 'mass-activate': 'Activated' };
 const FIELD_LABELS = {
   approval_status: 'Status', card_amount: 'Card Amount', is_active: 'Active', first_name: 'First Name', last_name: 'Last Name',
   name_en: 'Name', name: 'Name', role: 'Role', phone: 'Phone', slots_allocated: 'Slots', email: 'Email', home_phone: 'Home Phone',
@@ -62,7 +62,11 @@ function fmtVal(k, v) {
 // headline reads "Updated shul — Congregation Beth Israel" instead of a
 // bare entity type + id.
 function entityName(row) {
-  const r = row.after || row.before;
+  let r = row.after || row.before;
+  // A hard-delete's before/after carries a full cascade snapshot (see
+  // utils/entityDelete.js), not a flat row — {kind, row, ...} — so unwrap
+  // to the actual entity row before reading name fields off of it.
+  if (r && r.kind && r.row) r = r.row;
   if (!r) return '';
   return r.name_en || r.name || `${r.first_name || ''} ${r.last_name || ''}`.trim() || r.email || '';
 }

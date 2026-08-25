@@ -198,18 +198,50 @@ export const SYSTEM_EMAIL_TEMPLATES = {
   // notifyNewSignup() below. Only ever fires when Settings > Organization's
   // "Notify on New Signups" email is set.
   newShulSignup: {
-    label: 'Internal Notice: New Shul Signup', vars: ['shulName', 'contactName', 'contactEmail', 'contactPhone'],
+    label: 'Internal Notice: New Shul Signup', vars: ['shulName', 'contactName', 'contactEmail', 'contactPhone', 'details'],
     subject: 'New shul application: {{shulName}}',
     body: `<p>A new shul application was just submitted.</p>
-      <p><strong>Shul:</strong> {{shulName}}<br><strong>Contact:</strong> {{contactName}}<br><strong>Email:</strong> {{contactEmail}}<br><strong>Phone:</strong> {{contactPhone}}</p>`,
+      <p><strong>Shul:</strong> {{shulName}}<br><strong>Contact:</strong> {{contactName}}<br><strong>Email:</strong> {{contactEmail}}<br><strong>Phone:</strong> {{contactPhone}}</p>
+      {{details}}`,
   },
   newStoreSignup: {
-    label: 'Internal Notice: New Store Signup', vars: ['storeName', 'contactName', 'contactEmail', 'contactPhone'],
+    label: 'Internal Notice: New Store Signup', vars: ['storeName', 'contactName', 'contactEmail', 'contactPhone', 'details'],
     subject: 'New store application: {{storeName}}',
     body: `<p>A new store application was just submitted.</p>
-      <p><strong>Store:</strong> {{storeName}}<br><strong>Contact:</strong> {{contactName}}<br><strong>Email:</strong> {{contactEmail}}<br><strong>Phone:</strong> {{contactPhone}}</p>`,
+      <p><strong>Store:</strong> {{storeName}}<br><strong>Contact:</strong> {{contactName}}<br><strong>Email:</strong> {{contactEmail}}<br><strong>Phone:</strong> {{contactPhone}}</p>
+      {{details}}`,
   },
 };
+
+// Renders every field the shul/store just submitted as a plain label/value
+// table for the internal new-signup notice's {{details}} var — the
+// top-of-email summary previously had room for only name/contact/phone, so
+// admins had to open the record itself to see the rest of what was
+// submitted. Skips technical/internal columns (ids, lat/lng/place_id,
+// status, timestamps, ...) since those aren't part of what the applicant
+// actually typed into the form.
+const DETAILS_SKIP_KEYS = new Set([
+  'id', 'org_id', 'season_id', 'lat', 'lng', 'place_id', 'ruv_place_id', 'gabai_place_id',
+  'status', 'is_paused', 'is_locked', 'duplicate_of_shul_id', 'duplicate_status', 'portal_user_id', 'source',
+  'created_at', 'updated_at', 'same_person', 'setup_status', 'has_provider_account', 'provider_store_id',
+  'onboarding_step', 'onboarding_completed_at', 'agreed_terms_at',
+]);
+function fieldLabelFallback(key) {
+  return key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+// This table is built from raw shul/store submission data (address,
+// comments, names, ...) — escape it before dropping it into an HTML email
+// body, since an applicant could type anything into a free-text field.
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+export function renderSignupDetails(row) {
+  const rowsHtml = Object.keys(row)
+    .filter(k => !DETAILS_SKIP_KEYS.has(k) && row[k] !== null && row[k] !== '' && row[k] !== undefined)
+    .map(k => `<tr><td style="padding:3px 12px 3px 0;color:#6b6b6b;white-space:nowrap">${escapeHtml(fieldLabelFallback(k))}</td><td style="padding:3px 0">${escapeHtml(row[k])}</td></tr>`)
+    .join('');
+  return rowsHtml ? `<table style="border-collapse:collapse;margin-top:10px">${rowsHtml}</table>` : '';
+}
 
 function substitute(text, vars) {
   return String(text).replace(/\{\{(\w+)\}\}/g, (m, k) => (vars[k] != null ? vars[k] : m));

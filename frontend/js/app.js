@@ -334,13 +334,15 @@ window.submitSetPassword = async (userId) => {
   } catch (err) { toast(err.message, true); }
 };
 
-function openModal(title, bodyHtml, footerHtml = '') {
+// wide:true widens the modal (e.g. a table with a lot of columns, like the
+// Form Builder responses view) instead of the default 900px cap.
+function openModal(title, bodyHtml, footerHtml = '', { wide = false } = {}) {
   const el = document.createElement('div');
   el.className = 'modal-backdrop';
   el.id = 'ec-modal';
-  el.innerHTML = `<div class="modal">
+  el.innerHTML = `<div class="modal"${wide ? ' style="max-width:1400px"' : ''}>
     <div class="modal-header" style="cursor:move"><h3 style="margin:0">${esc(title)}</h3><button onclick="closeModal()">&times;</button></div>
-    <div class="modal-body">${bodyHtml}</div>
+    <div class="modal-body"${wide ? ' style="max-height:82vh"' : ''}>${bodyHtml}</div>
     ${footerHtml ? `<div class="modal-footer">${footerHtml}</div>` : ''}
   </div>`;
   el.addEventListener('click', (e) => { if (e.target === el) closeModal(); });

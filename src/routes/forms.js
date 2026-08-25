@@ -230,4 +230,18 @@ router.get('/:id/responses/export', requirePermission('forms', 'can_export'), (r
   sendXlsx(res, `${form.slug || 'form'}-responses-${Date.now()}.xlsx`, flat, columns);
 });
 
+// Deletes one raw response row from the response table (e.g. a test
+// submission, spam, or a duplicate) — this only removes the logged
+// response, never the real shul/applicant/store record a submission may
+// have also created (entity_type/entity_id, if set, are just left as they
+// were; delete that record from its own list page instead).
+router.delete('/:id/responses/:responseId', requirePermission('forms', 'can_edit'), (req, res) => {
+  const form = db.prepare('SELECT * FROM forms WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
+  if (!form) return res.status(404).json({ error: 'Not found' });
+  const response = db.prepare('SELECT * FROM form_responses WHERE id = ? AND form_id = ?').get(req.params.responseId, form.id);
+  if (!response) return res.status(404).json({ error: 'Not found' });
+  db.prepare('DELETE FROM form_responses WHERE id = ?').run(response.id);
+  res.json({ ok: true });
+});
+
 export default router;

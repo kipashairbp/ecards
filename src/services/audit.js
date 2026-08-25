@@ -1,5 +1,21 @@
 import { db, uuid } from '../db.js';
-import { hardDeleteShul, hardDeleteApplicant } from '../utils/entityDelete.js';
+import {
+  hardDeleteShul, hardDeleteApplicant, hardDeleteStore,
+  restoreShulSnapshot, restoreApplicantSnapshot, restoreStoreSnapshot,
+} from '../utils/entityDelete.js';
+
+// Dispatch tables for undoing a hard delete (shul/applicant/store):
+// CASCADE_RESTORERS brings a full snapshot (see entityDelete.js) back —
+// used whenever the audit_log 'before' value is one of these snapshots,
+// i.e. undoing an original delete, or redoing a previous undo of one.
+// HARD_DELETERS is the reverse direction — re-deleting the entity via its
+// real cascade (not a naive single-row DELETE, which would violate FK
+// constraints against contracts/notes a prior undo just restored) — used
+// whenever the target state is "this entity shouldn't exist" (before ===
+// null) for one of these three entity types, whether that's undoing a
+// 'create' or redoing an original delete.
+const CASCADE_RESTORERS = { 'shul-cascade': restoreShulSnapshot, 'applicant-cascade': restoreApplicantSnapshot, 'store-cascade': restoreStoreSnapshot };
+const HARD_DELETERS = { shul: hardDeleteShul, applicant: hardDeleteApplicant, store: hardDeleteStore };
 
 // ---------------------------------------------------------------------------
 // Shared audit trail + generic undo/redo. Previously logAudit() was a local,
@@ -90,7 +106,7 @@ export function getRecentActions(orgId, hours = 48) {
     ...r,
     before: r.before_json ? JSON.parse(r.before_json) : null,
     after: r.after_json ? JSON.parse(r.after_json) : null,
-    undoable: (UNDOABLE_ACTIONS.includes(r.action) || r.action === 'mass-import') && !!ENTITY_TABLES[r.entity_type] && !r.undone_at && !!(r.before_json || r.after_json),
+    undoable: (UNDOABLE_ACTIONS.includes(r.action) || r.action === 'mass-import' || r.action === 'mass-delete') && !!ENTITY_TABLES[r.entity_type] && !r.undone_at && !!(r.before_json || r.after_json),
     // Lets the UI put a "Redo" button directly on an already-undone row
     // instead of making the admin go find the separate "Reversed a change
     // to..." entry the undo created.
@@ -215,19 +231,64 @@ function undoMassImportEntry(entry, actingUser, ip) {
   return logMassAudit(entry.org_id, actingUser.id, 'mass-import-undo', entry.entity_type, touchedIds.length ? touchedIds : [entry.id], summary, ip);
 }
 
+// Reverses a mass-delete: every record it hard-deleted gets fully restored
+// (main row + every related row the cascade removed/unlinked) from the
+// per-row snapshot routes/{shuls,applicants,stores}.js captured right
+// before deleting each one (see captureShulSnapshot() & friends). Same
+// "deliberately not itself undoable/redoable" shape as
+// undoMassImportEntry above, for the same reason — logged as
+// 'mass-delete-undo', not 'undo', and never wired to a Redo button.
+function undoMassDeleteEntry(entry, actingUser, ip) {
+  const after = entry.after_json ? JSON.parse(entry.after_json) : {};
+  const snapshots = after.snapshots || [];
+  if (!snapshots.length) throw new Error('Nothing to restore for this mass delete — no snapshot data was saved for these records.');
+  let restored = 0;
+  const run = db.transaction(() => {
+    for (const snap of snapshots) {
+      const restore = CASCADE_RESTORERS[snap.kind];
+      if (!restore) continue;
+      restore(snap);
+      restored++;
+    }
+  });
+  run();
+  db.prepare(`UPDATE audit_log SET undone_at = datetime('now') WHERE id = ?`).run(entry.id);
+  const touchedIds = snapshots.map(s => s.row.id);
+  return logMassAudit(entry.org_id, actingUser.id, 'mass-delete-undo', entry.entity_type, touchedIds.length ? touchedIds : [entry.id], { restored }, ip);
+}
+
 export function undoAuditEntry(auditId, actingUser, ip) {
   const entry = db.prepare('SELECT * FROM audit_log WHERE id = ?').get(auditId);
   if (!entry) throw new Error('Action not found');
   if (entry.org_id !== actingUser.org_id) throw new Error('Not found');
   if (entry.undone_at) throw new Error('This action was already undone');
   if (entry.action === 'mass-import') return undoMassImportEntry(entry, actingUser, ip);
+  if (entry.action === 'mass-delete') return undoMassDeleteEntry(entry, actingUser, ip);
   if (!UNDOABLE_ACTIONS.includes(entry.action)) throw new Error(`"${entry.action}" actions can't be undone`);
   if (!ENTITY_TABLES[entry.entity_type]) throw new Error(`"${entry.entity_type}" records can't be undone`);
   const before = entry.before_json ? JSON.parse(entry.before_json) : null;
   const after = entry.after_json ? JSON.parse(entry.after_json) : null;
   if (before === null && after === null) throw new Error('Nothing to restore for this action');
 
-  restoreEntityState(entry.entity_type, entry.entity_id, before);
+  const run = db.transaction(() => {
+    if (before && before.kind && CASCADE_RESTORERS[before.kind]) {
+      // Undoing a hard delete (or redoing a previous undo of one) — bring
+      // back the whole snapshot, not just the bare row.
+      CASCADE_RESTORERS[before.kind](before);
+    } else if (before === null && HARD_DELETERS[entry.entity_type]) {
+      // Target state is "doesn't exist" for a shul/applicant/store — use
+      // the real cascade delete rather than restoreEntityState's naive
+      // single-row DELETE, which would fail (or leave orphans) against any
+      // FK-constrained related rows a prior undo just restored.
+      const def = ENTITY_TABLES[entry.entity_type];
+      const row = db.prepare(`SELECT * FROM ${def.table} WHERE ${def.pk} = ?`).get(entry.entity_id);
+      if (row) HARD_DELETERS[entry.entity_type](row);
+    } else {
+      restoreEntityState(entry.entity_type, entry.entity_id, before);
+    }
+  });
+  run();
+
   const undoEntryId = logAudit(entry.org_id, actingUser.id, 'undo', entry.entity_type, entry.entity_id, after, before, ip);
   db.prepare(`UPDATE audit_log SET undone_at = datetime('now'), undo_entry_id = ? WHERE id = ?`).run(undoEntryId, auditId);
   return undoEntryId;
