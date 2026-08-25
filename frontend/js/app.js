@@ -1397,13 +1397,23 @@ window.openSignatureBoxEditor = async (kind, title) => {
           ${Object.keys(SIGBOX_TYPE_LABEL).map(t => `<option value="${t}" ${f.type === t ? 'selected' : ''}>${SIGBOX_TYPE_LABEL[t]}</option>`).join('')}
         </select>
         <input data-fid="${f.id}" class="sigbox-label" placeholder="Label" value="${esc(f.label || '')}" style="flex:1">
+        ${['date', 'text'].includes(f.type) ? `<select data-fid="${f.id}" class="sigbox-align" style="width:90px">
+          <option value="" ${!f.align ? 'selected' : ''}>Left</option>
+          <option value="center" ${f.align === 'center' ? 'selected' : ''}>Center</option>
+          <option value="right" ${f.align === 'right' ? 'selected' : ''}>Right</option>
+        </select>` : ''}
         <label class="small-muted" style="display:flex;align-items:center;gap:3px;white-space:nowrap"><input type="checkbox" data-fid="${f.id}" class="sigbox-required" ${f.required !== false ? 'checked' : ''}> Required</label>
         <button type="button" class="btn btn-outline btn-sm" onclick="selectSignatureField('${f.id}')">Select</button>
         ${fields.length > 1 ? `<button type="button" class="btn btn-outline btn-sm" onclick="removeSignatureField('${f.id}')">&times;</button>` : ''}
       </div>
     `).join('');
-    qsa('.sigbox-type').forEach(sel => sel.onchange = () => { const f = fields.find(x => x.id === sel.dataset.fid); f.type = sel.value; renderBoxes(); });
+    // renderFieldsList() (not just renderBoxes()) on a type change so the
+    // Alignment dropdown appears/disappears immediately when switching a
+    // field into or out of date/text — otherwise it'd stay stale until
+    // something else happened to re-render this list.
+    qsa('.sigbox-type').forEach(sel => sel.onchange = () => { const f = fields.find(x => x.id === sel.dataset.fid); f.type = sel.value; renderBoxes(); renderFieldsList(); });
     qsa('.sigbox-label').forEach(inp => inp.oninput = () => { const f = fields.find(x => x.id === inp.dataset.fid); f.label = inp.value; renderBoxes(); });
+    qsa('.sigbox-align').forEach(sel => sel.onchange = () => { const f = fields.find(x => x.id === sel.dataset.fid); f.align = sel.value || undefined; });
     qsa('.sigbox-required').forEach(cb => cb.onchange = () => { const f = fields.find(x => x.id === cb.dataset.fid); f.required = cb.checked; });
   }
 
@@ -1520,11 +1530,17 @@ window.openContractFieldEditor = async (kind, title) => {
         <select data-fid="${f.id}" class="cfbox-field" style="flex:1">
           ${availableFields.map(([key, label]) => `<option value="${key}" ${f.dataField === key ? 'selected' : ''}>${esc(label)}</option>`).join('')}
         </select>
+        <select data-fid="${f.id}" class="cfbox-align" style="width:90px">
+          <option value="" ${!f.align ? 'selected' : ''}>Left</option>
+          <option value="center" ${f.align === 'center' ? 'selected' : ''}>Center</option>
+          <option value="right" ${f.align === 'right' ? 'selected' : ''}>Right</option>
+        </select>
         <button type="button" class="btn btn-outline btn-sm" onclick="selectContractField('${f.id}')">Select</button>
         <button type="button" class="btn btn-outline btn-sm" onclick="removeContractField('${f.id}')">&times;</button>
       </div>
     `).join('') : '<p class="small-muted">No fields yet — click "+ Add Field" above.</p>';
     qsa('.cfbox-field').forEach(sel => sel.onchange = () => { const f = fields.find(x => x.id === sel.dataset.fid); f.dataField = sel.value; renderBoxes(); });
+    qsa('.cfbox-align').forEach(sel => sel.onchange = () => { const f = fields.find(x => x.id === sel.dataset.fid); f.align = sel.value || undefined; });
   }
 
   window.addContractField = () => {

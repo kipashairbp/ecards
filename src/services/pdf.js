@@ -264,7 +264,16 @@ export async function stampDataFields(templateBytes, fields, values) {
     const text = String(value);
     let size = f.fontSize || Math.min(14, boxH * 0.7);
     while (size > 6 && font.widthOfTextAtSize(text, size) > boxW) size -= 0.5;
-    page.drawText(text, { x: boxX, y: boxTop - boxH * 0.75, size, font, color: rgb(0.1, 0.08, 0.06) });
+    // f.align ('center'/'right', default left) — shifts the drawn text
+    // within the box by its actual rendered width at the chosen size, same
+    // idea as the web Form Builder's alignment, just computed manually
+    // since pdf-lib has no text-align concept of its own.
+    let drawX = boxX;
+    if (f.align === 'center' || f.align === 'right') {
+      const textWidth = font.widthOfTextAtSize(text, size);
+      drawX = f.align === 'center' ? boxX + Math.max(0, (boxW - textWidth) / 2) : boxX + Math.max(0, boxW - textWidth);
+    }
+    page.drawText(text, { x: drawX, y: boxTop - boxH * 0.75, size, font, color: rgb(0.1, 0.08, 0.06) });
   }
   return doc.save();
 }
@@ -416,8 +425,16 @@ export async function stampSignatureFields({ unsignedPath, shulId, fields, value
     const value = values?.[field.id];
 
     if (field.type === 'date' || field.type === 'text') {
-      const label = field.type === 'date' ? (value || signedAt || '') : (value || '');
-      page.drawText(String(label), { x: boxX, y: boxBottom + boxH * 0.3, size: Math.min(12, boxH * 0.5), font, color: rgb(0.15, 0.11, 0.09) });
+      const label = String(field.type === 'date' ? (value || signedAt || '') : (value || ''));
+      const size = Math.min(12, boxH * 0.5);
+      // field.align ('center'/'right', default left) — same manual
+      // text-width-based shift as stampDataFields above.
+      let drawX = boxX;
+      if (field.align === 'center' || field.align === 'right') {
+        const textWidth = font.widthOfTextAtSize(label, size);
+        drawX = field.align === 'center' ? boxX + Math.max(0, (boxW - textWidth) / 2) : boxX + Math.max(0, boxW - textWidth);
+      }
+      page.drawText(label, { x: drawX, y: boxBottom + boxH * 0.3, size, font, color: rgb(0.15, 0.11, 0.09) });
       continue;
     }
 
