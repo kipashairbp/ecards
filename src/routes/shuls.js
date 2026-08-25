@@ -203,6 +203,9 @@ router.post('/contract/:token/sign', async (req, res) => {
   db.prepare(`UPDATE shuls SET status='contract_signed', updated_at=datetime('now') WHERE id=?`).run(contract.shul_id);
   const shul = db.prepare('SELECT * FROM shuls WHERE id = ?').get(contract.shul_id);
   logAudit(shul.org_id, null, 'esign', 'contract', contract.id, null, { signer_name, signedAt }, req.ip);
+  await notifyNewSignup(shul.org_id, 'notify_doc_signed_email', 'docSigned', {
+    docTitle: 'Shul Contract', entityName: shul.name_en || '', signerName: signer_name, signedAt,
+  });
   res.json({ ok: true, message: 'Contract signed. An administrator will review and set up your account.' });
 });
 

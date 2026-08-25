@@ -7,7 +7,7 @@ import { db, uuid } from '../db.js';
 import { auth } from '../middleware/auth.js';
 import { requirePermission } from '../middleware/permissions.js';
 import { generateGenericDocumentPdf, buildSimplePdf, stampSignatureFields, getSignatureFields, resolveSignatureValues } from '../services/pdf.js';
-import { sendMailChecked, renderSystemTemplate } from '../services/mail.js';
+import { sendMailChecked, renderSystemTemplate, notifyNewSignup } from '../services/mail.js';
 
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
@@ -321,6 +321,9 @@ router.post('/sign/:token/sign', async (req, res) => {
     const { emailError } = await sendMailChecked(document.org_id, toEmail, tmpl.subject, tmpl.body, { replyTo: tmpl.replyTo });
     if (emailError) console.error('[mail] signed-document link email failed:', emailError);
   }
+  await notifyNewSignup(document.org_id, 'notify_doc_signed_email', 'docSigned', {
+    docTitle: document.title || 'Document', entityName: entityName || '', signerName: signer_name, signedAt,
+  });
   res.json({ ok: true, message: 'Document signed. Thank you.' });
 });
 

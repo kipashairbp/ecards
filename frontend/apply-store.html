@@ -125,7 +125,7 @@ qs('#sign-btn').addEventListener('click', async () => {
   const signerName = qs('#signer_name').value.trim();
   if (!signerName) return toast('Please type your full name', true);
   if (!esignConsentChecked('sign')) return;
-  const values = collectSignValues(contractFields);
+  const values = await collectSignValues(contractFields);
   if (!values) return;
   const btn = qs('#sign-btn'); btn.disabled = true; btn.textContent = 'Submitting…';
   try {

@@ -211,6 +211,12 @@ export const SYSTEM_EMAIL_TEMPLATES = {
       <p><strong>Store:</strong> {{storeName}}<br><strong>Contact:</strong> {{contactName}}<br><strong>Email:</strong> {{contactEmail}}<br><strong>Phone:</strong> {{contactPhone}}</p>
       {{details}}`,
   },
+  docSigned: {
+    label: 'Internal Notice: Document Signed', vars: ['docTitle', 'entityName', 'signerName', 'signedAt'],
+    subject: 'Signed: {{docTitle}} ({{entityName}})',
+    body: `<p><strong>{{entityName}}</strong> just signed <strong>{{docTitle}}</strong>.</p>
+      <p><strong>Signed by:</strong> {{signerName}}<br><strong>Signed at:</strong> {{signedAt}}</p>`,
+  },
 };
 
 // Renders every field the shul/store just submitted as a plain label/value

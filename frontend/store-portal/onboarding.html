@@ -120,7 +120,7 @@ function attachHandlers() {
     const signerName = qs('#signer_name').value.trim();
     if (!signerName) return toast('Please type your full name', true);
     if (!esignConsentChecked('sign')) return;
-    const values = collectSignValues(agreementFields);
+    const values = await collectSignValues(agreementFields);
     if (!values) return;
     const btn = qs('#sign-btn'); btn.disabled = true; btn.textContent = 'Submitting…';
     try {

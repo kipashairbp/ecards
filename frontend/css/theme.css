@@ -1,3 +1,15 @@
+/* Self-hosted (not a Google Fonts CDN call) so the typed e-signature
+   feature renders identically everywhere, the same reasoning as bundling
+   NotoSansHebrew for PDFs instead of relying on whatever's installed on the
+   signer's device. SIL Open Font License — see frontend/fonts/DancingScript-LICENSE.txt. */
+@font-face {
+  font-family: 'Signature Script';
+  src: url('/fonts/DancingScript-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
   --brand-bg: #241a15;
   --brand-bg-2: #2e221b;

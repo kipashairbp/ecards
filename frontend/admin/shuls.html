@@ -127,11 +127,29 @@ async function load() {
 function changePage(d) { state.page += d; load(); }
 
 function rowHtml(s, cols) {
-  return `<tr onclick="openShul('${s.id}')" style="cursor:pointer">
+  return `<tr data-shul-id="${s.id}" onclick="openShul('${s.id}')" style="cursor:pointer">
     <td onclick="event.stopPropagation()"><input type="checkbox" class="row-chk" data-id="${s.id}"></td>
     ${cols.map(c => `<td>${c.render(s)}</td>`).join('')}
     <td><button class="btn btn-sm btn-outline" onclick="event.stopPropagation();openShul('${s.id}')">View</button></td>
   </tr>`;
+}
+
+// The detail popup always fetches fresh data (GET /shuls/:id), but merely
+// opening it never touched the list row underneath — so a shul that
+// changed status entirely outside this page (most commonly: a shul signing
+// their own contract via their public link, which the admin never triggers
+// or sees happen) showed the right thing in the popup but a stale badge in
+// the list until a full reload. Patches just that one row in place with
+// whatever the popup just fetched, so viewing it is enough to catch the
+// list up too.
+function patchShulRow(s) {
+  const tr = qs(`tr[data-shul-id="${s.id}"]`);
+  if (!tr) return;
+  const cols = activeColumns.map(k => SHUL_COLUMNS.find(c => c.key === k)).filter(Boolean);
+  const wasChecked = tr.querySelector('.row-chk')?.checked;
+  tr.outerHTML = rowHtml(s, cols);
+  const chk = qs(`tr[data-shul-id="${s.id}"] .row-chk`);
+  if (chk) { chk.checked = !!wasChecked; chk.addEventListener('change', onCheck); }
 }
 
 function onCheck(e) {
@@ -270,6 +288,7 @@ qs('#btn-mass-apply').addEventListener('click', async () => {
 async function openShul(id) {
   try {
     const { shul, notes, contract, applicants, flags } = await api(`/shuls/${id}`);
+    patchShulRow({ ...shul, applicant_count: applicants.length });
     const body = `
       <div class="tabs" id="stabs">
         <button class="active" data-t="info">Info</button><button data-t="notes">Notes (${notes.length})</button>

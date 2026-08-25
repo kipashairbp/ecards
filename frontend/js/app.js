@@ -1145,40 +1145,68 @@ function initSignaturePad(canvasId) {
   };
 }
 
-// Renders one input per admin-configured fillable field (from
-// getSignatureFields()/services/pdf.js's field list, as returned alongside
-// the contract/document on the signing endpoints) into `container` — a
-// signature pad for 'signature'/'initial', a date/text input otherwise.
-// Used by sign-contract.html, sign-document.html, and apply.html's embedded
-// contract-sign step so a document with more than one fillable item (extra
-// signatures, initials, a date, free text) renders the same way everywhere.
+// Shared state for every signature/initial field on the current signing
+// page: signaturePads holds the draw-pad instance (used in "Draw" mode),
+// signatureFieldModes tracks which mode ("type", the default, or "draw")
+// each field is currently in. Both are keyed by field id and populated by
+// renderPdfSigningPages below — the only live renderer of these fields now
+// (sign-contract.html, sign-document.html, apply.html's embedded step all
+// go through it).
 window.signaturePads = {};
-function renderSignFields(fields, container) {
-  container.innerHTML = fields.map(f => {
-    if (f.type === 'signature' || f.type === 'initial') {
-      return `<label>${esc(f.label || (f.type === 'signature' ? 'Signature' : 'Initial'))}${f.required !== false ? ' <span class="req">*</span>' : ''}</label>
-        <canvas id="sig-${f.id}" class="sign-field-canvas" style="width:100%;height:${f.type === 'signature' ? 120 : 70}px;border:1px solid var(--border);border-radius:6px"></canvas>
-        <div style="margin:6px 0 16px"><button type="button" class="btn btn-outline btn-sm" onclick="signaturePads['${f.id}'].clear()">Clear</button></div>`;
-    }
-    if (f.type === 'date') {
-      return `<label>${esc(f.label || 'Date')}${f.required !== false ? ' <span class="req">*</span>' : ''}</label>
-        <input type="date" class="sign-field-text" data-fid="${f.id}" value="${new Date().toISOString().slice(0, 10)}" style="margin-bottom:16px">`;
-    }
-    return `<label>${esc(f.label || 'Text')}${f.required !== false ? ' <span class="req">*</span>' : ''}</label>
-      <input type="text" class="sign-field-text" data-fid="${f.id}" style="margin-bottom:16px">`;
-  }).join('');
-  fields.filter(f => f.type === 'signature' || f.type === 'initial').forEach(f => { signaturePads[f.id] = initSignaturePad(`sig-${f.id}`); });
+window.signatureFieldModes = {};
+
+// Rasterizes a typed name into a cursive-styled PNG — same output shape a
+// hand-drawn signature pad already produces, so stampSignatureFields
+// (services/pdf.js) needs no changes at all: it already just embeds
+// whatever PNG data URL it's handed, whether that came from mouse/touch
+// strokes or from typed text rendered here. This is what makes "Type" a
+// real signature, not just a name written in a different font: legally, an
+// electronic signature only needs to be a symbol executed with intent to
+// sign (ESIGN Act / UETA) — the cursive rendering is just so it visually
+// reads as one too.
+const SIGNATURE_FONT_FAMILY = `'Signature Script', 'Brush Script MT', 'Segoe Script', 'Bradley Hand', cursive`;
+async function renderTypedSignaturePng(text, isInitial) {
+  // Canvas text doesn't wait for webfonts on its own (a well-known gotcha —
+  // font-display:swap only governs regular DOM text) so without this a
+  // signature typed and submitted fast enough could rasterize in the
+  // browser's fallback font instead of the real one. document.fonts.load
+  // is a no-op once it's already loaded (e.g. from the input field next to
+  // it already using the same font), so this never adds a real delay.
+  try { await document.fonts.load(`700 40px 'Signature Script'`); } catch { /* falls back to the next font in the stack below */ }
+  const canvas = document.createElement('canvas');
+  const w = 500, h = isInitial ? 120 : 160;
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  let size = isInitial ? 60 : 70;
+  // The bundled Signature Script file only ships a 700 (bold) weight —
+  // canvas silently falls through to the next font in the stack if the
+  // requested weight doesn't match a registered face, so this has to say
+  // "bold" explicitly rather than relying on the (400/normal) default.
+  ctx.font = `bold ${size}px ${SIGNATURE_FONT_FAMILY}`;
+  while (size > 20 && ctx.measureText(text).width > w - 40) { size -= 2; ctx.font = `bold ${size}px ${SIGNATURE_FONT_FAMILY}`; }
+  ctx.fillStyle = '#241a15';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, 20, h / 2);
+  return canvas.toDataURL('image/png');
 }
 
 // Reads back every field's value: signature/initial as a PNG data URL (or
-// '' if left blank), date/text as typed text. Returns null (and toasts) if
-// a required field was left empty — caller should abort the submit in that case.
-function collectSignValues(fields) {
+// '' if left blank) — typed text is rasterized on the spot via
+// renderTypedSignaturePng, a drawn one is read straight off its pad — date/
+// text fields as typed text. Returns null (and toasts) if a required field
+// was left empty — caller should abort the submit in that case.
+async function collectSignValues(fields) {
   const values = {};
   for (const f of fields) {
     if (f.type === 'signature' || f.type === 'initial') {
-      const pad = signaturePads[f.id];
-      values[f.id] = pad && !pad.isEmpty() ? pad.toDataUrl() : '';
+      const mode = signatureFieldModes[f.id] || 'draw';
+      if (mode === 'type') {
+        const text = qs(`.sig-type-input[data-fid="${f.id}"]`)?.value.trim() || '';
+        values[f.id] = text ? await renderTypedSignaturePng(text, f.type === 'initial') : '';
+      } else {
+        const pad = signaturePads[f.id];
+        values[f.id] = pad && !pad.isEmpty() ? pad.toDataUrl() : '';
+      }
     } else {
       values[f.id] = qs(`.sign-field-text[data-fid="${f.id}"]`)?.value.trim() || '';
     }
@@ -1257,8 +1285,21 @@ async function renderPdfSigningPages(pdfUrl, fields, containerId) {
       const overlay = document.createElement('div');
       overlay.style.cssText = `position:absolute;left:${x * 100}%;top:${y * 100}%;width:${w * 100}%;height:${h * 100}%;`;
       if (f.type === 'signature' || f.type === 'initial') {
-        overlay.innerHTML = `<canvas id="sig-${f.id}" class="sign-field-canvas" style="width:100%;height:100%;background:rgba(255,247,225,.65);border:1.5px dashed var(--brand-gold-dark);border-radius:4px;cursor:crosshair"></canvas>
-          <div style="position:absolute;top:2px;left:4px;font-size:10px;color:var(--brand-gold-dark);pointer-events:none;font-weight:600">${esc(f.label || (f.type === 'signature' ? 'Signature' : 'Initial'))}${f.required !== false ? ' *' : ''}</div>`;
+        // "Type" is the default and shows a name/initials input styled in a
+        // cursive font — reads as a real signature as you type it, and gets
+        // rasterized to a PNG at submit time (collectSignValues). "Draw"
+        // swaps to the original hand-drawn canvas for anyone who wants that
+        // instead. Both are always in the DOM; the toggle just shows/hides.
+        const isInitial = f.type === 'initial';
+        overlay.innerHTML = `
+          <div style="position:absolute;top:2px;right:2px;z-index:3;display:flex;gap:2px">
+            <button type="button" class="sig-mode-btn" data-fid="${f.id}" data-mode="type" style="font-size:9px;padding:2px 6px;border:1px solid var(--brand-gold-dark);border-radius:3px;cursor:pointer">Type</button>
+            <button type="button" class="sig-mode-btn" data-fid="${f.id}" data-mode="draw" style="font-size:9px;padding:2px 6px;border:1px solid var(--brand-gold-dark);border-radius:3px;cursor:pointer">Draw</button>
+          </div>
+          <div style="position:absolute;top:2px;left:4px;font-size:10px;color:var(--brand-gold-dark);pointer-events:none;font-weight:600;z-index:2">${esc(f.label || (f.type === 'signature' ? 'Signature' : 'Initial'))}${f.required !== false ? ' *' : ''}</div>
+          <input type="text" class="sig-type-input" data-fid="${f.id}" placeholder="${isInitial ? 'Type your initials' : 'Type your full name'}"
+            style="width:100%;height:100%;box-sizing:border-box;padding:16px 8px 4px;border:1.5px dashed var(--brand-gold-dark);border-radius:4px;background:rgba(255,247,225,.65);font-family:${SIGNATURE_FONT_FAMILY};font-weight:700;font-size:${isInitial ? 18 : 22}px;color:#241a15">
+          <canvas id="sig-${f.id}" class="sign-field-canvas" style="display:none;width:100%;height:100%;background:rgba(255,247,225,.65);border:1.5px dashed var(--brand-gold-dark);border-radius:4px;cursor:crosshair"></canvas>`;
       } else {
         // Font-size scales down for small boxes (floor 8px so it never goes
         // illegible), and padding is cut to the minimum needed to keep the
@@ -1277,7 +1318,45 @@ async function renderPdfSigningPages(pdfUrl, fields, containerId) {
       pageWrap.appendChild(overlay);
     }
   }
-  fields.filter(f => f.type === 'signature' || f.type === 'initial').forEach(f => { signaturePads[f.id] = initSignaturePad(`sig-${f.id}`); });
+  const sigFields = fields.filter(f => f.type === 'signature' || f.type === 'initial');
+  const firstSignatureId = sigFields.find(f => f.type === 'signature')?.id;
+  sigFields.forEach(f => {
+    signaturePads[f.id] = initSignaturePad(`sig-${f.id}`);
+    signatureFieldModes[f.id] = 'type';
+    const typeInput = qs(`.sig-type-input[data-fid="${f.id}"]`);
+    const canvas = qs(`#sig-${f.id}`);
+    // The (usually one) main signature field mirrors the page's own "Signer
+    // Full Name" input by default, so nobody has to type their name twice —
+    // stops mirroring the moment they type something different into this
+    // field directly. Extra co-signer signature fields, and initial fields,
+    // start blank since there's no single name to guess for those.
+    if (f.id === firstSignatureId) {
+      const nameEl = qs('#signer_name');
+      if (nameEl) {
+        let userEdited = false;
+        typeInput.value = nameEl.value;
+        nameEl.addEventListener('input', () => { if (!userEdited) typeInput.value = nameEl.value; });
+        typeInput.addEventListener('input', () => { userEdited = true; });
+      }
+    }
+    qsa(`.sig-mode-btn[data-fid="${f.id}"]`).forEach(btn => {
+      const setActive = (mode) => {
+        btn.style.background = btn.dataset.mode === mode ? 'var(--brand-gold-dark)' : '#fff';
+        btn.style.color = btn.dataset.mode === mode ? '#fff' : 'var(--brand-gold-dark)';
+      };
+      setActive('type');
+      btn.addEventListener('click', () => {
+        const mode = btn.dataset.mode;
+        signatureFieldModes[f.id] = mode;
+        qsa(`.sig-mode-btn[data-fid="${f.id}"]`).forEach(b => {
+          b.style.background = b.dataset.mode === mode ? 'var(--brand-gold-dark)' : '#fff';
+          b.style.color = b.dataset.mode === mode ? '#fff' : 'var(--brand-gold-dark)';
+        });
+        typeInput.style.display = mode === 'type' ? 'block' : 'none';
+        canvas.style.display = mode === 'draw' ? 'block' : 'none';
+      });
+    });
+  });
 }
 
 // Renders the last page of the actual document at previewUrl (the org's
