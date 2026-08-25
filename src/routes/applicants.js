@@ -244,6 +244,29 @@ router.get('/export', requirePermission('applicants', 'can_export'), (req, res) 
   sendXlsx(res, `applicants-${Date.now()}.xlsx`, redact(rows, req.permission.hidden_fields));
 });
 
+// Shul-portal export: the shul's own pending/approved applicants, in the
+// exact same column layout as the upload template (with real `id`s filled
+// in) so this sheet can be edited and re-uploaded through the normal
+// POST /import unchanged (see #3 — export, edit/fill-in-missing-info,
+// re-upload). A shul never gets the general can_export permission (see the
+// PORTAL_ALLOWED_RESOURCES note near /export above) — this is a separate,
+// narrowly-scoped route instead of opening that up. 'incomplete' (carried-
+// over, awaiting re-enrollment) and 'draft' (uploaded but not yet submitted)
+// rows are left out — those have their own dedicated flows (complete-
+// reenrollment / mass-submit-drafts) with their own required-field rules.
+router.get('/my-export', (req, res) => {
+  if (req.user.role !== 'shul') return res.status(403).json({ error: 'Not permitted' });
+  const rows = db.prepare(`SELECT * FROM applicants WHERE org_id = ? AND shul_id = ? AND approval_status IN ('pending','approved') ORDER BY created_at DESC`)
+    .all(req.user.org_id, req.user.shul_id);
+  const columns = ['id', ...APPLICANT_IMPORT_COLUMNS.filter(c => c !== 'shul_name')];
+  const out = rows.map(r => Object.fromEntries(columns.map(c => {
+    if (c === 'id') return [c, r.id];
+    if (c === 'home_for_yomtov') return [c, r.home_for_yomtov ? 'Yes' : 'No'];
+    return [c, r[c] ?? ''];
+  })));
+  sendXlsx(res, `my-applicants-${Date.now()}.xlsx`, out, columns);
+});
+
 router.get('/:id', (req, res) => {
   const applicant = db.prepare('SELECT a.*, s.name_en as shul_name FROM applicants a LEFT JOIN shuls s ON s.id=a.shul_id WHERE a.id = ? AND a.org_id = ?').get(req.params.id, req.user.org_id);
   if (!applicant) return res.status(404).json({ error: 'Not found' });
@@ -293,6 +316,10 @@ router.get('/:id/messages', requireAdmin, (req, res) => {
 });
 
 router.post('/:id/send-sms', requirePermission('applicants', 'can_edit'), async (req, res) => {
+  // Admin-only quick-send feature (see loadMessagesTab/app.js) — the
+  // shul-portal never calls this, and a shul sending SMS "from the org" to
+  // any applicant (not just their own) isn't a capability it should have.
+  if (req.user.role === 'shul') return res.status(403).json({ error: 'Not permitted' });
   const applicant = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!applicant) return res.status(404).json({ error: 'Not found' });
   const { to, body } = req.body || {};
@@ -304,6 +331,8 @@ router.post('/:id/send-sms', requirePermission('applicants', 'can_edit'), async 
 });
 
 router.post('/:id/send-email', requirePermission('applicants', 'can_edit'), async (req, res) => {
+  // Admin-only quick-send feature — see the identical note on /send-sms above.
+  if (req.user.role === 'shul') return res.status(403).json({ error: 'Not permitted' });
   const applicant = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!applicant) return res.status(404).json({ error: 'Not found' });
   const { to, subject, body } = req.body || {};
@@ -351,7 +380,7 @@ router.post('/', requirePermission('applicants', 'can_edit'), (req, res) => {
   }
   // 'incomplete' (carried-over, not yet re-enrolled) rows don't count as
   // used slots — see the identical check in complete-reenrollment below.
-  const used = db.prepare(`SELECT COUNT(*) c FROM applicants WHERE shul_id = ? AND approval_status NOT IN ('rejected','incomplete')`).get(shulId).c;
+  const used = db.prepare(`SELECT COUNT(*) c FROM applicants WHERE shul_id = ? AND approval_status NOT IN ('rejected','incomplete','draft')`).get(shulId).c;
   if (shul.slots_allocated && used >= shul.slots_allocated) return res.status(400).json({ error: `This shul has used all ${shul.slots_allocated} allocated slot(s) for this season` });
   const capError = seasonCapacityError(shul.season_id);
   if (capError) return res.status(400).json({ error: capError });
@@ -480,7 +509,7 @@ router.post('/:id/complete-reenrollment', requirePermission('applicants', 'can_e
     }
   }
   if (shul?.slots_allocated) {
-    const used = db.prepare(`SELECT COUNT(*) c FROM applicants WHERE shul_id = ? AND approval_status NOT IN ('rejected','incomplete')`).get(applicant.shul_id).c;
+    const used = db.prepare(`SELECT COUNT(*) c FROM applicants WHERE shul_id = ? AND approval_status NOT IN ('rejected','incomplete','draft')`).get(applicant.shul_id).c;
     if (used >= shul.slots_allocated) return res.status(400).json({ error: `This shul has used all ${shul.slots_allocated} allocated slot(s) for this season` });
   }
   const b = req.body || {};
@@ -542,7 +571,7 @@ router.post('/mass-complete-reenrollment', requirePermission('applicants', 'can_
   const affectedIds = [], names = [];
   for (const applicant of candidates) {
     if (shul.slots_allocated) {
-      const used = db.prepare(`SELECT COUNT(*) c FROM applicants WHERE shul_id = ? AND approval_status NOT IN ('rejected','incomplete')`).get(shulId).c;
+      const used = db.prepare(`SELECT COUNT(*) c FROM applicants WHERE shul_id = ? AND approval_status NOT IN ('rejected','incomplete','draft')`).get(shulId).c;
       if (used >= shul.slots_allocated) { skippedSlotsFull++; continue; }
     }
     const errors = validateBySchema(APPLICANT_APPLICATION_SCHEMA, applicant, { isAdmin: false });
@@ -559,11 +588,54 @@ router.post('/mass-complete-reenrollment', requirePermission('applicants', 'can_
   res.json({ completed, skippedIncomplete, skippedSlotsFull });
 });
 
+// Shul-portal only: turns specific 'draft' rows (created by the shul's own
+// bulk upload — see POST /import's initialStatus comment, #3) into real
+// submissions. A shul-uploaded new row never auto-submits — the shul picks
+// which of them to actually send in, same explicit checkbox-then-submit
+// pattern as mass-complete-reenrollment above. Same shul-info-complete and
+// contract-signed gates as every other shul-portal submission path; only the
+// per-shul slots cap applies here (not the org-wide season cap) — same as
+// complete-reenrollment, since these rows already exist and aren't a brand
+// new application being created.
+router.post('/mass-submit-drafts', requirePermission('applicants', 'can_edit'), (req, res) => {
+  if (req.user.role !== 'shul') return res.status(403).json({ error: 'Not permitted' });
+  const shul = db.prepare('SELECT * FROM shuls WHERE id = ? AND org_id = ?').get(req.user.shul_id, req.user.org_id);
+  if (!shul) return res.status(404).json({ error: 'Shul not found' });
+  const shulErrors = shulInfoErrors(shul);
+  if (shulErrors.length) return res.status(400).json({ error: `Please complete your shul's information before submitting applicants: ${shulErrors.join('; ')}`, code: 'SHUL_INFO_INCOMPLETE' });
+  if (!['contract_signed', 'approved'].includes(shul.status)) {
+    return res.status(400).json({ error: 'Please sign your contract for this season before submitting applicants.', code: 'CONTRACT_NOT_SIGNED' });
+  }
+  const { ids } = req.body || {};
+  if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids array required' });
+  const candidates = db.prepare(`SELECT * FROM applicants WHERE shul_id = ? AND approval_status = 'draft' AND id IN (${ids.map(() => '?').join(',')})`).all(shul.id, ...ids);
+  let submitted = 0, skippedSlotsFull = 0; const affectedIds = [], names = [];
+  for (const applicant of candidates) {
+    if (shul.slots_allocated) {
+      const used = db.prepare(`SELECT COUNT(*) c FROM applicants WHERE shul_id = ? AND approval_status NOT IN ('rejected','incomplete','draft')`).get(shul.id).c;
+      if (used >= shul.slots_allocated) { skippedSlotsFull++; continue; }
+    }
+    const initialStatus = isZipAllowed(req.user.org_id, applicant.zip) ? 'pending' : 'rejected';
+    db.prepare(`UPDATE applicants SET approval_status=?, updated_at=datetime('now') WHERE id=?`).run(initialStatus, applicant.id);
+    const updated = db.prepare('SELECT * FROM applicants WHERE id = ?').get(applicant.id);
+    detectAndFlag(req.user.org_id, 'applicant', updated);
+    affectedIds.push(applicant.id); names.push(`${applicant.first_name} ${applicant.last_name}`.trim());
+    submitted++;
+  }
+  logMassAudit(req.user.org_id, req.user.id, 'mass-submit-drafts', 'applicant', affectedIds, { skippedSlotsFull, names }, req.ip);
+  res.json({ submitted, skippedSlotsFull });
+});
+
 // Manually move an applicant back to 'pending' — for un-rejecting one after
 // a decision was made too early/in error, or un-approving one to reconsider
 // (approved_by/approved_at/card_amount are left as-is so there's a record of
 // the prior decision; approving again overwrites them same as normal).
 router.post('/:id/set-pending', requirePermission('applicants', 'can_edit'), async (req, res) => {
+  // Admin decision-workflow action — a shul (even for its own applicant)
+  // never has a legitimate reason to un-approve/un-reject one itself, since
+  // that would let it bypass the review it's waiting on. The shul-portal UI
+  // never calls this.
+  if (req.user.role === 'shul') return res.status(403).json({ error: 'Not permitted' });
   const applicant = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!applicant) return res.status(404).json({ error: 'Not found' });
   db.prepare(`UPDATE applicants SET approval_status='pending', updated_at=datetime('now') WHERE id=?`).run(applicant.id);
@@ -573,6 +645,7 @@ router.post('/:id/set-pending', requirePermission('applicants', 'can_edit'), asy
 });
 
 router.post('/mass-set-pending', requirePermission('applicants', 'can_edit'), async (req, res) => {
+  if (req.user.role === 'shul') return res.status(403).json({ error: 'Not permitted' });
   const { ids } = req.body || {};
   if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids array required' });
   let updated = 0, skipped = 0, cardLockErrors = 0;
@@ -608,6 +681,8 @@ router.post('/mass-set-pending', requirePermission('applicants', 'can_edit'), as
 // loaded onto a card should stay on record there, just deactivated, not be
 // erased.
 router.delete('/:id/permanent', requirePermission('applicants', 'can_edit'), async (req, res) => {
+  // Admin-only — the shul-portal has no delete capability at all.
+  if (req.user.role === 'shul') return res.status(403).json({ error: 'Not permitted' });
   const applicant = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!applicant) return res.status(404).json({ error: 'Not found' });
   const { errors: cardLockErrors } = await lockApplicantCards(req.user.org_id, applicant);
@@ -624,6 +699,7 @@ router.delete('/:id/permanent', requirePermission('applicants', 'can_edit'), asy
 });
 
 router.post('/mass-delete-permanent', requirePermission('applicants', 'can_edit'), async (req, res) => {
+  if (req.user.role === 'shul') return res.status(403).json({ error: 'Not permitted' });
   const { ids } = req.body || {};
   if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids array required' });
   let deleted = 0, skipped = 0, cardLockErrors = 0;
@@ -659,6 +735,11 @@ router.post('/mass-delete-permanent', requirePermission('applicants', 'can_edit'
 const approvalsInFlight = new Set();
 
 router.post('/:id/approve', requirePermission('applicants', 'can_edit'), async (req, res) => {
+  // Admin decision only — a shul approving its own applicant would bypass
+  // the review it's waiting on (and, since approval can trigger a real
+  // disccardpromos gift-card write, self-approve real money). The
+  // shul-portal UI never calls this.
+  if (req.user.role === 'shul') return res.status(403).json({ error: 'Not permitted' });
   const applicant = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!applicant) return res.status(404).json({ error: 'Not found' });
   if (applicant.is_paused) return res.status(423).json({ error: 'Applicant has an unresolved duplicate flag' });
@@ -798,6 +879,8 @@ router.get('/:id/provider-customer-by-id', requireAdmin, async (req, res) => {
 });
 
 router.post('/:id/reject', requirePermission('applicants', 'can_edit'), async (req, res) => {
+  // Admin decision only — see the identical note on /:id/approve above.
+  if (req.user.role === 'shul') return res.status(403).json({ error: 'Not permitted' });
   const applicant = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!applicant) return res.status(404).json({ error: 'Not found' });
   db.prepare(`UPDATE applicants SET approval_status='rejected', approved_by=?, approved_at=datetime('now') WHERE id=?`).run(req.user.id, applicant.id);
@@ -807,6 +890,7 @@ router.post('/:id/reject', requirePermission('applicants', 'can_edit'), async (r
 });
 
 router.post('/mass-reject', requirePermission('applicants', 'can_edit'), async (req, res) => {
+  if (req.user.role === 'shul') return res.status(403).json({ error: 'Not permitted' });
   const { ids } = req.body || {};
   if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids array required' });
   let rejected = 0, skipped = 0, cardLockErrors = 0;
@@ -826,6 +910,7 @@ router.post('/mass-reject', requirePermission('applicants', 'can_edit'), async (
 
 // Mass approval — spec #5 "allow mass approval".
 router.post('/mass-approve', requirePermission('applicants', 'can_edit'), async (req, res) => {
+  if (req.user.role === 'shul') return res.status(403).json({ error: 'Not permitted' });
   const { ids, card_amount } = req.body || {};
   if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids array required' });
   const discountId = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'disccardpromos_discount_id'`).get(req.user.org_id)?.value;
@@ -879,6 +964,7 @@ router.post('/mass-approve', requirePermission('applicants', 'can_edit'), async 
 });
 
 router.post('/:id/notes', (req, res) => {
+  if (req.user.role === 'shul') return res.status(403).json({ error: 'Not permitted' });
   const { note } = req.body || {};
   if (!note) return res.status(400).json({ error: 'Note text required' });
   const applicant = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
@@ -889,11 +975,16 @@ router.post('/:id/notes', (req, res) => {
 });
 
 // CSV/XLSX bulk import (spec #1 "via XCLS and CSV files", #3 mass upload, #5 shul self-upload).
-// If the requester is a shul-portal user, shul_name is ignored — always their own shul.
+// If the requester is a shul-portal user, shul_name is ignored server-side
+// (always their own shul — see forcedShul below) — and, since that column
+// would otherwise be confusing/pointless for them to fill in, this drops
+// it from the template they download entirely. An admin's own template
+// still has it, since an admin's upload can span many shuls.
 router.get('/import/template', (req, res) => {
+  const columns = req.user.role === 'shul' ? APPLICANT_IMPORT_COLUMNS.filter(c => c !== 'shul_name') : APPLICANT_IMPORT_COLUMNS;
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.setHeader('Content-Disposition', 'attachment; filename="applicant_import_template.xlsx"');
-  res.send(buildXlsxTemplate(['id', ...APPLICANT_IMPORT_COLUMNS]));
+  res.send(buildXlsxTemplate(['id', ...columns]));
 });
 
 // Every column an UPDATE row (see rowExisting below) can touch, and how to
@@ -1022,7 +1113,13 @@ router.post('/import', requirePermission('applicants', 'can_edit'), upload.singl
       const id = uuid();
       // Zip-restricted rows are auto-rejected silently — the upload still
       // reports as a normal success so the submitting shul is never told.
-      const initialStatus = isZipAllowed(req.user.org_id, r.zip) ? 'pending' : 'rejected';
+      // A shul-portal upload's brand-new rows (not matched by id — see
+      // rowExisting above) land as 'draft', not 'pending': they don't count
+      // against slots or show up as real submissions until the shul
+      // explicitly picks which ones to submit (POST /mass-submit-drafts).
+      // An admin's own upload is unaffected — admin rows go straight to
+      // 'pending' as before, same as every other admin-submitted row.
+      const initialStatus = !isZipAllowed(req.user.org_id, r.zip) ? 'rejected' : (isAdminSubmitter ? 'pending' : 'draft');
       db.prepare(`INSERT INTO applicants (id, org_id, shul_id, season_id, external_id, first_name, last_name, marital_status, home_phone, husband_cell, wife_cell, email,
           address, city, state, zip, preferred_contact_method, preferred_number, num_children, home_for_yomtov, card_amount, comments, source, approval_status, provider_exempt)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?, 'mass_upload', ?, ?)`)

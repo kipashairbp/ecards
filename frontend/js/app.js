@@ -1086,21 +1086,35 @@ async function attachColumnCustomizer(buttonId, storageKey, columns, defaultOrde
 // response — so there's nothing to accidentally leak by rendering fields
 // verbatim. shulOptions is only used for the special shul_id field on a
 // custom Applicant Application form; pass [] anywhere else.
+// f.align ('center'/'right', default left/unset) — whitelisted rather than
+// escaped since it lands directly in a CSS declaration, not an HTML
+// attribute. Wraps the whole field block (label + input) so it shifts as a
+// unit; also applied to the input/select/textarea itself so typed/selected
+// text visibly shifts too, since inputs are full-width (theme.css) and
+// alignment on the wrapper alone wouldn't otherwise be visible. Checkbox
+// rows are flex layout, so alignment there maps to justify-content instead.
 function fieldHtml(f, shulOptions = []) {
-  if (f.type === 'header') return `<h3 style="margin-top:22px">${esc(f.label || '')}</h3>`;
-  if (f.type === 'image') return f.url ? `<img src="${esc(f.url)}" alt="${esc(f.label||'')}" style="max-width:100%;height:auto;margin:14px 0;border-radius:8px">` : '';
+  const align = ['center', 'right'].includes(f.align) ? f.align : null;
+  const wrapStyle = align ? ` style="text-align:${align}"` : '';
+  const inputStyle = align ? ` style="text-align:${align}"` : '';
+  const wrap = (inner) => align ? `<div${wrapStyle}>${inner}</div>` : inner;
+  if (f.type === 'header') return wrap(`<h3 style="margin-top:22px">${esc(f.label || '')}</h3>`);
+  if (f.type === 'image') return f.url ? wrap(`<img src="${esc(f.url)}" alt="${esc(f.label||'')}" style="max-width:100%;height:auto;margin:14px 0;border-radius:8px">`) : '';
   const req = f.required ? 'required' : '';
   const label = `<label>${esc(f.label || f.key)} ${f.required ? '<span class="req">*</span>' : ''}</label>`;
-  if (f.key === 'shul_id') return `${label}<select name="shul_id" id="shul_id" ${req}><option value="">Select your shul…</option>${shulOptions.map(s => `<option value="${s.id}">${esc(s.name_en)}</option>`).join('')}</select>`;
-  if (f.type === 'select') return `${label}<select name="${esc(f.key)}" id="${esc(f.key)}" ${req}><option value=""></option>${(f.options||[]).map(o => `<option value="${esc(o.value)}">${esc(o.label)}</option>`).join('')}</select>`;
-  if (f.type === 'textarea') return `${label}<textarea name="${esc(f.key)}" id="${esc(f.key)}" ${req}></textarea>`;
-  if (f.type === 'checkbox') return `<div class="checkbox-row" style="margin-top:14px"><input type="checkbox" name="${esc(f.key)}" id="${esc(f.key)}" ${req}><label style="margin:0" for="${esc(f.key)}">${esc(f.label||f.key)}${f.required ? ' <span class="req">*</span>' : ''}</label></div>`;
+  if (f.key === 'shul_id') return wrap(`${label}<select name="shul_id" id="shul_id" ${req}${inputStyle}><option value="">Select your shul…</option>${shulOptions.map(s => `<option value="${s.id}">${esc(s.name_en)}</option>`).join('')}</select>`);
+  if (f.type === 'select') return wrap(`${label}<select name="${esc(f.key)}" id="${esc(f.key)}" ${req}${inputStyle}><option value=""></option>${(f.options||[]).map(o => `<option value="${esc(o.value)}">${esc(o.label)}</option>`).join('')}</select>`);
+  if (f.type === 'textarea') return wrap(`${label}<textarea name="${esc(f.key)}" id="${esc(f.key)}" ${req}${inputStyle}></textarea>`);
+  if (f.type === 'checkbox') {
+    const justify = align === 'center' ? 'center' : align === 'right' ? 'flex-end' : 'flex-start';
+    return `<div class="checkbox-row" style="margin-top:14px;justify-content:${justify}"><input type="checkbox" name="${esc(f.key)}" id="${esc(f.key)}" ${req}><label style="margin:0" for="${esc(f.key)}">${esc(f.label||f.key)}${f.required ? ' <span class="req">*</span>' : ''}</label></div>`;
+  }
   if (f.type === 'number') {
     const min = f.min !== undefined && f.min !== null && f.min !== '' ? ` min="${esc(f.min)}"` : '';
     const max = f.max !== undefined && f.max !== null && f.max !== '' ? ` max="${esc(f.max)}"` : '';
-    return `${label}<input type="number" name="${esc(f.key)}" id="${esc(f.key)}" ${req}${min}${max}>`;
+    return wrap(`${label}<input type="number" name="${esc(f.key)}" id="${esc(f.key)}" ${req}${min}${max}${inputStyle}>`);
   }
-  return `${label}<input type="${f.type==='email'?'email':(f.type==='tel'?'tel':'text')}" name="${esc(f.key)}" id="${esc(f.key)}" ${req}>`;
+  return wrap(`${label}<input type="${f.type==='email'?'email':(f.type==='tel'?'tel':'text')}" name="${esc(f.key)}" id="${esc(f.key)}" ${req}${inputStyle}>`);
 }
 
 // Fetches the fixed question set for one of the four built-in application

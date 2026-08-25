@@ -185,6 +185,11 @@ function renderFields() {
         </select></div>
         ${isBlock ? '' : `<div><label style="margin-top:0">Required</label><select onchange="fieldDraft[${i}].required=this.value==='1'"><option value="1" ${f.required?'selected':''}>Yes</option><option value="0" ${!f.required?'selected':''}>No</option></select></div>`}
       </div>
+      <div style="margin-top:8px"><label style="margin-top:0">Alignment</label><select onchange="fieldDraft[${i}].align=this.value||undefined">
+        <option value="" ${!f.align?'selected':''}>Left (default)</option>
+        <option value="center" ${f.align==='center'?'selected':''}>Center</option>
+        <option value="right" ${f.align==='right'?'selected':''}>Right</option>
+      </select></div>
       ${isBlock ? '' : `<div class="checkbox-row" style="margin-top:8px">
         <input type="checkbox" id="fd-override-${i}" ${f.admin_override?'checked':''} onchange="fieldDraft[${i}].admin_override=this.checked">
         <label style="margin:0" for="fd-override-${i}">Admin can override — skip this field's requirement when an admin adds/imports on someone's behalf</label>
