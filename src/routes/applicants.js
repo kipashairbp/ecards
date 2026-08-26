@@ -184,6 +184,20 @@ function maskForShul(records, role, orgId) {
   return Array.isArray(records) ? records.map(mask) : mask(records);
 }
 
+// A plain 5-digit (or 5+4) US zip loses its leading zero the moment it
+// passes through a spreadsheet cell formatted as a number ("07030" becomes
+// 7030) — very common for the Northeast zips this platform mostly deals
+// with. Without this, that applicant's zip ("7030") would never match the
+// admin's Allowed Zip Codes list ("07030"), silently auto-rejecting a
+// perfectly in-area applicant. Only touches clean numeric/zip+4 strings —
+// anything else (a non-US postal code, stray text) is compared as-is, same
+// as before.
+function normalizeZip(z) {
+  const s = String(z || '').trim();
+  if (!s || !/^\d+(-\d+)?$/.test(s)) return s;
+  return s.split('-')[0].padStart(5, '0');
+}
+
 // If the org has restricted accepted zips (Settings > Organization >
 // Allowed Zip Codes), an applicant outside that list is auto-rejected
 // silently at submission time — the submission still appears to succeed
@@ -191,9 +205,9 @@ function maskForShul(records, role, orgId) {
 export function isZipAllowed(orgId, zip) {
   const setting = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'allowed_zip_codes'`).get(orgId);
   if (!setting || !setting.value.trim()) return true;
-  const allowed = setting.value.split(',').map(z => z.trim()).filter(Boolean);
+  const allowed = setting.value.split(',').map(z => normalizeZip(z)).filter(Boolean);
   if (!allowed.length) return true;
-  return allowed.includes(String(zip || '').trim());
+  return allowed.includes(normalizeZip(zip));
 }
 
 // Shul-portal users only ever see/act on their own shul's applicants; regardless

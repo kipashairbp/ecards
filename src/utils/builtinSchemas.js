@@ -50,13 +50,13 @@ export const APPLICANT_APPLICATION_SCHEMA = [
   { key: 'marital_status', label: 'Marital Status', type: 'select', required: false, options: [
     { value: 'single', label: 'Single' }, { value: 'married', label: 'Married' }, { value: 'widowed', label: 'Widowed' }, { value: 'divorced', label: 'Divorced' } ] },
   { key: 'home_phone', label: 'Home Phone', type: 'tel', required: false }, { key: 'email', label: 'Email', type: 'email', required: false },
-  { key: 'husband_cell', label: 'Husband Cell', type: 'tel', required: false }, { key: 'wife_cell', label: 'Wife Cell', type: 'tel', required: false },
+  { key: 'husband_cell', label: 'Husband Cell', type: 'tel', required: true }, { key: 'wife_cell', label: 'Wife Cell', type: 'tel', required: false },
   { key: 'preferred_contact_method', label: 'Preferred Contact Method', type: 'select', required: false, options: [
     { value: 'phone', label: 'Phone' }, { value: 'text', label: 'Text' }, { value: 'email', label: 'Email' } ] },
   { key: 'preferred_number', label: 'Number To Use', type: 'select', required: false, options: [
     { value: 'home', label: 'Home' }, { value: 'husband', label: 'Husband' }, { value: 'wife', label: 'Wife' } ] },
-  { key: 'address', label: 'Address', type: 'text', required: false }, { key: 'city', label: 'City', type: 'text', required: false },
-  { key: 'state', label: 'State', type: 'text', required: false }, { key: 'zip', label: 'Zip', type: 'text', required: false },
+  { key: 'address', label: 'Address', type: 'text', required: true }, { key: 'city', label: 'City', type: 'text', required: true },
+  { key: 'state', label: 'State', type: 'text', required: true }, { key: 'zip', label: 'Zip', type: 'text', required: true },
   { key: 'num_children', label: 'Number of Children', type: 'number', required: false, min: 0 },
   { key: 'home_for_yomtov', label: 'Home for Yom Tov', type: 'select', required: false, options: [ { value: '1', label: 'Yes' }, { value: '0', label: 'No' } ] },
   { key: 'comments', label: 'Comments', type: 'textarea', required: false },

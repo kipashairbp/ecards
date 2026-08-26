@@ -816,5 +816,32 @@ db.prepare(`UPDATE forms SET season_id = (
     SELECT id FROM seasons WHERE seasons.org_id = forms.org_id AND seasons.is_active = 1 ORDER BY seasons.created_at DESC LIMIT 1
   ) WHERE season_id IS NULL`).run();
 
+// address/city/state/zip/husband_cell used to be optional on the Applicant
+// Application question set (utils/builtinSchemas.js) — now required, same
+// as first/last name. Anything still in the normal decision pipeline
+// (pending or auto/manually rejected) that was let through under the old,
+// laxer rules and is missing one of those fields never should have counted
+// as a real submission. Put back as 'incomplete' — the exact same status/
+// screen a carried-forward shul already uses to finish an applicant's
+// info (shul-portal openReenrollment) — so the shul sees it and has to
+// fill in what's missing before it counts again. Runs every boot but is a
+// no-op once a record is fixed (or stays fixed): completing it moves it out
+// of 'pending'/'rejected' and out of this WHERE clause for good, and if it
+// comes back here it's because it's genuinely missing something again.
+// Already-approved applicants are deliberately left untouched — a gift
+// card may already be issued against one, and reversing that isn't safe to
+// do blindly as part of an unattended migration.
+const missingRequiredApplicantField = `(
+    TRIM(COALESCE(first_name,'')) = '' OR TRIM(COALESCE(last_name,'')) = '' OR
+    TRIM(COALESCE(address,'')) = '' OR TRIM(COALESCE(city,'')) = '' OR
+    TRIM(COALESCE(state,'')) = '' OR TRIM(COALESCE(zip,'')) = '' OR
+    TRIM(COALESCE(husband_cell,'')) = ''
+  )`;
+const incompleteBackfill = db.prepare(`UPDATE applicants SET approval_status = 'incomplete', updated_at = datetime('now')
+    WHERE approval_status IN ('pending','rejected') AND ${missingRequiredApplicantField}`).run();
+if (incompleteBackfill.changes) {
+  console.log(`[db] Marked ${incompleteBackfill.changes} pending/rejected applicant(s) missing a now-required field (address/city/state/zip/husband cell) as 'incomplete' for the shul to complete.`);
+}
+
 export const DEFAULT_ORG_ID = defaultOrgId;
 export function uuid() { return randomUUID(); }

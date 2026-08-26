@@ -198,8 +198,9 @@ window.createApplicant = async () => {
 async function openReenrollment(a) {
   const schema = await loadBuiltinSchema('applicant_application');
   if (!schema) { toast('Could not load the application form — try again shortly.', true); return; }
-  openModal(`Complete Re-enrollment: ${esc(a.first_name)} ${esc(a.last_name)}`,
-    `<p class="small-muted">This applicant was carried over from a previous season. Please review and fill in anything missing before submitting.</p>
+  const carriedOver = a.source === 'carried_forward';
+  openModal(`Complete ${carriedOver ? 'Re-enrollment' : 'Submission'}: ${esc(a.first_name)} ${esc(a.last_name)}`,
+    `<p class="small-muted">${carriedOver ? 'This applicant was carried over from a previous season.' : 'This applicant is missing required information.'} Please review and fill in anything missing before submitting.</p>
      <form id="reenroll-form">${schema.map(f => fieldHtml(f)).join('')}</form>`,
     `<button class="btn btn-primary btn-sm" onclick="submitReenrollment('${a.id}')">Submit</button>`);
   loadGoogleMaps().then(() => { attachPlacesAutocomplete('address', { address: 'address', city: 'city', state: 'state', zip: 'zip' }); });
