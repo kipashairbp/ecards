@@ -816,6 +816,50 @@ db.prepare(`UPDATE forms SET season_id = (
     SELECT id FROM seasons WHERE seasons.org_id = forms.org_id AND seasons.is_active = 1 ORDER BY seasons.created_at DESC LIMIT 1
   ) WHERE season_id IS NULL`).run();
 
+// Applicants auto-rejected by the OLD, buggy isZipAllowed (raw string
+// match — see routes/applicants.js) purely because their zip lost a
+// leading zero somewhere upstream (e.g. an Excel cell formatted as a
+// number: "07030" -> 7030) never should have been rejected at all — their
+// zip genuinely is in the org's Allowed Zip Codes list once compared
+// correctly. Re-checks every still-'rejected' applicant that an admin
+// never actually clicked Reject on (no matching audit_log 'reject' or
+// 'mass-reject' entry — those are real decisions and are left alone no
+// matter what their zip looks like) against the corrected zip logic, and
+// restores it to 'pending' if it now matches. Deliberately duplicates
+// (rather than imports) isZipAllowed's normalize/compare logic — this
+// runs at module load, before routes/applicants.js exists to import from,
+// and importing this file from there would be circular. Runs every boot,
+// no-op once a record leaves 'rejected' — the required-field backfill
+// right below catches anything this restores to 'pending' that's also
+// missing a required field.
+function normalizeZipForMigration(z) {
+  const s = String(z || '').trim();
+  if (!s || !/^\d+(-\d+)?$/.test(s)) return s;
+  return s.split('-')[0].padStart(5, '0');
+}
+const manuallyRejectedApplicantIds = new Set(
+  db.prepare(`SELECT entity_id FROM audit_log WHERE action = 'reject' AND entity_type = 'applicant' AND entity_id IS NOT NULL`).all().map(r => r.entity_id)
+);
+for (const row of db.prepare(`SELECT after_json FROM audit_log WHERE action = 'mass-reject' AND entity_type = 'applicant'`).all()) {
+  try { (JSON.parse(row.after_json || '{}').ids || []).forEach(id => manuallyRejectedApplicantIds.add(id)); } catch { /* malformed/old row */ }
+}
+const allowedZipsByOrg = new Map();
+let zipRecheckRestored = 0;
+for (const a of db.prepare(`SELECT id, org_id, zip FROM applicants WHERE approval_status = 'rejected'`).all()) {
+  if (manuallyRejectedApplicantIds.has(a.id)) continue;
+  if (!allowedZipsByOrg.has(a.org_id)) {
+    const setting = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'allowed_zip_codes'`).get(a.org_id);
+    allowedZipsByOrg.set(a.org_id, setting && setting.value.trim() ? setting.value.split(',').map(normalizeZipForMigration).filter(Boolean) : null);
+  }
+  const allowed = allowedZipsByOrg.get(a.org_id);
+  if (allowed && allowed.length && !allowed.includes(normalizeZipForMigration(a.zip))) continue; // genuinely out of area
+  db.prepare(`UPDATE applicants SET approval_status = 'pending', updated_at = datetime('now') WHERE id = ?`).run(a.id);
+  zipRecheckRestored++;
+}
+if (zipRecheckRestored) {
+  console.log(`[db] Re-checked ${zipRecheckRestored} auto-rejected applicant(s) against the corrected zip-matching logic and restored to 'pending'.`);
+}
+
 // address/city/state/zip/husband_cell used to be optional on the Applicant
 // Application question set (utils/builtinSchemas.js) — now required, same
 // as first/last name. Anything still in the normal decision pipeline
