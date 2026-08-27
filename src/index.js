@@ -50,6 +50,20 @@ const app = express();
 const PORT = process.env.PORT || 3002;
 const FRONTEND_DIR = join(__dirname, '..', 'frontend');
 
+// Render (like any host behind a reverse proxy) terminates the client
+// connection itself and forwards the request here — without this, every
+// single request looks like it came from Render's own proxy, so req.ip
+// (and every IP-keyed rate limiter below) sees the ENTIRE SITE as one
+// visitor. That's what was actually behind reports of sitewide login
+// lockouts: once anyone, anywhere, made 20 combined login/reset/invite
+// requests within 15 minutes, EVERY visitor got 429'd — including
+// forgot-password requests, blocked before they ever reach
+// sendMailChecked, which is why "can't sign in" and "no reset email"
+// were being reported together. `1` trusts exactly the first hop
+// (Render's proxy) and reads the real client IP from X-Forwarded-For —
+// the standard setting for a single-reverse-proxy host.
+app.set('trust proxy', 1);
+
 // Standard hardening headers (HSTS, X-Frame-Options, X-Content-Type-Options,
 // Referrer-Policy, etc.). contentSecurityPolicy/crossOriginEmbedderPolicy are
 // off: every admin/portal page is server-rendered with inline <script> blocks
@@ -70,15 +84,23 @@ app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 2000 }));
 // Auth endpoints get their own much tighter limit — the blanket 2000/15min
 // above is sized for normal app usage (list pages, dashboards polling), not
-// for how many password guesses one IP should get against /login. Applies to
-// every /api/auth/* route (login, forgot-password, accept-invite,
-// change-password) since all of them are password-guessing/token-guessing
-// surface.
+// for how many password/token guesses one IP should get. Scoped to just the
+// four routes that are actually a credential-guessing surface (login,
+// forgot-password, accept-invite, change-password) — GET /me is deliberately
+// excluded: it's a routine "is my session still good" check that fires on
+// every admin page load for logged-in staff/org_admin users (see app.js's
+// refreshPermissions), not something a password guesser hits, and sharing
+// this tight a budget with it was enough on its own to lock a normal
+// browsing session out of login/forgot-password within minutes. /me stays
+// covered by the blanket 2000/15min limit above instead.
 const authRateLimit = rateLimit({
   windowMs: 15 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false,
   message: { error: 'Too many attempts. Please wait a few minutes and try again.' },
 });
-app.use('/api/auth', authRateLimit);
+app.use('/api/auth/login', authRateLimit);
+app.use('/api/auth/forgot-password', authRateLimit);
+app.use('/api/auth/accept-invite', authRateLimit);
+app.use('/api/auth/change-password', authRateLimit);
 
 initMail();
 
