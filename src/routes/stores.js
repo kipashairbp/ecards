@@ -8,6 +8,7 @@ import { requirePermission, redact } from '../middleware/permissions.js';
 import { sendMailChecked, renderSystemTemplate, notifyNewSignup, renderSignupDetails } from '../services/mail.js';
 import { sendXlsx } from '../services/xlsx.js';
 import { normalizePhone, isValidPhone } from '../utils/phone.js';
+import { normalizeEmail } from '../utils/email.js';
 import { validateBySchema } from '../utils/formValidation.js';
 import { STORE_APPLICATION_SCHEMA } from '../utils/builtinSchemas.js';
 import { logAudit, logMassAudit, getEntityHistory } from '../services/audit.js';
@@ -296,7 +297,9 @@ router.post('/mass-delete-permanent', requirePermission('stores', 'can_edit'), (
 
 // Shared by the single and mass invite routes below.
 async function inviteStoreToPortal(orgId, store, emailOverride, sentBy = null) {
-  const email = emailOverride || store.owner_email || store.manager_email;
+  // Normalized before it ever touches users.email — login lowercases its
+  // lookup, so a mixed-case users.email is an account nobody can sign into.
+  const email = normalizeEmail(emailOverride || store.owner_email || store.manager_email);
   if (!email) return { error: 'No email on file for this store' };
   let user = db.prepare('SELECT * FROM users WHERE store_id = ?').get(store.id);
   const emailTaken = db.prepare('SELECT id FROM users WHERE email = ? AND id != ?').get(email, user?.id || '');
@@ -367,7 +370,8 @@ router.post('/mass-invite', requirePermission('stores', 'can_edit'), async (req,
 function ensureStorePortalUser(orgId, store, emailOverride) {
   let user = db.prepare('SELECT * FROM users WHERE store_id = ?').get(store.id);
   if (user) return user;
-  const email = emailOverride || store.owner_email || store.manager_email;
+  // Same users.email normalization as inviteStoreToPortal above.
+  const email = normalizeEmail(emailOverride || store.owner_email || store.manager_email);
   const existing = email ? db.prepare('SELECT * FROM users WHERE org_id = ? AND email = ?').get(orgId, email) : null;
   if (existing) {
     db.prepare('UPDATE users SET store_id = ? WHERE id = ?').run(store.id, existing.id);

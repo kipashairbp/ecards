@@ -10,6 +10,7 @@ import { sendSmsChecked } from '../services/sms.js';
 import { parseSpreadsheet, buildXlsxTemplate, SHUL_IMPORT_COLUMNS } from '../services/importer.js';
 import { sendXlsx } from '../services/xlsx.js';
 import { normalizePhone, isValidPhone } from '../utils/phone.js';
+import { normalizeEmail } from '../utils/email.js';
 import { getActiveSeasonId } from '../utils/formSchedule.js';
 import { validateBySchema, shulInfoErrors } from '../utils/formValidation.js';
 import { SHUL_APPLICATION_SCHEMA } from '../utils/builtinSchemas.js';
@@ -38,7 +39,10 @@ const REQUIRED_SHUL_FIELDS = ['name_en', 'address', 'city', 'state', 'zip', 'ruv
 function ensureShulPortalUser(orgId, shul, portalEmailOverride) {
   let user = db.prepare('SELECT * FROM users WHERE shul_id = ?').get(shul.id);
   if (user) return user;
-  const email = portalEmailOverride || shul.gabai_email;
+  // gabai_email stays as typed on the shul row (fine for display/mailing),
+  // but the users-table copy must be normalized — login lowercases its
+  // lookup, so a mixed-case users.email is an account nobody can sign into.
+  const email = normalizeEmail(portalEmailOverride || shul.gabai_email);
   const existing = email ? db.prepare('SELECT * FROM users WHERE org_id = ? AND email = ?').get(orgId, email) : null;
   if (existing) {
     db.prepare('UPDATE users SET shul_id = ? WHERE id = ?').run(shul.id, existing.id);

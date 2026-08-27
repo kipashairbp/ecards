@@ -10,7 +10,11 @@ const router = Router();
 router.post('/login', (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: 'Email and password are required' });
-  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(String(email).trim().toLowerCase());
+  // COLLATE NOCASE: users.email is normalized to lowercase on write and
+  // backfilled at boot (see db.js), but stay case-insensitive here anyway —
+  // a single un-normalized row (e.g. a skipped backfill collision) should
+  // degrade to "wrong password", never to an account that can't be found.
+  const user = db.prepare('SELECT * FROM users WHERE email = ? COLLATE NOCASE').get(String(email).trim().toLowerCase());
   if (!user || !user.password_hash || !bcrypt.compareSync(password, user.password_hash)) {
     return res.status(401).json({ error: 'Invalid email or password' });
   }
@@ -46,7 +50,7 @@ router.post('/accept-invite', (req, res) => {
 
 router.post('/forgot-password', async (req, res) => {
   const { email } = req.body || {};
-  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(String(email || '').trim().toLowerCase());
+  const user = db.prepare('SELECT * FROM users WHERE email = ? COLLATE NOCASE').get(String(email || '').trim().toLowerCase());
   // Always respond 200 to avoid leaking which emails exist.
   if (user) {
     const token = uuid();

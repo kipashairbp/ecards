@@ -5,6 +5,7 @@ import { auth, requireRole } from '../middleware/auth.js';
 import { assign, unassign, PERMISSION_RESOURCES } from '../middleware/permissions.js';
 import { sendMailChecked, renderSystemTemplate } from '../services/mail.js';
 import { normalizePhone, isValidPhone } from '../utils/phone.js';
+import { normalizeEmail } from '../utils/email.js';
 import { logAudit, logMassAudit } from '../services/audit.js';
 
 const router = Router();
@@ -56,7 +57,8 @@ router.get('/:id', (req, res) => {
 
 // Invite a new internal user with a role + optional per-resource permission overrides.
 router.post('/', async (req, res) => {
-  const { email, first_name, last_name, phone, role = 'staff', permissions = [] } = req.body || {};
+  const { email: rawEmail, first_name, last_name, phone, role = 'staff', permissions = [] } = req.body || {};
+  const email = normalizeEmail(rawEmail);
   if (!email || !first_name) return res.status(400).json({ error: 'Email and first name are required' });
   if (!INTERNAL_ROLES.includes(role)) return res.status(400).json({ error: `Invalid role: ${role}. Shul/store accounts are created from the shul/store approval flow, not here.` });
   // Granting super_admin is itself an act of controlling a super_admin
@@ -68,7 +70,7 @@ router.post('/', async (req, res) => {
   const token = uuid();
   const expires = new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString();
   db.prepare(`INSERT INTO users (id, org_id, email, first_name, last_name, phone, role, invite_token, invite_expires, is_active)
-    VALUES (?,?,?,?,?,?,?,?,?,0)`).run(id, req.user.org_id, String(email).trim().toLowerCase(), first_name, last_name || '', normalizePhone(phone || ''), role, token, expires);
+    VALUES (?,?,?,?,?,?,?,?,?,0)`).run(id, req.user.org_id, email, first_name, last_name || '', normalizePhone(phone || ''), role, token, expires);
   for (const p of permissions) upsertPermission(id, p);
   const inviteUrl = `${process.env.APP_URL || ''}/accept-invite?token=${token}`;
   const tmpl = renderSystemTemplate(req.user.org_id, 'userInvite', { role: role.replace('_', ' '), inviteUrl });

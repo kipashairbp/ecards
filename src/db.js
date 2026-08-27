@@ -816,6 +816,29 @@ db.prepare(`UPDATE forms SET season_id = (
     SELECT id FROM seasons WHERE seasons.org_id = forms.org_id AND seasons.is_active = 1 ORDER BY seasons.created_at DESC LIMIT 1
   ) WHERE season_id IS NULL`).run();
 
+// Shul/store portal accounts used to store users.email exactly as typed on
+// the application ("Moshe@Gmail.com") while login lowercases its lookup —
+// and SQLite string comparison is case-sensitive, so every such account was
+// impossible to sign into and never received a password-reset email (the
+// forgot-password lookup misses the same way, then responds "ok" without
+// sending, by design). Normalize every existing row; passwords are
+// untouched, so whoever already set one just logs in normally afterward.
+// The one guard: users.email is UNIQUE, so if two accounts differ only by
+// case (shouldn't exist, but possible), the collision is skipped and
+// logged for manual resolution instead of crashing the boot — login stays
+// possible for those via the COLLATE NOCASE lookup in routes/auth.js.
+let emailsNormalized = 0;
+for (const u of db.prepare(`SELECT id, email FROM users WHERE email != lower(trim(email))`).all()) {
+  const lower = u.email.trim().toLowerCase();
+  const clash = db.prepare('SELECT id FROM users WHERE email = ? AND id != ?').get(lower, u.id);
+  if (clash) { console.warn(`[db] NOT normalizing user email "${u.email}" — another account already uses "${lower}". Resolve manually.`); continue; }
+  db.prepare('UPDATE users SET email = ? WHERE id = ?').run(lower, u.id);
+  emailsNormalized++;
+}
+if (emailsNormalized) {
+  console.log(`[db] Normalized ${emailsNormalized} user email(s) to lowercase — these accounts were un-loginable due to case-sensitive lookup.`);
+}
+
 // Applicants auto-rejected by the OLD, buggy isZipAllowed (raw string
 // match — see routes/applicants.js) purely because their zip lost a
 // leading zero somewhere upstream (e.g. an Excel cell formatted as a
