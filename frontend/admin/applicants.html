@@ -65,7 +65,7 @@ function contactLine(a) {
 const APPLICANT_COLUMNS = [
   { key: 'external_id', label: 'ID', sort: 'external_id', render: a => `<code>${esc(a.external_id||'')}</code>` },
   { key: 'name', label: 'Name', sort: 'last_name', render: a => `<strong>${esc(a.first_name)} ${esc(a.last_name)}</strong>${a.is_paused ? ' ' + badge('paused','paused') : ''}` },
-  { key: 'shul', label: 'Shul', render: a => esc(a.shul_name||'') },
+  { key: 'shul', label: 'Shul', render: a => esc(a.shul_name || (a.approval_status === 'soft_rejected' && a.previous_shul_name ? `Previously: ${a.previous_shul_name}` : '')) },
   { key: 'marital_status', label: 'Marital', render: a => esc(a.marital_status||'') },
   { key: 'contact', label: 'Contact', render: a => contactLine(a) },
   { key: 'email', label: 'Email', render: a => esc(a.email||'') },
@@ -205,9 +205,10 @@ async function openApplicant(id) {
           <div><strong>Applicant ID</strong><br><code>${esc(a.external_id||'')}</code></div>
           <div><strong>Status</strong><br>${badge(a.approval_status, a.approval_status)} ${a.is_paused ? badge('paused','paused') : ''}</div>
         </div>
+        ${a.approval_status === 'soft_rejected' && a.previous_shul_name ? `<div class="divider"></div><p class="small-muted">Previously at: <strong>${esc(a.previous_shul_name)}</strong></p>` : ''}
         ${mergeGroup && mergeGroup.length ? `<div class="divider"></div><div style="color:var(--text-muted);background:#f9efe0;padding:8px 12px;border-radius:6px">
-          <strong>Same person, enrolled through ${mergeGroup.length + 1} shuls${a.merge_group_id === a.id ? ' (this is the primary record — the only one with a real gift card)' : " — the primary record's shul holds the actual gift card"}:</strong>
-          ${mergeGroup.map(m => `${esc(m.first_name)} ${esc(m.last_name)} — ${esc(m.shul_name||'')}`).join(', ')}
+          <strong>Same person, enrolled through ${mergeGroup.length + 1} record${mergeGroup.length ? 's' : ''}${a.merge_group_id === a.id ? ' (this is the primary record — the only one with a real gift card)' : (a.merge_group_id ? " — the primary record's shul holds the actual gift card" : ' — not yet resolved, see the duplicate flag below')}:</strong>
+          ${mergeGroup.map(m => `${esc(m.first_name)} ${esc(m.last_name)} — ${esc(m.shul_name || (m.previous_shul_name ? `previously ${m.previous_shul_name}` : 'no shul'))} (${badge(m.approval_status, m.approval_status)})`).join(', ')}
         </div>` : ''}
         <div class="divider"></div>
         <div class="grid-2">
@@ -346,7 +347,7 @@ window.openSoftReject = async (id) => {
     const body = `<p class="small-muted">Pick which shul's submission to remove. That record is detached from its shul and marked <strong>Soft Reject</strong> — it stays that way, not counted against any shul's slots, until an admin gives it a shul again (which moves it back to Pending automatically).</p>
       ${members.map(m => `<div class="card" style="margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;gap:10px">
         <div><strong>${esc(m.first_name)} ${esc(m.last_name)}</strong>${m.id === id ? ' <span class="small-muted">(this record)</span>' : ''}<br>
-          <span class="small-muted">${esc(m.shul_name || 'No shul')} — ${badge(m.approval_status, m.approval_status)}</span></div>
+          <span class="small-muted">${esc(m.shul_name || (m.previous_shul_name ? `No shul (previously ${m.previous_shul_name})` : 'No shul'))} — ${badge(m.approval_status, m.approval_status)}</span></div>
         ${m.shul_id ? `<button class="btn btn-sm btn-danger" onclick="softRejectApplicant('${m.id}','${id}')">Soft Reject</button>` : '<span class="small-muted">No shul to remove from</span>'}
       </div>`).join('')}`;
     // Closed first — this modal is always opened on top of the applicant
@@ -528,10 +529,18 @@ window.openMergeView = async (flagId, fromApplicantId) => {
 };
 function renderMergeView() {
   const { flag, members, sharesPhone } = mergeGroupCache;
+  // A soft-rejected member (no current shul) can't be picked as Primary —
+  // the backend rejects it (see mergeApplicants's shul_id guard) since
+  // there'd be no shul left to actually hold the resulting card. Default
+  // the pre-checked radio to the first eligible member instead of always
+  // index 0, so opening this view doesn't start on a choice that would
+  // just get rejected on submit.
+  const defaultPrimaryIdx = Math.max(0, members.findIndex(m => m.shul_id));
   const cols = members.map((m, i) => `<th style="min-width:180px">
-      <div class="checkbox-row" style="margin-bottom:4px"><input type="radio" name="merge-primary" value="${esc(m.id)}" id="mp-${i}" ${i===0?'checked':''}>
+      <div class="checkbox-row" style="margin-bottom:4px"><input type="radio" name="merge-primary" value="${esc(m.id)}" id="mp-${i}" ${i===defaultPrimaryIdx?'checked':''} ${m.shul_id?'':'disabled'}>
         <label for="mp-${i}" style="margin:0"><strong>${esc(m.first_name)} ${esc(m.last_name)}</strong></label></div>
-      <span class="small-muted">${esc(m.shul_name||'')}</span>
+      <span class="small-muted">${esc(m.shul_name || (m.previous_shul_name ? `previously ${m.previous_shul_name}` : 'no shul'))}</span><br>
+      ${badge(m.approval_status, m.approval_status)}
     </th>`).join('');
   const rows = APPLICANT_MERGE_FIELDS.map(([key, label]) => {
     const cells = members.map((m, i) => {

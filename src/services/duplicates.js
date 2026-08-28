@@ -194,7 +194,18 @@ export function mergeApplicants(orgId, userId, { primaryId, values } = {}) {
   const placeholders = groupIds.map(() => '?').join(',');
   const members = db.prepare(`SELECT * FROM applicants WHERE id IN (${placeholders}) AND org_id = ?`).all(...groupIds, orgId);
   if (members.length < 2) throw new Error('Need at least two related records to merge');
-  if (!members.some(m => m.id === primaryId)) throw new Error('Primary record not found in this group');
+  const primary = members.find(m => m.id === primaryId);
+  if (!primary) throw new Error('Primary record not found in this group');
+  // A soft-rejected record (see routes/applicants.js's POST /:id/soft-reject)
+  // has no shul by definition — that's what the status means. Picking one as
+  // primary would "resolve" the flag into a record nobody can actually act
+  // on, silently losing whatever shul was trying to re-enroll this person.
+  // The correct resolution for that case is the other direction: pick the
+  // ACTIVE record (the one with a real shul) as primary, which naturally
+  // folds the old soft-rejected identity into it below — the frontend's
+  // merge view disables picking a soft-rejected member as primary for
+  // exactly this reason, this is just the backend backstop.
+  if (!primary.shul_id) throw new Error('This record has no shul — pick the other record as Primary instead.');
 
   const sets = Object.keys(values || {}).filter(k => MERGE_FIELDS.includes(k));
   const setSql = sets.length ? `, ${sets.map(k => `${k} = ?`).join(', ')}` : '';
@@ -202,7 +213,14 @@ export function mergeApplicants(orgId, userId, { primaryId, values } = {}) {
     .run(primaryId, ...sets.map(k => values[k]), primaryId);
   for (const m of members) {
     if (m.id === primaryId) continue;
-    db.prepare(`UPDATE applicants SET merge_group_id = ?, duplicate_status = 'merged', is_paused = 0, updated_at = datetime('now') WHERE id = ?`).run(primaryId, m.id);
+    // A losing member that was soft-rejected is now permanently subsumed
+    // into the primary (not just "orphaned and recoverable" anymore, which
+    // is what 'soft_rejected' means) — 'rejected' is the correct terminal
+    // state for it, and keeps it out of the Soft Reject filter/queue going
+    // forward. Every other loser keeps whatever status it already had, same
+    // as before.
+    const loserStatus = m.approval_status === 'soft_rejected' ? `, approval_status = 'rejected'` : '';
+    db.prepare(`UPDATE applicants SET merge_group_id = ?, duplicate_status = 'merged', is_paused = 0, updated_at = datetime('now')${loserStatus} WHERE id = ?`).run(primaryId, m.id);
   }
   const flagIds = db.prepare(`SELECT id FROM duplicate_flags WHERE org_id = ? AND entity_type='applicant' AND status='open'
       AND entity_id IN (${placeholders}) AND matched_entity_id IN (${placeholders})`).all(orgId, ...groupIds, ...groupIds).map(r => r.id);

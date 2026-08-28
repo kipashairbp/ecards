@@ -242,7 +242,7 @@ router.get('/', (req, res) => {
   const sortDir = dir === 'ASC' ? 'ASC' : 'DESC';
   const total = db.prepare(`SELECT COUNT(*) c FROM applicants a ${where}`).get(...params).c;
   const offset = (Math.max(1, +page) - 1) * +pageSize;
-  const rows = db.prepare(`SELECT a.*, s.name_en as shul_name FROM applicants a LEFT JOIN shuls s ON s.id = a.shul_id ${where} ORDER BY ${sortCol} ${sortDir} LIMIT ? OFFSET ?`).all(...params, +pageSize, offset);
+  const rows = db.prepare(`SELECT a.*, s.name_en as shul_name, ps.name_en as previous_shul_name FROM applicants a LEFT JOIN shuls s ON s.id = a.shul_id LEFT JOIN shuls ps ON ps.id = a.previous_shul_id ${where} ORDER BY ${sortCol} ${sortDir} LIMIT ? OFFSET ?`).all(...params, +pageSize, offset);
   res.json({ applicants: maskForShul(redact(rows, req.permission.hidden_fields), req.user.role, req.user.org_id), total, page: +page, pageSize: +pageSize });
 });
 
@@ -290,7 +290,10 @@ router.get('/my-export', (req, res) => {
 });
 
 router.get('/:id', (req, res) => {
-  const applicant = db.prepare('SELECT a.*, s.name_en as shul_name FROM applicants a LEFT JOIN shuls s ON s.id=a.shul_id WHERE a.id = ? AND a.org_id = ?').get(req.params.id, req.user.org_id);
+  const applicant = db.prepare(`SELECT a.*, s.name_en as shul_name, ps.name_en as previous_shul_name FROM applicants a
+      LEFT JOIN shuls s ON s.id=a.shul_id
+      LEFT JOIN shuls ps ON ps.id=a.previous_shul_id
+      WHERE a.id = ? AND a.org_id = ?`).get(req.params.id, req.user.org_id);
   if (!applicant) return res.status(404).json({ error: 'Not found' });
   if (req.user.role === 'shul' && applicant.shul_id !== req.user.shul_id) return res.status(403).json({ error: 'Not your applicant' });
   // Internal admin notes and duplicate flags may reference rejection/duplicate
@@ -299,13 +302,23 @@ router.get('/:id', (req, res) => {
   const notes = req.user.role === 'shul' ? [] : db.prepare('SELECT n.*, u.first_name, u.last_name FROM applicant_notes n LEFT JOIN users u ON u.id=n.user_id WHERE applicant_id = ? ORDER BY n.created_at DESC').all(applicant.id);
   const cards = db.prepare('SELECT * FROM cards WHERE applicant_id = ? ORDER BY created_at DESC').all(applicant.id);
   const flags = req.user.role === 'shul' ? [] : db.prepare(`SELECT * FROM duplicate_flags WHERE entity_type='applicant' AND (entity_id=? OR matched_entity_id=?) AND status='open'`).all(applicant.id, applicant.id);
-  // Every other shul's record confirmed to be this same real person (see
-  // services/duplicates.js's mergeApplicants) — admin-only, per spec: a
-  // shul must never learn its applicant is enrolled anywhere else.
-  const mergeGroup = (req.user.role !== 'shul' && applicant.merge_group_id)
-    ? db.prepare(`SELECT a.id, a.first_name, a.last_name, s.name_en as shul_name FROM applicants a LEFT JOIN shuls s ON s.id = a.shul_id
-        WHERE a.merge_group_id = ? AND a.id != ?`).all(applicant.merge_group_id, applicant.id)
-    : [];
+  // Every other record that's this same real person — confirmed (already
+  // merged, see services/duplicates.js's mergeApplicants) OR still just an
+  // open, unresolved duplicate flag; getMergeGroupIds chains through both,
+  // so this covers a match the instant it's flagged, not only after an
+  // admin explicitly resolves it. approval_status is included so an admin
+  // can see at a glance which of these are live enrollments vs.
+  // soft-rejected/rejected history. Admin-only, per spec: a shul must never
+  // learn its applicant is enrolled (or was ever) anywhere else.
+  let mergeGroup = [];
+  if (req.user.role !== 'shul') {
+    const groupIds = getMergeGroupIds(req.user.org_id, [applicant.id]).filter(gid => gid !== applicant.id);
+    if (groupIds.length) {
+      mergeGroup = db.prepare(`SELECT a.id, a.first_name, a.last_name, a.approval_status, s.name_en as shul_name, ps.name_en as previous_shul_name FROM applicants a
+          LEFT JOIN shuls s ON s.id = a.shul_id LEFT JOIN shuls ps ON ps.id = a.previous_shul_id
+          WHERE a.id IN (${groupIds.map(() => '?').join(',')})`).all(...groupIds);
+    }
+  }
   const requiresShulContribution = !!db.prepare('SELECT require_shul_contribution FROM seasons WHERE id = ?').get(applicant.season_id)?.require_shul_contribution;
   res.json({ applicant: maskForShul(redact(applicant, req.permission.hidden_fields), req.user.role, req.user.org_id), notes, cards, flags, mergeGroup, requiresShulContribution });
 });
@@ -482,12 +495,12 @@ router.put('/:id', requirePermission('applicants', 'can_edit'), async (req, res)
   // change, so this only ever fires on the one path that doesn't otherwise
   // touch approval_status.
   if (sets.includes('shul_id') && applicant.approval_status === 'soft_rejected' && b.shul_id) {
-    sets.push('approval_status');
+    sets.push('approval_status', 'previous_shul_id');
   }
   if (sets.length) {
     const vals = sets.map(f => f === 'home_for_yomtov' ? yomtovBit(b[f])
       : (f === 'provider_exempt' || f === 'shul_contribution_confirmed') ? (b[f] ? 1 : 0)
-      : f === 'approval_status' ? 'pending' : b[f]);
+      : f === 'approval_status' ? 'pending' : f === 'previous_shul_id' ? null : b[f]);
     db.prepare(`UPDATE applicants SET ${sets.map(f => `${f}=?`).join(',')}, updated_at=datetime('now') WHERE id=?`).run(...vals, applicant.id);
     logAudit(req.user.org_id, req.user.id, 'update', 'applicant', applicant.id,
       Object.fromEntries(sets.map(f => [f, applicant[f]])), Object.fromEntries(sets.map((f, i) => [f, vals[i]])), req.ip);
@@ -729,21 +742,12 @@ router.post('/mass-set-pending', requirePermission('applicants', 'can_edit'), as
 // loaded onto a card should stay on record there, just deactivated, not be
 // erased.
 router.delete('/:id/permanent', requirePermission('applicants', 'can_edit'), async (req, res) => {
+  // Admin-only — a shul removing its own applicant goes through
+  // POST /:id/soft-reject instead (detach + recoverable), not a true
+  // destructive delete. See that route for the shul-eligibility rule.
+  if (req.user.role === 'shul') return res.status(403).json({ error: 'Not permitted' });
   const applicant = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!applicant) return res.status(404).json({ error: 'Not found' });
-  // A shul can delete its own not-yet-reviewed applicants (draft/incomplete/
-  // pending — a submission it made itself and can just as easily retract),
-  // but never one an admin has ever actually decided on. approved_at is set
-  // by BOTH approve and reject (see those routes) and, deliberately, is
-  // left alone by set-pending when un-approving/un-rejecting one — so a
-  // record moved back to 'pending' after an earlier decision still shows
-  // approved_at and stays undeletable by the shul even though its current
-  // status looks untouched. Reaching an admin's queue at all means it's no
-  // longer purely the shul's to retract.
-  if (req.user.role === 'shul') {
-    if (applicant.shul_id !== req.user.shul_id) return res.status(403).json({ error: 'Not your applicant' });
-    if (applicant.approved_at) return res.status(403).json({ error: 'This applicant has already been reviewed (approved or rejected) by an admin and can no longer be deleted. Contact your admin.' });
-  }
   const { errors: cardLockErrors } = await lockApplicantCards(req.user.org_id, applicant);
   // Snapshot every related row before the cascade removes it, so a
   // super_admin can fully undo this from Recent Actions — "Delete
@@ -962,33 +966,57 @@ router.get('/:id/shul-group', requireAdmin, (req, res) => {
   const applicant = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!applicant) return res.status(404).json({ error: 'Not found' });
   const ids = getMergeGroupIds(req.user.org_id, [applicant.id]);
-  const members = db.prepare(`SELECT a.id, a.first_name, a.last_name, a.shul_id, a.approval_status, s.name_en as shul_name
-    FROM applicants a LEFT JOIN shuls s ON s.id = a.shul_id WHERE a.id IN (${ids.map(() => '?').join(',')})`).all(...ids);
+  const members = db.prepare(`SELECT a.id, a.first_name, a.last_name, a.shul_id, a.approval_status, s.name_en as shul_name, ps.name_en as previous_shul_name
+    FROM applicants a LEFT JOIN shuls s ON s.id = a.shul_id LEFT JOIN shuls ps ON ps.id = a.previous_shul_id WHERE a.id IN (${ids.map(() => '?').join(',')})`).all(...ids);
   res.json({ members });
 });
 
-// Duplicate-resolution tool: this exact applicant appears to be submitted
-// by more than one shul (or an admin just wants one specific shul's
-// submission gone without touching the others in the group), so this picks
-// ONE record — not necessarily the one the request URL is even on, see the
-// frontend's shul-group modal — and detaches it: shul_id cleared and status
-// set to 'soft_rejected'. That status behaves like 'rejected' everywhere a
-// slot count matters (every such query is already scoped `WHERE shul_id =
-// ?`, which a NULL shul_id can never match — nothing extra needed there),
-// but it's meant to be temporary: PUT /:id auto-clears it back to 'pending'
-// the moment this same row is ever given a shul_id again (by any admin
-// action, not just a dedicated "re-add" flow), so a shul can still end up
-// with this same person later without an admin having to remember to
-// un-reject them first.
+// Duplicate-resolution tool AND the shul-portal's own "remove this
+// applicant" action — both land here. Admin use: this exact applicant
+// appears to be submitted by more than one shul (or an admin just wants
+// one specific shul's submission gone without touching the others in the
+// group), so this picks ONE record — not necessarily the one the request
+// URL is even on, see the frontend's shul-group modal. Shul-portal use: a
+// shul removing an applicant from their own list was, until now, a real
+// permanent delete — it's this instead, so an accidental removal (or one
+// genuinely meant to be temporary) doesn't destroy history and can find
+// its way back. Either way this detaches the record: shul_id cleared and
+// status set to 'soft_rejected'. That status behaves like 'rejected'
+// everywhere a slot count matters (every such query is already scoped
+// `WHERE shul_id = ?`, which a NULL shul_id can never match — nothing
+// extra needed there), but it's meant to be temporary: PUT /:id auto-
+// clears it back to 'pending' the moment this same row is ever given a
+// shul_id again (any admin action, not just a dedicated "re-add" flow),
+// and re-enrolling the same person elsewhere gets caught by the ordinary
+// duplicate-detection flag (checkApplicantDuplicate has no status filter,
+// so a soft-rejected record is still a live match candidate) — resolving
+// that flag by merging with the new submission as primary is what actually
+// brings them back under a shul (see services/duplicates.js's
+// mergeApplicants). Never exposed to the shul beyond the fact that their
+// own action succeeded — no flag/group/other-shul detail ever reaches
+// that role (see GET /:id and GET /:id/shul-group, both admin-only).
 router.post('/:id/soft-reject', requirePermission('applicants', 'can_edit'), async (req, res) => {
-  if (req.user.role === 'shul') return res.status(403).json({ error: 'Not permitted' });
   const applicant = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!applicant) return res.status(404).json({ error: 'Not found' });
+  if (req.user.role === 'shul') {
+    if (applicant.shul_id !== req.user.shul_id) return res.status(403).json({ error: 'Not your applicant' });
+    // Same rule the old shul-side hard-delete used: an applicant an admin
+    // has ever actually decided on (approved_at, set by both approve AND
+    // reject, deliberately left alone by set-pending) is no longer purely
+    // the shul's to retract, no matter its current status.
+    if (applicant.approved_at) return res.status(403).json({ error: 'This applicant has already been reviewed by an admin and can no longer be removed. Contact your admin.' });
+  }
   if (applicant.approval_status === 'approved') return res.status(400).json({ error: 'This applicant is already approved — use Set to Pending or Reject instead, not Soft Reject.' });
   if (!applicant.shul_id) return res.status(400).json({ error: 'This applicant isn\'t currently assigned to a shul.' });
-  db.prepare(`UPDATE applicants SET shul_id = NULL, approval_status = 'soft_rejected', updated_at = datetime('now') WHERE id = ?`).run(applicant.id);
+  // previous_shul_id records who they were removed from — shul_id itself
+  // has to go to NULL (that's what makes them invisible to every shul-
+  // scoped query), but losing that history entirely would leave an admin
+  // looking at a soft-rejected record with no way to tell where it came
+  // from. Cleared again the moment they're given a real shul_id (see PUT
+  // /:id's auto-revert) — it's only meaningful while actually soft-rejected.
+  db.prepare(`UPDATE applicants SET shul_id = NULL, previous_shul_id = ?, approval_status = 'soft_rejected', updated_at = datetime('now') WHERE id = ?`).run(applicant.shul_id, applicant.id);
   logAudit(req.user.org_id, req.user.id, 'soft-reject', 'applicant', applicant.id,
-    { shul_id: applicant.shul_id, approval_status: applicant.approval_status }, { shul_id: null, approval_status: 'soft_rejected' }, req.ip);
+    { shul_id: applicant.shul_id, approval_status: applicant.approval_status }, { shul_id: null, previous_shul_id: applicant.shul_id, approval_status: 'soft_rejected' }, req.ip);
   const { errors: cardLockErrors } = await lockApplicantCards(req.user.org_id, applicant);
   res.json({ ok: true, cardLockErrors });
 });
@@ -1285,7 +1313,8 @@ router.get('/duplicates/:flagId/group', requireAdmin, (req, res) => {
   const flag = db.prepare(`SELECT * FROM duplicate_flags WHERE id = ? AND org_id = ? AND entity_type='applicant'`).get(req.params.flagId, req.user.org_id);
   if (!flag) return res.status(404).json({ error: 'Not found' });
   const ids = getMergeGroupIds(req.user.org_id, [flag.entity_id, flag.matched_entity_id]);
-  const members = db.prepare(`SELECT a.*, s.name_en as shul_name FROM applicants a LEFT JOIN shuls s ON s.id = a.shul_id
+  const members = db.prepare(`SELECT a.*, s.name_en as shul_name, ps.name_en as previous_shul_name FROM applicants a
+    LEFT JOIN shuls s ON s.id = a.shul_id LEFT JOIN shuls ps ON ps.id = a.previous_shul_id
     WHERE a.id IN (${ids.map(() => '?').join(',')})`).all(...ids);
   const e = members.find(m => m.id === flag.entity_id), m = members.find(m => m.id === flag.matched_entity_id);
   res.json({ flag, members, sharesPhone: !!(e && m && applicantsSharePhone(e, m)) });

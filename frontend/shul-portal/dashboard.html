@@ -202,7 +202,7 @@ async function openReenrollment(a) {
   openModal(`Complete ${carriedOver ? 'Re-enrollment' : 'Submission'}: ${esc(a.first_name)} ${esc(a.last_name)}`,
     `<p class="small-muted">${carriedOver ? 'This applicant was carried over from a previous season.' : 'This applicant is missing required information.'} Please review and fill in anything missing before submitting.</p>
      <form id="reenroll-form">${schema.map(f => fieldHtml(f)).join('')}</form>`,
-    `<button class="btn btn-primary btn-sm" onclick="submitReenrollment('${a.id}')">Submit</button>`);
+    `${!a.approved_at ? `<button class="btn btn-danger btn-sm" onclick="removeApplicantShul('${a.id}')">Remove</button>` : ''}<button class="btn btn-primary btn-sm" onclick="submitReenrollment('${a.id}')">Submit</button>`);
   loadGoogleMaps().then(() => { attachPlacesAutocomplete('address', { address: 'address', city: 'city', state: 'state', zip: 'zip' }); });
   // Pre-fill every field the schema rendered with whatever this applicant
   // already has on file (fieldHtml doesn't set values itself).
@@ -312,7 +312,7 @@ async function openApplicantEdit(a) {
     <div class="checkbox-row" style="margin-top:10px"><input type="checkbox" id="e-shul-contrib-confirmed" ${a.shul_contribution_confirmed?'checked':''}>
       <label for="e-shul-contrib-confirmed" style="margin:0">I confirm this amount is accurate</label></div>
     <p class="small-muted">This must be entered and confirmed before this applicant can be approved.</p>` : ''}
-  `, `${!a.approved_at ? `<button class="btn btn-danger btn-sm" onclick="deleteApplicantShul('${a.id}')">Delete</button>` : ''}<button class="btn btn-primary btn-sm" onclick="saveApplicantEdit('${a.id}')">Save</button>`);
+  `, `${!a.approved_at ? `<button class="btn btn-danger btn-sm" onclick="removeApplicantShul('${a.id}')">Remove</button>` : ''}<button class="btn btn-primary btn-sm" onclick="saveApplicantEdit('${a.id}')">Save</button>`);
   loadGoogleMaps().then(() => { attachPlacesAutocomplete('address', { address: 'address', city: 'city', state: 'state', zip: 'zip' }); });
   for (const f of schema) {
     const el = qs('#' + f.key);
@@ -332,9 +332,13 @@ window.saveApplicantEdit = async (id) => {
   }
   try { await api(`/applicants/${id}`, { method: 'PUT', body }); toast('Saved'); closeModal(); load(); } catch (err) { toast(err.message, true); }
 };
-window.deleteApplicantShul = async (id) => {
-  if (!confirm('Delete this applicant? This cannot be undone.')) return;
-  try { await api(`/applicants/${id}/permanent`, { method: 'DELETE' }); toast('Applicant deleted'); closeModal(); load(); } catch (err) { toast(err.message, true); }
+// Detaches the applicant from this shul rather than truly deleting the
+// record (see routes/applicants.js's POST /:id/soft-reject) — if they were
+// removed by mistake, or re-enroll with any shul later, an admin can still
+// find and restore them. The shul just sees them gone from their list.
+window.removeApplicantShul = async (id) => {
+  if (!confirm('Remove this applicant from your list? They will no longer appear here.')) return;
+  try { await api(`/applicants/${id}/soft-reject`, { method: 'POST' }); toast('Applicant removed'); closeModal(); load(); } catch (err) { toast(err.message, true); }
 };
 load();
 </script>

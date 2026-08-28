@@ -719,6 +719,15 @@ safeAlter(`ALTER TABLE documents ADD COLUMN esign_consent_at TEXT`);
 // "use the single default signature box" (see GET/POST /documents/sign).
 safeAlter(`ALTER TABLE documents ADD COLUMN fields_json TEXT`);
 
+// Which shul a soft-rejected applicant (routes/applicants.js's
+// POST /:id/soft-reject) was removed from — shul_id itself has to go to
+// NULL for the soft-reject to actually work (that's what makes the record
+// invisible to every shul-scoped query), so this is the only place that
+// history survives. Cleared again the moment the record is given a real
+// shul_id (PUT /:id's auto-revert back to 'pending') — only meaningful
+// while the record is actually soft-rejected.
+safeAlter(`ALTER TABLE applicants ADD COLUMN previous_shul_id TEXT REFERENCES shuls(id)`);
+
 // One-time normalization of pre-existing phone numbers to the canonical
 // 123-456-7890 display format (see utils/phone.js). Cheap and idempotent —
 // re-running it on already-normalized numbers is a no-op — so it's safe to
