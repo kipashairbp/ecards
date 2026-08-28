@@ -88,6 +88,7 @@ label .req { color: var(--danger); }
 .badge-pending { background: #f3e3c4; color: #7a5a1a; }
 .badge-approved, .badge-active, .badge-activated, .badge-signed { background: #dcecdb; color: #2f5c33; }
 .badge-rejected, .badge-paused, .badge-deactivated { background: #f3d9d2; color: #8c3a24; }
+.badge-soft_rejected { background: #e6dcf0; color: #5a3a8c; }
 .badge-submitted, .badge-sent, .badge-assigned { background: #dde6ec; color: #33566a; }
 
 table { width: 100%; border-collapse: collapse; font-size: 13.5px; }

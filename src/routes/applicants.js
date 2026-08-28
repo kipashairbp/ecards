@@ -473,9 +473,21 @@ router.put('/:id', requirePermission('applicants', 'can_edit'), async (req, res)
   // violation, not a legitimate self-service edit).
   const fields = req.user.role === 'shul' ? EDITABLE_FIELDS.filter(f => f !== 'card_amount' && f !== 'provider_exempt') : [...EDITABLE_FIELDS, 'shul_id', 'permanent_comments', 'min_contribution_override'];
   const sets = fields.filter(f => b[f] !== undefined);
+  // A 'soft_rejected' applicant (see POST /:id/soft-reject) has no shul —
+  // that's what the status means. The moment this update actually gives it
+  // one again, it's no longer "removed from a shul waiting to be picked
+  // back up" — it's a normal submission again, so status clears back to
+  // pending in the same write. Set-pending/reject/approve are the only
+  // other ways off 'soft_rejected' and already do their own explicit status
+  // change, so this only ever fires on the one path that doesn't otherwise
+  // touch approval_status.
+  if (sets.includes('shul_id') && applicant.approval_status === 'soft_rejected' && b.shul_id) {
+    sets.push('approval_status');
+  }
   if (sets.length) {
     const vals = sets.map(f => f === 'home_for_yomtov' ? yomtovBit(b[f])
-      : (f === 'provider_exempt' || f === 'shul_contribution_confirmed') ? (b[f] ? 1 : 0) : b[f]);
+      : (f === 'provider_exempt' || f === 'shul_contribution_confirmed') ? (b[f] ? 1 : 0)
+      : f === 'approval_status' ? 'pending' : b[f]);
     db.prepare(`UPDATE applicants SET ${sets.map(f => `${f}=?`).join(',')}, updated_at=datetime('now') WHERE id=?`).run(...vals, applicant.id);
     logAudit(req.user.org_id, req.user.id, 'update', 'applicant', applicant.id,
       Object.fromEntries(sets.map(f => [f, applicant[f]])), Object.fromEntries(sets.map((f, i) => [f, vals[i]])), req.ip);
@@ -932,6 +944,51 @@ router.post('/:id/reject', requirePermission('applicants', 'can_edit'), async (r
   if (!applicant) return res.status(404).json({ error: 'Not found' });
   db.prepare(`UPDATE applicants SET approval_status='rejected', approved_by=?, approved_at=datetime('now') WHERE id=?`).run(req.user.id, applicant.id);
   logAudit(req.user.org_id, req.user.id, 'reject', 'applicant', applicant.id, { approval_status: applicant.approval_status }, { approval_status: 'rejected' }, req.ip);
+  const { errors: cardLockErrors } = await lockApplicantCards(req.user.org_id, applicant);
+  res.json({ ok: true, cardLockErrors });
+});
+
+// Every shul this applicant is (or, via an open/resolved duplicate match,
+// might be) submitted under — the pick-list for POST /:id/soft-reject
+// below. Reuses getMergeGroupIds rather than the narrower merge_group_id-
+// only `mergeGroup` GET /:id already returns, since that field is only
+// populated after an admin has explicitly merged the duplicate; this needs
+// to work just as well while a match is still an open, unresolved flag (the
+// far more common case when an admin first notices the same person at two
+// shuls and wants to pick one to remove). Degrades to just this one
+// applicant's own shul when there's no duplicate at all — soft-reject
+// doesn't require one.
+router.get('/:id/shul-group', requireAdmin, (req, res) => {
+  const applicant = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
+  if (!applicant) return res.status(404).json({ error: 'Not found' });
+  const ids = getMergeGroupIds(req.user.org_id, [applicant.id]);
+  const members = db.prepare(`SELECT a.id, a.first_name, a.last_name, a.shul_id, a.approval_status, s.name_en as shul_name
+    FROM applicants a LEFT JOIN shuls s ON s.id = a.shul_id WHERE a.id IN (${ids.map(() => '?').join(',')})`).all(...ids);
+  res.json({ members });
+});
+
+// Duplicate-resolution tool: this exact applicant appears to be submitted
+// by more than one shul (or an admin just wants one specific shul's
+// submission gone without touching the others in the group), so this picks
+// ONE record — not necessarily the one the request URL is even on, see the
+// frontend's shul-group modal — and detaches it: shul_id cleared and status
+// set to 'soft_rejected'. That status behaves like 'rejected' everywhere a
+// slot count matters (every such query is already scoped `WHERE shul_id =
+// ?`, which a NULL shul_id can never match — nothing extra needed there),
+// but it's meant to be temporary: PUT /:id auto-clears it back to 'pending'
+// the moment this same row is ever given a shul_id again (by any admin
+// action, not just a dedicated "re-add" flow), so a shul can still end up
+// with this same person later without an admin having to remember to
+// un-reject them first.
+router.post('/:id/soft-reject', requirePermission('applicants', 'can_edit'), async (req, res) => {
+  if (req.user.role === 'shul') return res.status(403).json({ error: 'Not permitted' });
+  const applicant = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
+  if (!applicant) return res.status(404).json({ error: 'Not found' });
+  if (applicant.approval_status === 'approved') return res.status(400).json({ error: 'This applicant is already approved — use Set to Pending or Reject instead, not Soft Reject.' });
+  if (!applicant.shul_id) return res.status(400).json({ error: 'This applicant isn\'t currently assigned to a shul.' });
+  db.prepare(`UPDATE applicants SET shul_id = NULL, approval_status = 'soft_rejected', updated_at = datetime('now') WHERE id = ?`).run(applicant.id);
+  logAudit(req.user.org_id, req.user.id, 'soft-reject', 'applicant', applicant.id,
+    { shul_id: applicant.shul_id, approval_status: applicant.approval_status }, { shul_id: null, approval_status: 'soft_rejected' }, req.ip);
   const { errors: cardLockErrors } = await lockApplicantCards(req.user.org_id, applicant);
   res.json({ ok: true, cardLockErrors });
 });

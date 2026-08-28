@@ -27,7 +27,7 @@ renderShell('/admin/applicants', `
   <div id="cap-banner"></div>
   <div class="toolbar">
     <input id="f-search" placeholder="Search name, phone, email…">
-    <select id="f-status"><option value="">All statuses</option><option value="pending">Pending</option><option value="approved">Approved</option><option value="rejected">Rejected</option></select>
+    <select id="f-status"><option value="">All statuses</option><option value="pending">Pending</option><option value="approved">Approved</option><option value="rejected">Rejected</option><option value="soft_rejected">Soft Reject</option></select>
     <select id="f-marital"><option value="">Any marital status</option><option value="single">Single</option><option value="married">Married</option><option value="widowed">Widowed</option><option value="divorced">Divorced</option></select>
     <select id="f-shul"><option value="">All Shuls</option></select>
     <select id="f-season"></select>
@@ -247,7 +247,11 @@ async function openApplicant(id) {
         </div>` : ''}
         <label>Permanent Comments (internal — carries forward to future seasons)</label>
         <textarea id="e-permanent_comments" rows="3">${esc(a.permanent_comments||'')}</textarea>
-        ${flags.length ? `<div class="divider"></div><div style="color:var(--danger)"><strong>&#9888; Duplicate flag open.</strong> Resolve from Applicants > Duplicates.</div>` : ''}
+        ${flags.length ? `<div class="divider"></div><div style="color:var(--danger)">
+          <strong>&#9888; Duplicate flag open.</strong>
+          ${flags.map(f => `<div style="margin-top:6px">Matches another applicant — reason: ${esc(f.reason)}.
+            <button class="btn btn-sm btn-outline" onclick="openMergeView('${f.id}','${id}')">View &amp; Resolve</button></div>`).join('')}
+        </div>` : ''}
       </div>
       <div id="atab-notes" style="display:none">
         <div style="display:flex;gap:8px"><input id="new-anote" placeholder="Add an internal note…"><button class="btn btn-sm btn-primary" onclick="addApplicantNote('${id}')">Add</button></div>
@@ -271,6 +275,7 @@ async function openApplicant(id) {
       <button class="btn btn-outline btn-sm" onclick="openQuickTaskModal('applicant','${id}','${esc(a.first_name+' '+a.last_name).replace(/'/g,"\\'")}')">+ Add Task</button>
       ${['super_admin','org_admin'].includes(Auth.user()?.role) ? `<button class="btn btn-outline btn-sm" style="color:#b71c1c;border-color:#b71c1c" onclick="deleteApplicant('${id}')">Delete Permanently</button>` : ''}
       ${a.approval_status !== 'pending' ? `<button class="btn btn-outline btn-sm" onclick="setApplicantPending('${id}')">Set to Pending</button>` : ''}
+      ${!a.is_paused && a.shul_id && a.approval_status !== 'approved' ? `<button class="btn btn-outline btn-sm" onclick="openSoftReject('${id}')">Soft Reject…</button>` : ''}
       ${a.is_paused ? '' : (a.approval_status !== 'approved' ? `<button class="btn btn-outline btn-sm" onclick="rejectApplicant('${id}')">Reject</button><button class="btn btn-primary btn-sm" onclick="approveApplicant('${id}')">Approve</button>` : '')}
       <button class="btn btn-primary btn-sm" onclick="saveApplicant('${id}')">Save</button>`;
     openModal(`${a.first_name} ${a.last_name}`, body, footer);
@@ -327,6 +332,35 @@ window.setApplicantPending = async (id) => {
   try {
     const r = await api(`/applicants/${id}/set-pending`, { method: 'POST' });
     toast(r.cardLockErrors?.length ? `Moved back to pending, but card lock failed: ${r.cardLockErrors.join('; ')}` : 'Moved back to pending', !!r.cardLockErrors?.length);
+    closeModal(); load();
+  } catch (err) { toast(err.message, true); }
+};
+// Lists every shul this applicant is (or, via a duplicate match, might be)
+// submitted under — GET /applicants/:id/shul-group already resolves the
+// whole cluster, open-flag or already-merged. Soft-rejecting any one of
+// them detaches just that record from its shul and marks it Soft Reject;
+// the others in the list are untouched.
+window.openSoftReject = async (id) => {
+  try {
+    const { members } = await api(`/applicants/${id}/shul-group`);
+    const body = `<p class="small-muted">Pick which shul's submission to remove. That record is detached from its shul and marked <strong>Soft Reject</strong> — it stays that way, not counted against any shul's slots, until an admin gives it a shul again (which moves it back to Pending automatically).</p>
+      ${members.map(m => `<div class="card" style="margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;gap:10px">
+        <div><strong>${esc(m.first_name)} ${esc(m.last_name)}</strong>${m.id === id ? ' <span class="small-muted">(this record)</span>' : ''}<br>
+          <span class="small-muted">${esc(m.shul_name || 'No shul')} — ${badge(m.approval_status, m.approval_status)}</span></div>
+        ${m.shul_id ? `<button class="btn btn-sm btn-danger" onclick="softRejectApplicant('${m.id}','${id}')">Soft Reject</button>` : '<span class="small-muted">No shul to remove from</span>'}
+      </div>`).join('')}`;
+    // Closed first — this modal is always opened on top of the applicant
+    // profile modal, and openModal() never removes a prior one on its own
+    // (see the identical note on openMergeView above).
+    closeModal();
+    openModal('Soft Reject', body, `<button class="btn btn-outline btn-sm" onclick="closeModal();openApplicant('${id}')">Cancel</button>`);
+  } catch (err) { toast(err.message, true); }
+};
+window.softRejectApplicant = async (memberId, fromId) => {
+  if (!confirm('Remove this applicant from their shul and mark them Soft Reject?')) return;
+  try {
+    const r = await api(`/applicants/${memberId}/soft-reject`, { method: 'POST' });
+    toast(r.cardLockErrors?.length ? `Soft rejected, but card lock failed: ${r.cardLockErrors.join('; ')}` : 'Soft rejected', !!r.cardLockErrors?.length);
     closeModal(); load();
   } catch (err) { toast(err.message, true); }
 };
@@ -428,19 +462,38 @@ const APPLICANT_MERGE_FIELDS = [
   ['num_children','Children'], ['home_for_yomtov','Home for Yom Tov'], ['comments','Comments'], ['card_amount','Card Amount'],
 ];
 
+let dupFlagsCache = [];
+let dupSearchTerm = '';
 async function showDuplicates() {
+  mergeViewReturnToApplicant = null;
   try {
     const { flags } = await api('/applicants/duplicates/open' + (state.season_id ? `?season_id=${state.season_id}` : ''));
-    const body = flags.length ? flags.map(f => `<div class="card" style="margin-bottom:10px">
-        <strong>${esc(f.entity?.first_name)} ${esc(f.entity?.last_name)}</strong> (${esc(f.entity?.shul_name||'')}) may duplicate
-        <strong>${esc(f.matched?.first_name)} ${esc(f.matched?.last_name)}</strong> (${esc(f.matched?.shul_name||'')})<br>
-        <span class="small-muted">Reason: ${esc(f.reason)}</span>
-        <div style="margin-top:10px">
-          <button class="btn btn-sm btn-primary" onclick="openMergeView('${f.id}')">Compare &amp; Resolve</button>
-        </div>
-      </div>`).join('') : '<p class="small-muted">No open duplicate flags.</p>';
-    openModal('Duplicate Applicant Flags', body);
+    dupFlagsCache = flags;
+    renderDuplicatesList();
   } catch (err) { toast(err.message, true); }
+}
+function renderDuplicatesList() {
+  const body = `<input id="dup-search" placeholder="Search by name, shul, or reason…" value="${esc(dupSearchTerm)}" style="margin-bottom:12px">
+    <div id="dup-list">${renderDupListOnly()}</div>`;
+  openModal('Duplicate Applicant Flags', body);
+  qs('#dup-search').addEventListener('input', (e) => { dupSearchTerm = e.target.value; qs('#dup-list').innerHTML = renderDupListOnly(); });
+  qs('#dup-search').focus();
+  qs('#dup-search').selectionStart = qs('#dup-search').selectionEnd = dupSearchTerm.length;
+}
+function renderDupListOnly() {
+  const term = dupSearchTerm.trim().toLowerCase();
+  const flags = term
+    ? dupFlagsCache.filter(f => [f.entity?.first_name, f.entity?.last_name, f.entity?.shul_name, f.matched?.first_name, f.matched?.last_name, f.matched?.shul_name, f.reason]
+        .some(v => (v || '').toLowerCase().includes(term)))
+    : dupFlagsCache;
+  return flags.length ? flags.map(f => `<div class="card" style="margin-bottom:10px">
+      <strong>${esc(f.entity?.first_name)} ${esc(f.entity?.last_name)}</strong> (${esc(f.entity?.shul_name||'')}) may duplicate
+      <strong>${esc(f.matched?.first_name)} ${esc(f.matched?.last_name)}</strong> (${esc(f.matched?.shul_name||'')})<br>
+      <span class="small-muted">Reason: ${esc(f.reason)}</span>
+      <div style="margin-top:10px">
+        <button class="btn btn-sm btn-primary" onclick="openMergeView('${f.id}')">Compare &amp; Resolve</button>
+      </div>
+    </div>`).join('') : `<p class="small-muted">${dupFlagsCache.length ? 'No flags match your search.' : 'No open duplicate flags.'}</p>`;
 }
 
 // The merge group can be more than a pair — the same family can get
@@ -448,10 +501,28 @@ async function showDuplicates() {
 // always fetches the FULL connected group for the flag, not just its two
 // original entities (see GET /applicants/duplicates/:flagId/group).
 let mergeGroupCache = null;
-window.openMergeView = async (flagId) => {
+// Set only when opened from an applicant's own profile (see openApplicant's
+// "View & Resolve" button) rather than the Duplicates list, so the compare
+// view's Back button can return to that profile directly instead of always
+// landing on the full list — the whole point of surfacing this from the
+// profile in the first place.
+let mergeViewReturnToApplicant = null;
+window.openMergeView = async (flagId, fromApplicantId) => {
+  mergeViewReturnToApplicant = fromApplicantId || null;
   try {
     const group = await api(`/applicants/duplicates/${flagId}/group`);
     mergeGroupCache = group;
+    // Closed only once the fetch succeeds — an errored fetch below leaves
+    // whatever modal was already open (profile or list) in place instead of
+    // vanishing into a blank screen. Explicit close before the next
+    // openModal() matters here specifically: unlike every other same-modal
+    // transition in this app, this one can be reached from a DIFFERENT
+    // modal (the applicant profile) and hands back to it later (Back to
+    // Applicant, below) — without this, that round trip stacks multiple
+    // #ec-modal backdrops (openModal never removes a prior one), and the
+    // leftover invisible ones intercept clicks on whatever's rendered on
+    // top.
+    closeModal();
     renderMergeView();
   } catch (err) { toast(err.message, true); }
 };
@@ -476,13 +547,24 @@ function renderMergeView() {
     ${sharesPhone ? '<p style="color:var(--danger)"><strong>These records share a phone number</strong> — they can only be resolved as a merge, not bypassed as coincidentally-similar different people.</p>' : ''}
     <div style="overflow-x:auto"><table><thead><tr><th></th>${cols}</tr></thead><tbody>${rows}</tbody></table></div>
   `;
-  const footer = `<button class="btn btn-outline btn-sm" onclick="showDuplicates()">Back to List</button>
+  const backBtn = mergeViewReturnToApplicant
+    ? `<button class="btn btn-outline btn-sm" onclick="closeModal();openApplicant('${mergeViewReturnToApplicant}')">Back to Applicant</button>`
+    : `<button class="btn btn-outline btn-sm" onclick="closeModal();showDuplicates()">Back to List</button>`;
+  const footer = `${backBtn}
     ${sharesPhone ? '' : `<button class="btn btn-outline btn-sm" onclick="bypassDup('${flag.id}')">Bypass (not the same person)</button>`}
     <button class="btn btn-primary btn-sm" onclick="submitMerge('${flag.id}')">Merge &amp; Resolve</button>`;
   openModal('Compare & Merge Records', body, footer);
 }
+// Lands back wherever this compare view was opened from — the applicant's
+// own profile if that's how it was reached, otherwise the full Duplicates
+// list, same as before.
+function afterDuplicateResolved() {
+  closeModal();
+  if (mergeViewReturnToApplicant) openApplicant(mergeViewReturnToApplicant); else showDuplicates();
+  load();
+}
 window.bypassDup = async (id) => {
-  try { await api(`/applicants/duplicates/${id}/resolve`, { method: 'POST', body: { action: 'bypass' } }); closeModal(); showDuplicates(); load(); }
+  try { await api(`/applicants/duplicates/${id}/resolve`, { method: 'POST', body: { action: 'bypass' } }); afterDuplicateResolved(); }
   catch (err) { toast(err.message, true); }
 };
 window.submitMerge = async (flagId) => {
@@ -497,7 +579,7 @@ window.submitMerge = async (flagId) => {
   }
   try {
     await api(`/applicants/duplicates/${flagId}/merge`, { method: 'POST', body: { primaryId, values } });
-    toast('Merged'); closeModal(); showDuplicates(); load();
+    toast('Merged'); afterDuplicateResolved();
   } catch (err) { toast(err.message, true); }
 };
 
