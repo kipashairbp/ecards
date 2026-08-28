@@ -147,7 +147,10 @@ async function openUser(id) {
         : RESOURCES.map(r => permRow(r, permMap[r] || defaultPermFor(r, u.role))).join('')}
     `;
     const canSetPassword = ['super_admin','org_admin'].includes(Auth.user()?.role) && ROLE_RANK[u.role] < ROLE_RANK[Auth.user()?.role];
-    openModal(`${u.first_name} ${u.last_name}`, body, `<button class="btn btn-danger btn-sm" onclick="deleteUserPermanently('${id}')">Delete Permanently</button><button class="btn btn-outline btn-sm" onclick="deactivateUser('${id}')">Deactivate</button>${canSetPassword ? `<button class="btn btn-outline btn-sm" onclick="openSetPasswordModal('${id}','${esc(u.first_name+' '+u.last_name).replace(/'/g,"\\'")}')">Set Password</button>` : ''}<button class="btn btn-primary btn-sm" onclick="saveUser('${id}')">Save</button>`);
+    // Only a still-pending account (invite sent, never signed in yet) has a
+    // setup link to resend or copy — an active user already has a password.
+    const pendingSetupBtns = !u.is_active ? `<button class="btn btn-outline btn-sm" onclick="resendInvite('${id}')">Resend Invite</button><button class="btn btn-outline btn-sm" onclick="copyInviteLink('${id}')">Copy Setup Link</button>` : '';
+    openModal(`${u.first_name} ${u.last_name}`, body, `<button class="btn btn-danger btn-sm" onclick="deleteUserPermanently('${id}')">Delete Permanently</button><button class="btn btn-outline btn-sm" onclick="deactivateUser('${id}')">Deactivate</button>${pendingSetupBtns}${canSetPassword ? `<button class="btn btn-outline btn-sm" onclick="openSetPasswordModal('${id}','${esc(u.first_name+' '+u.last_name).replace(/'/g,"\\'")}')">Set Password</button>` : ''}<button class="btn btn-primary btn-sm" onclick="saveUser('${id}')">Save</button>`);
   } catch (err) { toast(err.message, true); }
 }
 
@@ -171,6 +174,17 @@ window.saveUser = async (id) => {
   try { await api(`/users/${id}`, { method: 'PUT', body }); toast('Saved'); closeModal(); load(); } catch (err) { toast(err.message, true); }
 };
 window.deactivateUser = async (id) => { if (!confirm('Deactivate this user? They will be blocked from signing in, but their account and history stay on file.')) return; try { await api(`/users/${id}`, { method: 'DELETE' }); closeModal(); load(); } catch (err) { toast(err.message, true); } };
+window.resendInvite = async (id) => {
+  try { const r = await api(`/users/${id}/resend-invite`, { method: 'POST' }); toast(r.emailError ? `Could not send: ${r.emailError}` : 'Invite resent', !!r.emailError); }
+  catch (err) { toast(err.message, true); }
+};
+window.copyInviteLink = async (id) => {
+  try {
+    const { inviteUrl } = await api(`/users/${id}/invite-link`);
+    try { await navigator.clipboard.writeText(inviteUrl); toast('Setup link copied'); }
+    catch { toast(inviteUrl); }
+  } catch (err) { toast(err.message, true); }
+};
 window.deleteUserPermanently = async (id) => {
   if (!confirm('Permanently delete this user? This cannot be undone. Their notes/sent emails/tasks stay on file, but the account itself is gone.')) return;
   try { await api(`/users/${id}/permanent`, { method: 'DELETE' }); toast('User deleted'); closeModal(); load(); } catch (err) { toast(err.message, true); }

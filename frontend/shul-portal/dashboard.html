@@ -312,7 +312,7 @@ async function openApplicantEdit(a) {
     <div class="checkbox-row" style="margin-top:10px"><input type="checkbox" id="e-shul-contrib-confirmed" ${a.shul_contribution_confirmed?'checked':''}>
       <label for="e-shul-contrib-confirmed" style="margin:0">I confirm this amount is accurate</label></div>
     <p class="small-muted">This must be entered and confirmed before this applicant can be approved.</p>` : ''}
-  `, `<button class="btn btn-primary btn-sm" onclick="saveApplicantEdit('${a.id}')">Save</button>`);
+  `, `${!a.approved_at ? `<button class="btn btn-danger btn-sm" onclick="deleteApplicantShul('${a.id}')">Delete</button>` : ''}<button class="btn btn-primary btn-sm" onclick="saveApplicantEdit('${a.id}')">Save</button>`);
   loadGoogleMaps().then(() => { attachPlacesAutocomplete('address', { address: 'address', city: 'city', state: 'state', zip: 'zip' }); });
   for (const f of schema) {
     const el = qs('#' + f.key);
@@ -331,6 +331,10 @@ window.saveApplicantEdit = async (id) => {
     body.shul_contribution_confirmed = qs('#e-shul-contrib-confirmed').checked;
   }
   try { await api(`/applicants/${id}`, { method: 'PUT', body }); toast('Saved'); closeModal(); load(); } catch (err) { toast(err.message, true); }
+};
+window.deleteApplicantShul = async (id) => {
+  if (!confirm('Delete this applicant? This cannot be undone.')) return;
+  try { await api(`/applicants/${id}/permanent`, { method: 'DELETE' }); toast('Applicant deleted'); closeModal(); load(); } catch (err) { toast(err.message, true); }
 };
 load();
 </script>

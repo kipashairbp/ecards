@@ -81,6 +81,48 @@ router.post('/', async (req, res) => {
   res.status(201).json({ user: { id: created.id, email: created.email, role: created.role }, emailError });
 });
 
+// Re-sends the account-setup email with a fresh invite link — for when the
+// original never arrived (spam filter, typo since fixed, etc.) or its
+// 7-day link has expired. Only makes sense for an account that hasn't
+// finished setup yet; an already-active user has no invite link to resend.
+// Regenerates invite_token/expires (same TTL as the original invite) so
+// the new link is guaranteed valid — this does intentionally invalidate
+// any older unused link for the same account.
+router.post('/:id/resend-invite', async (req, res) => {
+  const user = db.prepare('SELECT * FROM users WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
+  if (!user) return res.status(404).json({ error: 'Not found' });
+  if (!canManageTarget(req.user, user.role)) return res.status(403).json({ error: 'A super admin account can only be managed by another super admin' });
+  if (user.is_active) return res.status(400).json({ error: 'This account is already active — there is no pending invite to resend.' });
+  const token = uuid();
+  const expires = new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString();
+  db.prepare('UPDATE users SET invite_token = ?, invite_expires = ? WHERE id = ?').run(token, expires, user.id);
+  const inviteUrl = `${process.env.APP_URL || ''}/accept-invite?token=${token}`;
+  const tmpl = renderSystemTemplate(req.user.org_id, 'userInvite', { role: user.role.replace('_', ' '), inviteUrl });
+  const { emailError } = await sendMailChecked(req.user.org_id, user.email, tmpl.subject, tmpl.body, { replyTo: tmpl.replyTo, sentBy: req.user.id });
+  if (emailError) console.error('[mail] resend invite email failed:', emailError);
+  res.json({ ok: true, inviteUrl, emailError });
+});
+
+// Just the link, no email sent — for handing someone their setup link
+// directly (Slack, in person) instead of waiting on their inbox. Reuses
+// the account's current invite link if it's still valid; only mints a
+// fresh one (same as resend-invite, minus the email) if there's none yet
+// or it's expired, so copying the link doesn't needlessly invalidate one
+// that was already sent and might be about to be clicked.
+router.get('/:id/invite-link', (req, res) => {
+  const user = db.prepare('SELECT * FROM users WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
+  if (!user) return res.status(404).json({ error: 'Not found' });
+  if (!canManageTarget(req.user, user.role)) return res.status(403).json({ error: 'A super admin account can only be managed by another super admin' });
+  if (user.is_active) return res.status(400).json({ error: 'This account is already active — there is no setup link for it.' });
+  let token = user.invite_token;
+  if (!token || (user.invite_expires && new Date(user.invite_expires) < new Date())) {
+    token = uuid();
+    const expires = new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString();
+    db.prepare('UPDATE users SET invite_token = ?, invite_expires = ? WHERE id = ?').run(token, expires, user.id);
+  }
+  res.json({ inviteUrl: `${process.env.APP_URL || ''}/accept-invite?token=${token}` });
+});
+
 router.put('/:id', (req, res) => {
   const user = db.prepare('SELECT * FROM users WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!user) return res.status(404).json({ error: 'Not found' });

@@ -576,6 +576,38 @@ router.put('/:id', (req, res) => {
   }
   const updated = db.prepare('SELECT * FROM shuls WHERE id = ?').get(shul.id);
   logAudit(req.user.org_id, req.user.id, 'update', 'shul', shul.id, shul, updated, req.ip);
+  // ensureShulPortalUser only ever reads gabai_email at invite time — an
+  // edit here otherwise had zero effect on an already-issued login, so
+  // "removing" a shul's email in this form never actually revoked access:
+  // the old login kept working with the old address indefinitely (same bug
+  // as stores.js's PUT /:id, fixed there identically). Unlike stores, a
+  // shul CAN reach this route on their own record (isSelf) — revoking here
+  // would immediately kill the session of the very person mid-edit of their
+  // own profile, which is a confusing self-lockout, not a security fix. So
+  // self-edits sync the login's email to match instead (same account, same
+  // session, just re-pointed to the address they just typed as themselves,
+  // already authenticated); only an admin editing someone else's shul
+  // revokes on mismatch, the same as the store fix.
+  if (sets.includes('gabai_email') && updated.portal_user_id) {
+    const portalUser = db.prepare('SELECT * FROM users WHERE id = ?').get(updated.portal_user_id);
+    const newEmail = normalizeEmail(updated.gabai_email);
+    if (portalUser && portalUser.is_active && normalizeEmail(portalUser.email) !== newEmail) {
+      // Sync only for a self-edit to a real, non-colliding address — the
+      // login stays the same account/session, just re-pointed. Everything
+      // else (an admin's edit, a blanked email, or one that collides with
+      // another account) revokes instead: users.email is NOT NULL/UNIQUE so
+      // a blank or colliding value can't be synced to anyway, and an
+      // admin's edit is exactly the "cut off the old address" case this
+      // whole fix exists for.
+      const clash = newEmail ? db.prepare('SELECT id FROM users WHERE email = ? AND id != ?').get(newEmail, portalUser.id) : null;
+      if (isSelf && newEmail && !clash) {
+        db.prepare('UPDATE users SET email = ? WHERE id = ?').run(newEmail, portalUser.id);
+      } else {
+        db.prepare('UPDATE users SET is_active = 0, token_version = token_version + 1 WHERE id = ?').run(portalUser.id);
+        logAudit(req.user.org_id, req.user.id, 'update', 'user', portalUser.id, { is_active: 1 }, { is_active: 0 }, req.ip);
+      }
+    }
+  }
   const shulOut = { ...updated };
   if (isSelf) delete shulOut.permanent_comments;
   const missingInfo = shulInfoErrors(updated);

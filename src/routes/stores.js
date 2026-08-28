@@ -230,6 +230,27 @@ router.put('/:id', requirePermission('stores', 'can_edit'), (req, res) => {
     db.prepare(`UPDATE stores SET ${sets.map(f=>`${f}=?`).join(',')} WHERE id=?`).run(...vals, store.id);
     logAudit(req.user.org_id, req.user.id, 'update', 'store', store.id, Object.fromEntries(sets.map(f => [f, store[f]])), Object.fromEntries(sets.map((f,i) => [f, vals[i]])), req.ip);
   }
+  // Editing (or blanking) owner_email/manager_email here used to have zero
+  // effect on an already-issued portal login — inviteStoreToPortal only
+  // ever reads these fields at invite time, so a login's users.email is
+  // independent of them from then on. That meant "removing" a store's
+  // email in this form never actually revoked the access it was granted
+  // under: the old login kept working with the old address indefinitely.
+  // This route is never called by the store role itself (can_edit defaults
+  // to 0 for that role — store-portal self-service goes through its own
+  // dedicated onboarding routes, not this one), so there's no self-edit
+  // case to protect here the way shuls.js's PUT /:id has to — every caller
+  // is an admin, so revoking is always the right call, not a session they
+  // might be mid-edit of themselves.
+  if (store.portal_user_id && (sets.includes('owner_email') || sets.includes('manager_email'))) {
+    const updatedStore = db.prepare('SELECT owner_email, manager_email FROM stores WHERE id = ?').get(store.id);
+    const portalUser = db.prepare('SELECT * FROM users WHERE id = ?').get(store.portal_user_id);
+    const currentEmails = [updatedStore.owner_email, updatedStore.manager_email].filter(Boolean).map(normalizeEmail);
+    if (portalUser && portalUser.is_active && !currentEmails.includes(normalizeEmail(portalUser.email))) {
+      db.prepare('UPDATE users SET is_active = 0, token_version = token_version + 1 WHERE id = ?').run(portalUser.id);
+      logAudit(req.user.org_id, req.user.id, 'update', 'user', portalUser.id, { is_active: 1 }, { is_active: 0 }, req.ip);
+    }
+  }
   res.json({ store: db.prepare('SELECT * FROM stores WHERE id = ?').get(store.id) });
 });
 

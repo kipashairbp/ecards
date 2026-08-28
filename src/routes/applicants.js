@@ -717,10 +717,21 @@ router.post('/mass-set-pending', requirePermission('applicants', 'can_edit'), as
 // loaded onto a card should stay on record there, just deactivated, not be
 // erased.
 router.delete('/:id/permanent', requirePermission('applicants', 'can_edit'), async (req, res) => {
-  // Admin-only — the shul-portal has no delete capability at all.
-  if (req.user.role === 'shul') return res.status(403).json({ error: 'Not permitted' });
   const applicant = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!applicant) return res.status(404).json({ error: 'Not found' });
+  // A shul can delete its own not-yet-reviewed applicants (draft/incomplete/
+  // pending — a submission it made itself and can just as easily retract),
+  // but never one an admin has ever actually decided on. approved_at is set
+  // by BOTH approve and reject (see those routes) and, deliberately, is
+  // left alone by set-pending when un-approving/un-rejecting one — so a
+  // record moved back to 'pending' after an earlier decision still shows
+  // approved_at and stays undeletable by the shul even though its current
+  // status looks untouched. Reaching an admin's queue at all means it's no
+  // longer purely the shul's to retract.
+  if (req.user.role === 'shul') {
+    if (applicant.shul_id !== req.user.shul_id) return res.status(403).json({ error: 'Not your applicant' });
+    if (applicant.approved_at) return res.status(403).json({ error: 'This applicant has already been reviewed (approved or rejected) by an admin and can no longer be deleted. Contact your admin.' });
+  }
   const { errors: cardLockErrors } = await lockApplicantCards(req.user.org_id, applicant);
   // Snapshot every related row before the cascade removes it, so a
   // super_admin can fully undo this from Recent Actions — "Delete
