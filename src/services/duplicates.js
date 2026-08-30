@@ -188,9 +188,20 @@ export function getMergeGroupIds(orgId, startIds) {
 // the primary's id (== how a "is this the primary" check works elsewhere),
 // duplicate_status='merged', and unpaused. Every open flag connecting two
 // members of the resolved group is marked resolved.
-export function mergeApplicants(orgId, userId, { primaryId, values } = {}) {
+export function mergeApplicants(orgId, userId, { primaryId, values, memberIds } = {}) {
   if (!primaryId) throw new Error('primaryId is required');
-  const groupIds = getMergeGroupIds(orgId, [primaryId]);
+  const fullGroupIds = getMergeGroupIds(orgId, [primaryId]);
+  // memberIds lets an admin merge only PART of a larger connected group in
+  // this pass (see the compare view's per-member Dismiss button — a group
+  // can be 3, 4, 5+ records once duplicate flags chain together, and not
+  // every pair in it is necessarily the same person just because they're
+  // all transitively connected to each other). Whatever's left out stays
+  // exactly as it is — still an open duplicate flag, unmerged — so it can
+  // be resolved separately later instead of being forced into one merge.
+  // Falls back to the full transitive group when omitted, same as before.
+  const groupIds = Array.isArray(memberIds) && memberIds.length
+    ? [...new Set(memberIds.filter(id => fullGroupIds.includes(id)).concat(primaryId))]
+    : fullGroupIds;
   const placeholders = groupIds.map(() => '?').join(',');
   const members = db.prepare(`SELECT * FROM applicants WHERE id IN (${placeholders}) AND org_id = ?`).all(...groupIds, orgId);
   if (members.length < 2) throw new Error('Need at least two related records to merge');

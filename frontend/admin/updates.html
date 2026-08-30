@@ -53,6 +53,12 @@ window.viewUpdate = async (id) => {
 };
 
 let shulsCache = [], storesCache = [], seasonsCache = [];
+// Which shuls/stores are actually picked — tracked separately from the
+// checkboxes themselves (not just read off the DOM at send time) because
+// the search boxes below only render the rows currently matching the
+// filter; a shul checked, then filtered out of view by a search, must stay
+// selected rather than silently dropping off.
+let selectedShulIds = new Set(), selectedStoreIds = new Set();
 // Shuls are scoped to whichever season is picked (default: active) — a shul
 // is a fresh row every season, so an unscoped list mixes in every shul from
 // every past season too, and "All Shuls" would otherwise blast a current
@@ -62,11 +68,37 @@ let shulsCache = [], storesCache = [], seasonsCache = [];
 async function loadShulsForSeason(seasonId) {
   const { shuls } = await api('/shuls/all-list' + (seasonId ? `?season_id=${seasonId}` : ''));
   shulsCache = shuls;
-  qs('#up-shuls-list').innerHTML = shulsCache.map(s => `<label class="checkbox-row"><input type="checkbox" class="up-shul" value="${s.id}">${esc(s.name_en)}</label>`).join('') || '<span class="small-muted">No shuls in this season.</span>';
+  selectedShulIds = new Set();
   qs('#up-all-shuls').checked = false;
+  renderShulsList();
+}
+// Same search-to-filter pattern as the Email Center's recipient picker —
+// live-filters the already-loaded list client-side (no round trip needed,
+// this list is already small enough to hold in full) instead of scrolling
+// through every shul/store to find the one to check.
+function renderShulsList() {
+  const q = (qs('#up-shuls-search')?.value || '').trim().toLowerCase();
+  const filtered = q ? shulsCache.filter(s => s.name_en.toLowerCase().includes(q)) : shulsCache;
+  qs('#up-shuls-list').innerHTML = filtered.map(s => `<label class="checkbox-row"><input type="checkbox" class="up-shul" value="${s.id}" ${selectedShulIds.has(s.id)?'checked':''}>${esc(s.name_en)}</label>`).join('')
+    || `<span class="small-muted">${shulsCache.length ? 'No shuls match your search.' : 'No shuls in this season.'}</span>`;
+  qsa('.up-shul').forEach(c => c.addEventListener('change', () => {
+    if (c.checked) selectedShulIds.add(c.value); else selectedShulIds.delete(c.value);
+    qs('#up-all-shuls').checked = selectedShulIds.size === shulsCache.length && shulsCache.length > 0;
+  }));
+}
+function renderStoresList() {
+  const q = (qs('#up-stores-search')?.value || '').trim().toLowerCase();
+  const filtered = q ? storesCache.filter(s => s.name.toLowerCase().includes(q)) : storesCache;
+  qs('#up-stores-list').innerHTML = filtered.map(s => `<label class="checkbox-row"><input type="checkbox" class="up-store" value="${s.id}" ${selectedStoreIds.has(s.id)?'checked':''}>${esc(s.name)}</label>`).join('')
+    || `<span class="small-muted">${storesCache.length ? 'No stores match your search.' : 'No stores yet.'}</span>`;
+  qsa('.up-store').forEach(c => c.addEventListener('change', () => {
+    if (c.checked) selectedStoreIds.add(c.value); else selectedStoreIds.delete(c.value);
+    qs('#up-all-stores').checked = selectedStoreIds.size === storesCache.length && storesCache.length > 0;
+  }));
 }
 qs('#btn-compose').addEventListener('click', async () => {
   let activeSeasonId = '';
+  selectedShulIds = new Set(); selectedStoreIds = new Set();
   try {
     const [{ seasons }, { season: active }, { stores }] = await Promise.all([api('/seasons'), api('/seasons/active'), api('/stores')]);
     seasonsCache = seasons; storesCache = stores; activeSeasonId = active?.id || '';
@@ -79,15 +111,26 @@ qs('#btn-compose').addEventListener('click', async () => {
     <label>Shuls Season <span class="small-muted">(which season's shuls to choose from / "All Shuls" means)</span></label>
     <select id="up-season">${seasonsCache.map(s => `<option value="${s.id}" ${s.id === activeSeasonId ? 'selected' : ''}>${esc(s.name)}${s.id === activeSeasonId ? ' (active)' : ''}</option>`).join('')}</select>
     <label class="checkbox-row"><input type="checkbox" id="up-all-shuls"><strong>All Shuls</strong> (in the season above)</label>
+    <input id="up-shuls-search" placeholder="Search shuls…" style="margin:6px 0">
     <div id="up-shuls-list" style="max-height:140px;overflow-y:auto;margin:8px 0"><span class="small-muted">Loading…</span></div>
     <label class="checkbox-row"><input type="checkbox" id="up-all-stores"><strong>All Stores</strong></label>
-    <div id="up-stores-list" style="max-height:140px;overflow-y:auto;margin:8px 0">${storesCache.map(s => `<label class="checkbox-row"><input type="checkbox" class="up-store" value="${s.id}">${esc(s.name)}</label>`).join('') || '<span class="small-muted">No stores yet.</span>'}</div>
+    <input id="up-stores-search" placeholder="Search stores…" style="margin:6px 0">
+    <div id="up-stores-list" style="max-height:140px;overflow-y:auto;margin:8px 0"></div>
   `;
   openModal('Send Update', body, `<button class="btn btn-primary btn-sm" onclick="sendUpdate()">Send</button>`);
   loadShulsForSeason(activeSeasonId);
+  renderStoresList();
   qs('#up-season').addEventListener('change', (e) => loadShulsForSeason(e.target.value));
-  qs('#up-all-shuls').addEventListener('change', (e) => qsa('.up-shul').forEach(c => c.checked = e.target.checked));
-  qs('#up-all-stores').addEventListener('change', (e) => qsa('.up-store').forEach(c => c.checked = e.target.checked));
+  qs('#up-shuls-search').addEventListener('input', debounce(renderShulsList, 200));
+  qs('#up-stores-search').addEventListener('input', debounce(renderStoresList, 200));
+  qs('#up-all-shuls').addEventListener('change', (e) => {
+    selectedShulIds = e.target.checked ? new Set(shulsCache.map(s => s.id)) : new Set();
+    renderShulsList();
+  });
+  qs('#up-all-stores').addEventListener('change', (e) => {
+    selectedStoreIds = e.target.checked ? new Set(storesCache.map(s => s.id)) : new Set();
+    renderStoresList();
+  });
 });
 
 window.sendUpdate = async () => {
@@ -100,8 +143,8 @@ window.sendUpdate = async () => {
   if (allShuls) groups.push('all_shuls');
   if (allStores) groups.push('all_stores');
   const recipients = [];
-  if (!allShuls) qsa('.up-shul:checked').forEach(c => recipients.push({ entity_type: 'shul', entity_id: c.value }));
-  if (!allStores) qsa('.up-store:checked').forEach(c => recipients.push({ entity_type: 'store', entity_id: c.value }));
+  if (!allShuls) selectedShulIds.forEach(id => recipients.push({ entity_type: 'shul', entity_id: id }));
+  if (!allStores) selectedStoreIds.forEach(id => recipients.push({ entity_type: 'store', entity_id: id }));
   if (!recipients.length && !groups.length) return toast('Select at least one recipient', true);
 
   const fd = new FormData();

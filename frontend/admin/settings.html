@@ -70,7 +70,11 @@ renderShell('/admin/settings', `
       <p class="small-muted">disccardpromos loads money onto a card by crediting a customer's balance against one of their Packages — there's no separate "assign a card" step. Enter the Package/Discount ID to use; every approved applicant's card amount is loaded against this same package, regardless of season.</p>
       <div id="giftcard-status" style="margin:10px 0"></div>
       <label>Package (Discount) ID</label><input id="org-discount_id" placeholder="e.g. 4821">
-      <button class="btn btn-sm btn-primary" style="margin-top:14px" onclick="saveDiscountId()">Save</button>
+      <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+        <button class="btn btn-sm btn-primary" onclick="saveDiscountId()">Save</button>
+        <button class="btn btn-sm btn-outline" onclick="lookUpGiftcardPackages()">Look Up Valid Package IDs</button>
+      </div>
+      <div id="giftcard-packages-result" style="margin-top:10px"></div>
       <div class="divider"></div>
       <h4 style="margin-bottom:4px">Applicant Info Pushed to disccardpromos</h4>
       <p class="small-muted">Applicant ID is always sent — it's how a record gets matched to their disccardpromos customer at all. Choose which other fields go along with it, on approval and every save afterward.</p>
@@ -206,6 +210,27 @@ async function loadDiscountId() {
 }
 window.saveDiscountId = async () => {
   try { await api('/settings', { method: 'PUT', body: { disccardpromos_discount_id: qs('#org-discount_id').value.trim() } }); toast('Saved'); } catch (err) { toast(err.message, true); }
+};
+// disccardpromos only ever tells you a Package (Discount) ID is wrong when
+// an approval actually fails against it ("Discount id N not found") — this
+// looks up what's really valid on the account right now (via an existing
+// customer's packages array — see routes/settings.js's giftcard-packages
+// for why there's no cleaner way to ask), so a stale/renumbered/wrong ID
+// can be caught and fixed here instead.
+window.lookUpGiftcardPackages = async () => {
+  const el = qs('#giftcard-packages-result');
+  el.innerHTML = '<span class="small-muted">Looking up…</span>';
+  try {
+    const { mockMode, packages, note } = await api('/settings/giftcard-packages');
+    if (mockMode) { el.innerHTML = '<span class="small-muted">disccardpromos is in mock mode — nothing to look up until it\'s live.</span>'; return; }
+    if (note) { el.innerHTML = `<span class="small-muted">${esc(note)}</span>`; return; }
+    if (!packages.length) { el.innerHTML = '<span class="small-muted">No packages found on the account.</span>'; return; }
+    el.innerHTML = `<div class="small-muted">Valid Package IDs on this disccardpromos account:</div>
+      <table style="margin-top:6px"><thead><tr><th>ID</th><th>Name</th><th>Amount</th><th></th></tr></thead><tbody>
+        ${packages.map(p => `<tr><td><code>${esc(String(p.id))}</code></td><td>${esc(p.name || '')}</td><td>${p.amount != null ? esc(String(p.amount)) : ''}</td>
+          <td><button class="btn btn-sm btn-outline" onclick="qs('#org-discount_id').value='${esc(String(p.id))}'">Use this</button></td></tr>`).join('')}
+      </tbody></table>`;
+  } catch (err) { el.innerHTML = `<span style="color:var(--danger)">${esc(err.message)}</span>`; }
 };
 // Keep in sync with PROVIDER_PUSH_FIELDS in routes/applicants.js — the
 // server falls back to "everything" if this setting was never saved, so an

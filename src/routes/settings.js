@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { db, uuid } from '../db.js';
 import { auth, requireRole } from '../middleware/auth.js';
 import { requirePermission } from '../middleware/permissions.js';
-import { isMockMode } from '../services/giftcard.js';
+import { isMockMode, getCustomerByExternalId } from '../services/giftcard.js';
 import { SYSTEM_EMAIL_TEMPLATES } from '../services/mail.js';
 import { runBackup, listBackups, backupPath } from '../services/backup.js';
 
@@ -38,6 +38,28 @@ router.get('/giftcard-status', (req, res) => {
   const mockMode = isMockMode();
   const missing = mockMode ? [!process.env.DISCCARDPROMOS_API_BASE && 'DISCCARDPROMOS_API_BASE', !process.env.DISCCARDPROMOS_API_KEY && 'DISCCARDPROMOS_API_KEY'].filter(Boolean) : [];
   res.json({ mockMode, missing });
+});
+
+// What Package/Discount IDs actually exist on disccardpromos right now —
+// the only signal a wrong Package (Discount) ID gives back is add-funds
+// failing with "Discount id N not found" at approval time, which is a bad
+// way to discover the field's gone stale (a package renumbered, deleted,
+// or belongs to a different account there). There's no confirmed separate
+// "list packages" endpoint against their real API docs (see
+// services/giftcard.js's file header) — packages only ever come back
+// embedded on a Customer record — so this borrows whichever applicant
+// already has a disccardpromos account and reads its packages array as a
+// stand-in for what's available account-wide.
+router.get('/giftcard-packages', async (req, res) => {
+  if (isMockMode()) return res.json({ mockMode: true, packages: [] });
+  const applicant = db.prepare(`SELECT external_id, season_id FROM applicants WHERE org_id = ? AND provider_account_id IS NOT NULL ORDER BY created_at DESC LIMIT 1`).get(req.user.org_id);
+  if (!applicant) return res.json({ packages: [], note: 'No disccardpromos customer exists yet to check against — approve at least one applicant first, then look this up again.' });
+  try {
+    const customer = await getCustomerByExternalId(applicant.season_id, applicant.external_id, { balances: false });
+    res.json({ packages: customer?.packages || [] });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
 });
 
 // Auto-email message editor — every key in SYSTEM_EMAIL_TEMPLATES (contract

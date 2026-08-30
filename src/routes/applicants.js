@@ -224,9 +224,10 @@ function scopeWhere(req) {
 }
 
 router.get('/', (req, res) => {
-  const { search, status, shul_id, season_id, home_for_yomtov, marital_status, sort = 'created_at', dir = 'DESC', page = 1, pageSize = 50 } = req.query;
+  const { search, status, shul_id, season_id, home_for_yomtov, marital_status, paused, sort = 'created_at', dir = 'DESC', page = 1, pageSize = 50 } = req.query;
   let { where, params } = scopeWhere(req);
   if (status) { where += ' AND a.approval_status = ?'; params.push(status); }
+  if (paused === '1' || paused === '0') { where += ' AND a.is_paused = ?'; params.push(+paused); }
   if (shul_id) { where += ' AND a.shul_id = ?'; params.push(shul_id); }
   if (season_id) { where += ' AND a.season_id = ?'; params.push(season_id); }
   if (marital_status) { where += ' AND a.marital_status = ?'; params.push(marital_status); }
@@ -249,9 +250,10 @@ router.get('/', (req, res) => {
 // Full-detail CSV export — every field, no pagination, respects the same
 // filters as the list view. Must be registered before /:id.
 router.get('/export', requirePermission('applicants', 'can_export'), (req, res) => {
-  const { search, status, shul_id, season_id, home_for_yomtov, marital_status } = req.query;
+  const { search, status, shul_id, season_id, home_for_yomtov, marital_status, paused } = req.query;
   let { where, params } = scopeWhere(req);
   if (status) { where += ' AND a.approval_status = ?'; params.push(status); }
+  if (paused === '1' || paused === '0') { where += ' AND a.is_paused = ?'; params.push(+paused); }
   if (shul_id) { where += ' AND a.shul_id = ?'; params.push(shul_id); }
   if (season_id) { where += ' AND a.season_id = ?'; params.push(season_id); }
   if (marital_status) { where += ' AND a.marital_status = ?'; params.push(marital_status); }
@@ -1366,9 +1368,9 @@ router.get('/duplicates/:flagId/group', requireAdmin, (req, res) => {
 router.post('/duplicates/:flagId/merge', requirePermission('applicants', 'can_edit'), (req, res) => {
   const flag = db.prepare(`SELECT * FROM duplicate_flags WHERE id = ? AND org_id = ? AND entity_type='applicant'`).get(req.params.flagId, req.user.org_id);
   if (!flag) return res.status(404).json({ error: 'Not found' });
-  const { primaryId, values } = req.body || {};
+  const { primaryId, values, memberIds } = req.body || {};
   try {
-    const result = mergeApplicants(req.user.org_id, req.user.id, { primaryId, values });
+    const result = mergeApplicants(req.user.org_id, req.user.id, { primaryId, values, memberIds });
     logAudit(req.user.org_id, req.user.id, 'merge', 'applicant', primaryId, null, result, req.ip);
     res.json(result);
   } catch (e) { res.status(400).json({ error: e.message }); }

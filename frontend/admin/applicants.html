@@ -28,6 +28,7 @@ renderShell('/admin/applicants', `
   <div class="toolbar">
     <input id="f-search" placeholder="Search name, phone, email…">
     <select id="f-status"><option value="">All statuses</option><option value="pending">Pending</option><option value="approved">Approved</option><option value="rejected">Rejected</option><option value="soft_rejected">Soft Reject</option></select>
+    <select id="f-paused"><option value="">Paused: All</option><option value="1">Paused only</option><option value="0">Not paused</option></select>
     <select id="f-marital"><option value="">Any marital status</option><option value="single">Single</option><option value="married">Married</option><option value="widowed">Widowed</option><option value="divorced">Divorced</option></select>
     <select id="f-shul"><option value="">All Shuls</option></select>
     <select id="f-season"></select>
@@ -50,7 +51,7 @@ renderShell('/admin/applicants', `
   <div class="paginator" id="pager"></div>
 `);
 
-let state = { search:'', status:'', marital_status:'', shul_id:'', season_id:'', sort:'created_at', dir:'DESC', page:1, pageSize:25 };
+let state = { search:'', status:'', paused:'', marital_status:'', shul_id:'', season_id:'', sort:'created_at', dir:'DESC', page:1, pageSize:25 };
 let selected = new Set();
 
 // Every field a column can show, plus how to render it — the checkbox
@@ -130,6 +131,7 @@ function onCheck(e) {
 
 qs('#f-search').addEventListener('input', debounce(() => { state.search = qs('#f-search').value; state.page = 1; load(); }, 350));
 qs('#f-status').addEventListener('change', () => { state.status = qs('#f-status').value; state.page = 1; load(); });
+qs('#f-paused').addEventListener('change', () => { state.paused = qs('#f-paused').value; state.page = 1; load(); });
 qs('#f-marital').addEventListener('change', () => { state.marital_status = qs('#f-marital').value; state.page = 1; load(); });
 qs('#f-shul').addEventListener('change', () => { state.shul_id = qs('#f-shul').value; state.page = 1; load(); });
 qs('#f-season').addEventListener('change', () => {
@@ -525,6 +527,7 @@ let mergeGroupCache = null;
 let mergeViewReturnToApplicant = null;
 window.openMergeView = async (flagId, fromApplicantId) => {
   mergeViewReturnToApplicant = fromApplicantId || null;
+  dismissedMemberIds = new Set();
   try {
     const group = await api(`/applicants/duplicates/${flagId}/group`);
     mergeGroupCache = group;
@@ -542,8 +545,20 @@ window.openMergeView = async (flagId, fromApplicantId) => {
     renderMergeView();
   } catch (err) { toast(err.message, true); }
 };
+// Which of this group's members are excluded from the CURRENT merge pass —
+// reset every time a new group is opened (see openMergeView), scoped only
+// to this session/view. Dismissing a member never touches its duplicate
+// flag or status on the backend at all; it just leaves that record out of
+// the merge this compare view submits, same as if it had never been shown.
+// A group can legitimately be 3, 4, 5+ records once flags chain together,
+// and not every pair in it is necessarily the same person just because
+// they're all transitively connected — this is what lets an admin merge
+// the ones that really are the same person while leaving a genuinely-
+// unrelated-looking member's own flag open to sort out separately later.
+let dismissedMemberIds = new Set();
 function renderMergeView() {
-  const { flag, members, sharesPhone } = mergeGroupCache;
+  const { flag, members: allMembers, sharesPhone } = mergeGroupCache;
+  const members = allMembers.filter(m => !dismissedMemberIds.has(m.id));
   // A soft-rejected member (no current shul) can't be picked as Primary —
   // the backend rejects it (see mergeApplicants's shul_id guard) since
   // there'd be no shul left to actually hold the resulting card. Default
@@ -556,6 +571,7 @@ function renderMergeView() {
         <label for="mp-${i}" style="margin:0"><strong>${esc(m.first_name)} ${esc(m.last_name)}</strong></label></div>
       <span class="small-muted">${esc(m.shul_name || (m.previous_shul_name ? `previously ${m.previous_shul_name}` : 'no shul'))}</span><br>
       ${badge(m.approval_status, m.approval_status)}
+      ${members.length > 2 ? `<div style="margin-top:4px"><button type="button" class="btn btn-sm btn-outline" onclick="dismissMergeMember('${m.id}')" title="Leave this one out of this merge — still stays flagged as a duplicate for later">Dismiss</button></div>` : ''}
     </th>`).join('');
   const rows = APPLICANT_MERGE_FIELDS.map(([key, label]) => {
     const cells = members.map((m, i) => {
@@ -565,9 +581,11 @@ function renderMergeView() {
     }).join('');
     return `<tr><td class="small-muted" style="white-space:nowrap">${esc(label)}</td>${cells}</tr>`;
   }).join('');
+  const dismissedCount = allMembers.length - members.length;
   const body = `
-    <p class="small-muted">Reason flagged: ${esc(flag.reason)}. ${members.length > 2 ? `This is a group of ${members.length} records.` : ''}
+    <p class="small-muted">Reason flagged: ${esc(flag.reason)}. ${allMembers.length > 2 ? `This is a group of ${allMembers.length} records.` : ''}
     Pick which record is <strong>Primary</strong> (that's the one that keeps going forward as the real card-holder), then pick which value to keep for each field — you can mix and match from any record.</p>
+    ${dismissedCount ? `<p class="small-muted">${dismissedCount} record${dismissedCount>1?'s':''} left out of this merge — still flagged as a duplicate, unchanged. <button type="button" class="btn btn-sm btn-outline" onclick="dismissedMemberIds.clear();renderMergeView()">Show all again</button></p>` : ''}
     ${sharesPhone ? '<p style="color:var(--danger)"><strong>These records share a phone number</strong> — they can only be resolved as a merge, not bypassed as coincidentally-similar different people.</p>' : ''}
     <div style="overflow-x:auto"><table><thead><tr><th></th>${cols}</tr></thead><tbody>${rows}</tbody></table></div>
   `;
@@ -576,9 +594,13 @@ function renderMergeView() {
     : `<button class="btn btn-outline btn-sm" onclick="closeModal();showDuplicates()">Back to List</button>`;
   const footer = `${backBtn}
     ${sharesPhone ? '' : `<button class="btn btn-outline btn-sm" onclick="bypassDup('${flag.id}')">Bypass (not the same person)</button>`}
-    <button class="btn btn-primary btn-sm" onclick="submitMerge('${flag.id}')">Merge &amp; Resolve</button>`;
+    <button class="btn btn-primary btn-sm" onclick="submitMerge('${flag.id}')">Merge &amp; Resolve${dismissedCount ? ` (${members.length} of ${allMembers.length})` : ''}</button>`;
   openModal('Compare & Merge Records', body, footer);
 }
+window.dismissMergeMember = (id) => {
+  dismissedMemberIds.add(id);
+  renderMergeView();
+};
 // Lands back wherever this compare view was opened from — the applicant's
 // own profile if that's how it was reached, otherwise the full Duplicates
 // list, same as before.
@@ -601,8 +623,11 @@ window.submitMerge = async (flagId) => {
       : key === 'home_for_yomtov' ? (el.value === '1' || el.value === 'true' ? 1 : 0)
       : el.value;
   }
+  // Only the members still shown (not Dismissed) go into this merge — the
+  // backend leaves everyone else, and their flags, exactly as they are.
+  const memberIds = mergeGroupCache.members.filter(m => !dismissedMemberIds.has(m.id)).map(m => m.id);
   try {
-    await api(`/applicants/duplicates/${flagId}/merge`, { method: 'POST', body: { primaryId, values } });
+    await api(`/applicants/duplicates/${flagId}/merge`, { method: 'POST', body: { primaryId, values, memberIds } });
     toast('Merged'); afterDuplicateResolved();
   } catch (err) { toast(err.message, true); }
 };
