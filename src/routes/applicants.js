@@ -886,17 +886,30 @@ router.post('/:id/approve', requirePermission('applicants', 'can_edit'), async (
       // never blocks/undoes the approval itself. provider_exempt applicants
       // (one-time backfill import — see POST /import) never reach either block,
       // permanently, no matter how many times they're approved/rejected.
-      if (applicant.shul_id && !applicant.provider_exempt && !providerAccountError && amount > 0) {
-        const discountId = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'disccardpromos_discount_id'`).get(req.user.org_id)?.value;
-        if (!discountId) {
-          providerFundsError = 'No disccardpromos Package/Discount ID configured (Settings > Organization > Gift Card Loading) — card amount was not loaded.';
-        } else {
-          try {
-            await giftcard.addFunds(applicant.season_id, { externalId: applicant.external_id, discountId, amount });
-          } catch (e) {
-            providerFundsError = e.message;
-            console.error('[giftcard] failed to load funds on approval:', e.message);
+      if (applicant.shul_id && !applicant.provider_exempt && !providerAccountError) {
+        if (amount > 0) {
+          const discountId = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'disccardpromos_discount_id'`).get(req.user.org_id)?.value;
+          if (!discountId) {
+            providerFundsError = 'No disccardpromos Package/Discount ID configured (Settings > Organization > Gift Card Loading) — card amount was not loaded.';
+          } else {
+            try {
+              await giftcard.addFunds(applicant.season_id, { externalId: applicant.external_id, discountId, amount });
+            } catch (e) {
+              providerFundsError = e.message;
+              console.error('[giftcard] failed to load funds on approval:', e.message);
+            }
           }
+        } else {
+          // amount<=0 isn't itself an error — the account still gets
+          // created above with no funds, same as an intentionally-comped
+          // applicant — but it used to be entirely silent, indistinguishable
+          // from funds genuinely loading successfully. This resolved from
+          // req.body.card_amount ?? applicant.card_amount ?? season's
+          // default_card_amount ?? 0 — if this fires for every approval,
+          // the season's default (or each applicant's own Card Amount) is
+          // almost certainly $0/unset and that's the real thing to fix, not
+          // this route.
+          providerFundsError = 'Card amount resolved to $0 — nothing was sent to disccardpromos. Set a Card Amount on the applicant (or the season default) before approving if this should have loaded funds.';
         }
       }
     }
@@ -1046,7 +1059,7 @@ router.post('/mass-approve', requirePermission('applicants', 'can_edit'), async 
   const { ids, card_amount } = req.body || {};
   if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids array required' });
   const discountId = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'disccardpromos_discount_id'`).get(req.user.org_id)?.value;
-  let approved = 0, skipped = 0, capReached = false, providerErrors = 0, contributionBlocked = 0;
+  let approved = 0, skipped = 0, capReached = false, providerErrors = 0, contributionBlocked = 0, zeroAmountSkipped = 0;
   const affectedIds = [], names = [];
   // Unlike the single /:id/approve route (which returns providerFundsError
   // verbatim), this used to only ever report a bare providerErrors COUNT —
@@ -1102,11 +1115,21 @@ router.post('/mass-approve', requirePermission('applicants', 'can_edit'), async 
       } else if (accountOk && amount > 0 && !discountId) {
         providerErrors++;
         providerErrorDetails.push(`${applicant.first_name} ${applicant.last_name}: card not loaded — no disccardpromos Package/Discount ID configured`);
+      } else if (accountOk && amount <= 0) {
+        // Not itself an error (an intentionally-comped applicant looks
+        // identical), but it used to be entirely silent — indistinguishable
+        // from funds genuinely loading. amount here is the ONE uniform
+        // card_amount typed into the mass-approve prompt (falls back per-
+        // applicant to their own existing card_amount, then the season
+        // default, then $0) — if this fires for most/all of a batch, the
+        // season default (or the applicants' own Card Amount) is almost
+        // certainly $0/unset, which is the real thing to go fix.
+        zeroAmountSkipped++;
       }
     }
   }
-  logMassAudit(req.user.org_id, req.user.id, 'mass-approve', 'applicant', affectedIds, { skipped, capReached, providerErrors, contributionBlocked, names, providerErrorDetails }, req.ip);
-  res.json({ approved, skipped, capReached, providerErrors, contributionBlocked, providerErrorDetails, providerErrorsHint: providerErrors && !discountId ? 'No disccardpromos Package/Discount ID configured (Settings > Organization > Gift Card Loading).' : undefined });
+  logMassAudit(req.user.org_id, req.user.id, 'mass-approve', 'applicant', affectedIds, { skipped, capReached, providerErrors, contributionBlocked, zeroAmountSkipped, names, providerErrorDetails }, req.ip);
+  res.json({ approved, skipped, capReached, providerErrors, contributionBlocked, zeroAmountSkipped, providerErrorDetails, providerErrorsHint: providerErrors && !discountId ? 'No disccardpromos Package/Discount ID configured (Settings > Organization > Gift Card Loading).' : undefined });
 });
 
 router.post('/:id/notes', (req, res) => {

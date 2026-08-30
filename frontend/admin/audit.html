@@ -126,6 +126,7 @@ function massDetail(a) {
   if (after.errors) bits.push(`${after.errors} errors`);
   if (after.capReached) bits.push('season cap reached');
   if (after.providerErrors) bits.push(`${after.providerErrors} gift-card provider errors`);
+  if (after.zeroAmountSkipped) bits.push(`${after.zeroAmountSkipped} had a $0 card amount, nothing sent to disccardpromos`);
   if (after.emailErrors) bits.push(`${after.emailErrors} email errors`);
   if (after.cardLockErrors) bits.push(`${after.cardLockErrors} card-lock errors`);
   let html = bits.length ? `<div class="small-muted" style="margin-top:6px">${esc(bits.join(' · '))}</div>` : '';

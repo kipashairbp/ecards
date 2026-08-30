@@ -172,7 +172,13 @@ const MASS_ACTIONS = {
         if (r.providerErrorDetails?.length) msg += `: ${r.providerErrorDetails.slice(0, 3).join('; ')}${r.providerErrorDetails.length > 3 ? `; +${r.providerErrorDetails.length - 3} more (see Recent Actions for the full list)` : ''}`;
         else if (r.providerErrorsHint) msg += `: ${r.providerErrorsHint}`;
       }
-      return { msg, isError: !!r.providerErrors || !!r.contributionBlocked };
+      // Not an "error" (an intentionally-comped applicant looks identical),
+      // but used to be silent — indistinguishable from funds genuinely
+      // loading. If this fires for most/all of a batch, the amount typed
+      // into the prompt above was left blank AND the applicants' own Card
+      // Amount / the season's default are $0 or unset.
+      if (r.zeroAmountSkipped) msg += ` — ${r.zeroAmountSkipped} had a $0 card amount, nothing sent to disccardpromos`;
+      return { msg, isError: !!r.providerErrors || !!r.contributionBlocked || !!r.zeroAmountSkipped };
     },
   },
   reject: {
