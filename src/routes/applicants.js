@@ -1048,6 +1048,14 @@ router.post('/mass-approve', requirePermission('applicants', 'can_edit'), async 
   const discountId = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'disccardpromos_discount_id'`).get(req.user.org_id)?.value;
   let approved = 0, skipped = 0, capReached = false, providerErrors = 0, contributionBlocked = 0;
   const affectedIds = [], names = [];
+  // Unlike the single /:id/approve route (which returns providerFundsError
+  // verbatim), this used to only ever report a bare providerErrors COUNT —
+  // the actual disccardpromos error text only ever reached console.error,
+  // invisible to whoever's actually running the mass-approve. Collecting the
+  // real reason per applicant here is what lets an admin (or whoever they
+  // forward this to) tell "no Package/Discount ID configured" apart from a
+  // genuine live API rejection, instead of guessing from a number alone.
+  const providerErrorDetails = [];
   for (const id of ids) {
     const applicant = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(id, req.user.org_id);
     if (!applicant || applicant.is_paused) { skipped++; continue; }
@@ -1081,18 +1089,24 @@ router.post('/mass-approve', requirePermission('applicants', 'can_edit'), async 
         accountOk = true;
       } catch (e) {
         providerErrors++;
+        providerErrorDetails.push(`${applicant.first_name} ${applicant.last_name}: account write failed — ${e.message}`);
         console.error('[giftcard] failed to write disccardpromos account on mass-approve:', e.message);
       }
       if (accountOk && amount > 0 && discountId) {
         try { await giftcard.addFunds(applicant.season_id, { externalId: applicant.external_id, discountId, amount }); }
-        catch (e) { providerErrors++; console.error('[giftcard] failed to load funds on mass-approve:', e.message); }
+        catch (e) {
+          providerErrors++;
+          providerErrorDetails.push(`${applicant.first_name} ${applicant.last_name}: card not loaded — ${e.message}`);
+          console.error('[giftcard] failed to load funds on mass-approve:', e.message);
+        }
       } else if (accountOk && amount > 0 && !discountId) {
         providerErrors++;
+        providerErrorDetails.push(`${applicant.first_name} ${applicant.last_name}: card not loaded — no disccardpromos Package/Discount ID configured`);
       }
     }
   }
-  logMassAudit(req.user.org_id, req.user.id, 'mass-approve', 'applicant', affectedIds, { skipped, capReached, providerErrors, contributionBlocked, names }, req.ip);
-  res.json({ approved, skipped, capReached, providerErrors, contributionBlocked, providerErrorsHint: providerErrors && !discountId ? 'No disccardpromos Package/Discount ID configured (Settings > Organization > Gift Card Loading).' : undefined });
+  logMassAudit(req.user.org_id, req.user.id, 'mass-approve', 'applicant', affectedIds, { skipped, capReached, providerErrors, contributionBlocked, names, providerErrorDetails }, req.ip);
+  res.json({ approved, skipped, capReached, providerErrors, contributionBlocked, providerErrorDetails, providerErrorsHint: providerErrors && !discountId ? 'No disccardpromos Package/Discount ID configured (Settings > Organization > Gift Card Loading).' : undefined });
 });
 
 router.post('/:id/notes', (req, res) => {

@@ -162,7 +162,16 @@ const MASS_ACTIONS = {
     summarize: r => {
       let msg = `Approved ${r.approved}, skipped ${r.skipped}${r.capReached ? ' (season capacity reached)' : ' (paused)'}`;
       if (r.contributionBlocked) msg += ` — ${r.contributionBlocked} skipped: shul contribution not confirmed / below minimum`;
-      if (r.providerErrors) msg += ` — ${r.providerErrors} disccardpromos issue(s)${r.providerErrorsHint ? ': ' + r.providerErrorsHint : ''}`;
+      if (r.providerErrors) {
+        msg += ` — ${r.providerErrors} disccardpromos issue(s)`;
+        // Real per-applicant reasons, not just a bare count — see the
+        // comment on providerErrorDetails in the mass-approve route. Only
+        // the first few are shown inline (a large batch could otherwise
+        // produce an unreadably long toast); providerErrorsHint still covers
+        // the single most common case (no Package/Discount ID configured).
+        if (r.providerErrorDetails?.length) msg += `: ${r.providerErrorDetails.slice(0, 3).join('; ')}${r.providerErrorDetails.length > 3 ? `; +${r.providerErrorDetails.length - 3} more (see Recent Actions for the full list)` : ''}`;
+        else if (r.providerErrorsHint) msg += `: ${r.providerErrorsHint}`;
+      }
       return { msg, isError: !!r.providerErrors || !!r.contributionBlocked };
     },
   },

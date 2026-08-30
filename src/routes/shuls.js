@@ -260,7 +260,11 @@ router.get('/', (req, res) => {
   const rows = db.prepare(`SELECT * FROM shuls ${where} ORDER BY ${sortCol} ${sortDir} LIMIT ? OFFSET ?`).all(...params, +pageSize, offset);
   const withCounts = rows.map(s => ({
     ...s,
-    applicant_count: db.prepare('SELECT COUNT(*) c FROM applicants WHERE shul_id = ?').get(s.id).c,
+    // 'incomplete' (carried forward from last season, not yet re-enrolled)
+    // isn't a real submission for this season and shouldn't inflate this
+    // shul's applicant count — every other status (including 'draft',
+    // uploaded-but-not-yet-submitted) still counts.
+    applicant_count: db.prepare(`SELECT COUNT(*) c FROM applicants WHERE shul_id = ? AND approval_status != 'incomplete'`).get(s.id).c,
   }));
   res.json({ shuls: redact(withCounts, req.permission.hidden_fields), total, page: +page, pageSize: +pageSize });
 });
@@ -1052,7 +1056,7 @@ router.get('/duplicates/:flagId/group', requireAdmin, (req, res) => {
   const ids = getShulMergeGroupIds(req.user.org_id, [flag.entity_id, flag.matched_entity_id]);
   const placeholders = ids.map(() => '?').join(',');
   const members = db.prepare(`SELECT * FROM shuls WHERE id IN (${placeholders})`).all(...ids)
-    .map(s => ({ ...s, applicant_count: db.prepare('SELECT COUNT(*) c FROM applicants WHERE shul_id = ?').get(s.id).c }));
+    .map(s => ({ ...s, applicant_count: db.prepare(`SELECT COUNT(*) c FROM applicants WHERE shul_id = ? AND approval_status != 'incomplete'`).get(s.id).c }));
   res.json({ flag, members });
 });
 

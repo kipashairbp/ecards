@@ -129,6 +129,14 @@ function massDetail(a) {
   if (after.emailErrors) bits.push(`${after.emailErrors} email errors`);
   if (after.cardLockErrors) bits.push(`${after.cardLockErrors} card-lock errors`);
   let html = bits.length ? `<div class="small-muted" style="margin-top:6px">${esc(bits.join(' · '))}</div>` : '';
+  // Real per-applicant reasons for the gift-card provider errors counted
+  // above — see routes/applicants.js's mass-approve for why this exists
+  // (a bare count alone gave no way to tell "not configured" apart from a
+  // genuine disccardpromos rejection).
+  const providerErrorDetails = (after.providerErrorDetails || []).filter(Boolean);
+  if (providerErrorDetails.length) {
+    html += `<div class="small-muted" style="margin-top:4px;color:var(--danger)">${providerErrorDetails.map(d => esc(d)).join('<br>')}</div>`;
+  }
   const names = (after.names || []).filter(Boolean);
   if (names.length) {
     const shown = names.slice(0, 15).join(', ');

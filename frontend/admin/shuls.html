@@ -290,7 +290,10 @@ qs('#btn-mass-apply').addEventListener('click', async () => {
 async function openShul(id) {
   try {
     const { shul, notes, contract, applicants, flags } = await api(`/shuls/${id}`);
-    patchShulRow({ ...shul, applicant_count: applicants.length });
+    // Match the list route's applicant_count (GET /shuls) — 'incomplete'
+    // (carried forward, not yet re-enrolled this season) isn't a real
+    // submission and shouldn't inflate the count shown on the row.
+    patchShulRow({ ...shul, applicant_count: applicants.filter(a => a.approval_status !== 'incomplete').length });
     const body = `
       <div class="tabs" id="stabs">
         <button class="active" data-t="info">Info</button><button data-t="notes">Notes (${notes.length})</button>
