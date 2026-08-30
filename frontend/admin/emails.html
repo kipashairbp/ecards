@@ -159,12 +159,17 @@ window.deleteTemplate = async (id) => {
 };
 
 let composeEditor = null;
+const RECIPIENT_TYPE_LABEL = { shul: 'Shul', store: 'Store', applicant: 'Applicant', user: 'Admin' };
 qs('#btn-compose').addEventListener('click', async () => {
   if (!templatesCache.length) { try { ({ templates: templatesCache } = await api('/emails/templates/all')); } catch { /* compose still works without templates */ } }
   const options = `<option value="">Start from scratch</option>` + templatesCache.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('');
   const body = `
     <label>Use Template</label><select id="cp-template">${options}</select>
-    <label>To <span class="req">*</span></label><input id="cp-to" type="email" placeholder="recipient@example.com">
+    <label>To <span class="req">*</span> <span class="small-muted">(comma-separate multiple addresses)</span></label>
+    <input id="cp-to" type="email" multiple placeholder="recipient@example.com, another@example.com">
+    <div style="position:relative;margin-top:8px">
+      <input id="cp-to-search" placeholder="Search shuls, stores, applicants, or staff to add…">
+    </div>
     <label>Subject <span class="req">*</span></label><input id="cp-subject">
     <label>Body <span class="req">*</span></label><div id="cp-body-rte"></div>
   `;
@@ -175,13 +180,62 @@ qs('#btn-compose').addEventListener('click', async () => {
     qs('#cp-subject').value = t ? t.subject : '';
     composeEditor.setHtml(t ? t.body_html : '');
   });
+  attachRecipientSearch();
 });
+// Type-ahead over /emails/recipients/search — picking a result appends its
+// email to the To field (comma-separated, deduped against what's already
+// there) rather than replacing it, so multiple recipients can be built up
+// one search at a time alongside typing addresses in by hand.
+function attachRecipientSearch() {
+  const input = qs('#cp-to-search');
+  const wrap = input.parentElement;
+  let dropdown = null, debounceTimer = null, requestId = 0;
+  function closeDropdown() { dropdown?.remove(); dropdown = null; }
+  function renderResults(recipients) {
+    closeDropdown();
+    if (!recipients.length) return;
+    dropdown = document.createElement('div');
+    dropdown.className = 'places-dropdown';
+    for (const r of recipients) {
+      const item = document.createElement('div');
+      item.className = 'places-dropdown-item';
+      item.textContent = `${r.label} — ${r.email} (${RECIPIENT_TYPE_LABEL[r.type] || r.type})`;
+      item.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        const toEl = qs('#cp-to');
+        const current = toEl.value.split(',').map(s => s.trim()).filter(Boolean);
+        if (!current.some(a => a.toLowerCase() === r.email.toLowerCase())) current.push(r.email);
+        toEl.value = current.join(', ');
+        input.value = '';
+        closeDropdown();
+      });
+      dropdown.appendChild(item);
+    }
+    wrap.appendChild(dropdown);
+  }
+  input.addEventListener('input', () => {
+    clearTimeout(debounceTimer);
+    const q = input.value.trim();
+    if (q.length < 2) { closeDropdown(); return; }
+    const thisRequest = ++requestId;
+    debounceTimer = setTimeout(async () => {
+      try {
+        const { recipients } = await api(`/emails/recipients/search?q=${encodeURIComponent(q)}`);
+        if (thisRequest === requestId) renderResults(recipients);
+      } catch { /* leave dropdown closed on a failed lookup */ }
+    }, 250);
+  });
+  input.addEventListener('blur', () => setTimeout(closeDropdown, 150));
+}
 window.sendComposedEmail = async () => {
   const to = qs('#cp-to').value.trim(), subject = qs('#cp-subject').value.trim(), body_html = composeEditor.getHtml();
   if (!to || !subject || !body_html) return toast('To, subject, and body are required', true);
   try {
     const r = await api('/emails/send', { method: 'POST', body: { to, subject, body_html } });
-    toast(r.emailError ? `Could not send: ${r.emailError}` : 'Email sent', !!r.emailError);
+    const msg = r.failed
+      ? `Sent ${r.sent}, failed ${r.failed}: ${r.results.filter(x => x.emailError).map(x => `${x.to} — ${x.emailError}`).join('; ')}`
+      : (r.sent > 1 ? `Sent to ${r.sent} recipients` : 'Email sent');
+    toast(msg, !!r.failed);
     closeModal(); loadSent();
   } catch (err) { toast(err.message, true); }
 };

@@ -9,6 +9,8 @@ import { findAccountByEmail } from '../utils/contactLookup.js';
 const router = Router();
 router.use(auth, requirePermission('emails')); // internal team feature — staff/org_admin/super_admin only
 
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 // ============================= Sent email log =============================
 router.get('/', (req, res) => {
   const { search, status, page = 1, pageSize = 50 } = req.query;
@@ -82,17 +84,63 @@ router.delete('/templates/:id', requirePermission('emails', 'can_edit'), (req, r
 });
 
 // ============================= Compose & send =============================
+// Every contact type this org tracks that could plausibly have an email —
+// powers the Compose modal's recipient search (type a name or partial
+// email, pick from the results) instead of needing every address memorized
+// or copy-pasted in from elsewhere. Only rows with a real email on file are
+// worth returning; capped since this is a type-ahead, not a directory
+// browse.
+router.get('/recipients/search', (req, res) => {
+  const q = String(req.query.q || '').trim();
+  if (q.length < 2) return res.json({ recipients: [] });
+  const like = `%${q}%`;
+  const recipients = [];
+  const shuls = db.prepare(`SELECT id, name_en, gabai_email FROM shuls
+      WHERE org_id = ? AND gabai_email != '' AND (name_en LIKE ? OR gabai_email LIKE ?)
+      ORDER BY name_en LIMIT 8`).all(req.user.org_id, like, like);
+  for (const s of shuls) recipients.push({ type: 'shul', id: s.id, label: s.name_en, email: s.gabai_email });
+  const stores = db.prepare(`SELECT id, name, owner_email, manager_email FROM stores
+      WHERE org_id = ? AND (owner_email != '' OR manager_email != '') AND (name LIKE ? OR owner_email LIKE ? OR manager_email LIKE ?)
+      ORDER BY name LIMIT 8`).all(req.user.org_id, like, like, like);
+  for (const s of stores) {
+    if (s.owner_email) recipients.push({ type: 'store', id: s.id, label: `${s.name} (Owner)`, email: s.owner_email });
+    if (s.manager_email && s.manager_email !== s.owner_email) recipients.push({ type: 'store', id: s.id, label: `${s.name} (Manager)`, email: s.manager_email });
+  }
+  const applicants = db.prepare(`SELECT id, first_name, last_name, email FROM applicants
+      WHERE org_id = ? AND email != '' AND ((first_name || ' ' || last_name) LIKE ? OR email LIKE ?)
+      ORDER BY last_name LIMIT 8`).all(req.user.org_id, like, like);
+  for (const a of applicants) recipients.push({ type: 'applicant', id: a.id, label: `${a.first_name} ${a.last_name}`, email: a.email });
+  const users = db.prepare(`SELECT id, first_name, last_name, email FROM users
+      WHERE org_id = ? AND email != '' AND ((first_name || ' ' || last_name) LIKE ? OR email LIKE ?)
+      ORDER BY last_name LIMIT 8`).all(req.user.org_id, like, like);
+  for (const u of users) recipients.push({ type: 'user', id: u.id, label: `${u.first_name} ${u.last_name}`, email: u.email });
+  res.json({ recipients: recipients.slice(0, 20) });
+});
+
 // The "Email Builder" send action — an arbitrary one-off (or templated)
-// email to any recipient, distinct from the system's automatic emails.
+// email to any recipient(s), distinct from the system's automatic emails.
 // {{variable}} placeholders in the template are substituted from `variables`.
+// `to` accepts a comma-separated list — each address gets its own
+// individual send (and its own emails_sent log row), same as composing and
+// sending the same email to each person one at a time, rather than one
+// email exposing every recipient's address to each other in the To field.
 router.post('/send', requirePermission('emails', 'can_edit'), async (req, res) => {
   const { to, subject, body_html, variables } = req.body || {};
   if (!to || !subject || !body_html) return res.status(400).json({ error: 'to, subject, and body_html are required' });
+  const recipients = [...new Set(String(to).split(',').map(s => s.trim()).filter(Boolean))];
+  if (!recipients.length) return res.status(400).json({ error: 'At least one recipient is required' });
+  const invalid = recipients.filter(r => !EMAIL_RE.test(r));
+  if (invalid.length) return res.status(400).json({ error: `Not a valid email address: ${invalid.join(', ')}` });
   const substitute = (text) => String(text).replace(/\{\{(\w+)\}\}/g, (m, key) => (variables && variables[key] != null ? variables[key] : m));
   const finalSubject = substitute(subject);
   const finalBody = substitute(body_html);
-  const { emailError } = await sendMailChecked(req.user.org_id, to, finalSubject, finalBody, { sentBy: req.user.id });
-  res.json({ ok: !emailError, emailError });
+  const results = [];
+  for (const recipient of recipients) {
+    const { emailError } = await sendMailChecked(req.user.org_id, recipient, finalSubject, finalBody, { sentBy: req.user.id });
+    results.push({ to: recipient, emailError });
+  }
+  const failed = results.filter(r => r.emailError);
+  res.json({ ok: !failed.length, sent: results.length - failed.length, failed: failed.length, results });
 });
 
 export default router;
