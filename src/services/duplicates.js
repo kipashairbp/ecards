@@ -65,20 +65,49 @@ const fullAddress = (a) => norm([a.address, a.city, a.state, a.zip].filter(Boole
 // positive worth catching; an applicant legitimately reapplies fresh every
 // season (a new row each time), so matching last season's version of the
 // same person is expected, normal behavior, not a duplicate.
-export function checkApplicantDuplicate(orgId, applicant) {
+// Every field-based reason `a` currently matches candidate `c` on, in the
+// same priority order the old single-reason version used to short-circuit
+// on — kept as an ordered list (not just a boolean) so checkApplicantDuplicate
+// below can report "reasonsNow[0]" for plain creation-time checks (identical
+// behavior to before) while also being able to diff the full set against a
+// prior state for the continuous re-check case.
+function matchReasons(a, aAddress, c) {
+  const reasons = [];
+  const sameName = norm(a.first_name) && norm(a.last_name) && norm(c.first_name) === norm(a.first_name) && norm(c.last_name) === norm(a.last_name);
+  if (sameName) reasons.push('Same first and last name');
+  if (a.home_phone && norm(c.home_phone) === norm(a.home_phone)) reasons.push('Same home phone number');
+  if (a.husband_cell && norm(c.husband_cell) === norm(a.husband_cell)) reasons.push('Same husband cell number');
+  if (a.wife_cell && norm(c.wife_cell) === norm(a.wife_cell)) reasons.push('Same wife cell number');
+  if (a.email && norm(c.email) === norm(a.email)) reasons.push('Same email address');
+  if (a.address && aAddress === fullAddress(c)) reasons.push('Same address');
+  return reasons;
+}
+// previousApplicant (optional): the record's own field values immediately
+// before whatever save is being checked — passed by callers that re-check
+// on every edit (not just first-time creation), so a match caused ENTIRELY
+// by data that was already there on both sides before this save doesn't
+// get re-flagged; only a reason that wasn't already true against this same
+// candidate counts as new. Omitted (or null) for a genuinely new record —
+// nothing "already existed" for it, so every match is new by definition,
+// same as the original one-time creation-only check.
+export function checkApplicantDuplicate(orgId, applicant, previousApplicant) {
   const candidates = db.prepare(`SELECT * FROM applicants WHERE org_id = ? AND season_id = ? AND id != ?`).all(orgId, applicant.season_id, applicant.id);
   const applicantAddress = fullAddress(applicant);
+  const previousAddress = previousApplicant ? fullAddress(previousApplicant) : null;
   for (const c of candidates) {
-    let reason = null;
-    const sameName = norm(applicant.first_name) && norm(applicant.last_name)
-      && norm(c.first_name) === norm(applicant.first_name) && norm(c.last_name) === norm(applicant.last_name);
-    if (sameName) reason = 'Same first and last name';
-    else if (applicant.home_phone && norm(c.home_phone) === norm(applicant.home_phone)) reason = 'Same home phone number';
-    else if (applicant.husband_cell && norm(c.husband_cell) === norm(applicant.husband_cell)) reason = 'Same husband cell number';
-    else if (applicant.wife_cell && norm(c.wife_cell) === norm(applicant.wife_cell)) reason = 'Same wife cell number';
-    else if (applicant.email && norm(c.email) === norm(applicant.email)) reason = 'Same email address';
-    else if (applicant.address && applicantAddress === fullAddress(c)) reason = 'Same address';
-    if (reason) return { matchedId: c.id, reason };
+    // Already confirmed the same real person (see mergeApplicants) — a
+    // later edit to either one's own fields shouldn't re-flag a pair
+    // that's already been resolved as one identity.
+    if (applicant.merge_group_id && c.merge_group_id === applicant.merge_group_id) continue;
+    const reasonsNow = matchReasons(applicant, applicantAddress, c);
+    if (!reasonsNow.length) continue;
+    if (previousApplicant) {
+      const reasonsBefore = new Set(matchReasons(previousApplicant, previousAddress, c));
+      const newReasons = reasonsNow.filter(r => !reasonsBefore.has(r));
+      if (!newReasons.length) continue;
+      return { matchedId: c.id, reason: newReasons[0] };
+    }
+    return { matchedId: c.id, reason: reasonsNow[0] };
   }
   return null;
 }
@@ -86,10 +115,21 @@ export function checkApplicantDuplicate(orgId, applicant) {
 // Runs the appropriate check, and if found: flags it, pauses both accounts, returns the flag row.
 // If not found: returns null and leaves the record active. excludeIds (shul only,
 // see checkShulDuplicate) lets a caller rule out a record known to be the same
-// entity on purpose, like carry-forward's own source shul.
-export function detectAndFlag(orgId, entityType, entity, excludeIds = []) {
-  const match = entityType === 'shul' ? checkShulDuplicate(orgId, entity, excludeIds) : checkApplicantDuplicate(orgId, entity);
+// entity on purpose, like carry-forward's own source shul. previousEntity
+// (applicant only) is the record's own pre-save state — see
+// checkApplicantDuplicate's matching comment — passed by callers that
+// re-check on every edit rather than just at first-time creation.
+export function detectAndFlag(orgId, entityType, entity, excludeIds = [], previousEntity) {
+  const match = entityType === 'shul' ? checkShulDuplicate(orgId, entity, excludeIds) : checkApplicantDuplicate(orgId, entity, previousEntity);
   if (!match) return null;
+  // Never stack a second open flag on the same pair — an edit that
+  // introduces one newly-matching field on top of an already-open flag
+  // (from an earlier, different reason) doesn't need its own separate row;
+  // there's already one sitting there for an admin to resolve.
+  const existingOpen = db.prepare(`SELECT * FROM duplicate_flags WHERE org_id = ? AND entity_type = ? AND status = 'open'
+      AND ((entity_id = ? AND matched_entity_id = ?) OR (entity_id = ? AND matched_entity_id = ?))`)
+    .get(orgId, entityType, entity.id, match.matchedId, match.matchedId, entity.id);
+  if (existingOpen) return existingOpen;
   const id = uuid();
   db.prepare(`INSERT INTO duplicate_flags (id, org_id, entity_type, entity_id, matched_entity_id, reason, status)
     VALUES (?,?,?,?,?,?,'open')`).run(id, orgId, entityType, entity.id, match.matchedId, match.reason);

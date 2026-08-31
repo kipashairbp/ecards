@@ -508,6 +508,15 @@ router.put('/:id', requirePermission('applicants', 'can_edit'), async (req, res)
       Object.fromEntries(sets.map(f => [f, applicant[f]])), Object.fromEntries(sets.map((f, i) => [f, vals[i]])), req.ip);
   }
   const updated = db.prepare('SELECT * FROM applicants WHERE id = ?').get(applicant.id);
+  // Re-check for duplicates on every edit, not just at first submission —
+  // but only flags a NEW match: passing `applicant` (this record's own
+  // pre-edit state) lets checkApplicantDuplicate tell "this field already
+  // matched someone before this save" (skip — not a new problem) apart
+  // from "this field didn't match before, but does now" (flag — the edit
+  // itself is what surfaced it). A field that was never touched this save
+  // can't be the cause of a new match either way, so this never re-flags
+  // stale data that was already sitting there matching on both sides.
+  if (sets.length) detectAndFlag(req.user.org_id, 'applicant', updated, [], applicant);
   // Push the current info to disccardpromos on every save, not just at
   // approval — only meaningful once a customer already exists there
   // (provider_account_id is set the first time they're approved); nothing
@@ -1264,6 +1273,12 @@ router.post('/import', requirePermission('applicants', 'can_edit'), upload.singl
           db.prepare(`UPDATE applicants SET ${sets.map(f => `${f}=?`).join(',')}, updated_at=datetime('now') WHERE id=?`).run(...vals, existing.id);
           updatedIds.push(existing.id); updatedNames.push(`${existing.first_name} ${existing.last_name}`.trim());
           updatedDiffs.push({ id: existing.id, before: Object.fromEntries(sets.map(f => [f, existing[f]])) });
+          // Same "only flag what the edit itself newly caused" re-check as
+          // PUT /:id — a re-uploaded sheet is just as much an edit as
+          // typing into the form, and shouldn't re-flag a match that was
+          // already sitting there on both sides before this row was
+          // updated.
+          detectAndFlag(req.user.org_id, 'applicant', db.prepare('SELECT * FROM applicants WHERE id = ?').get(existing.id), [], existing);
         }
         updated++;
       } catch (e) {
