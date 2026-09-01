@@ -302,7 +302,7 @@ router.get('/:id', (req, res) => {
   // Internal-only, not a configurable hidden field — a shul should never
   // even know this column exists, same boundary as shul_notes' contents
   // being an admin-facing thing (the shul just never has a UI for this one).
-  if (req.user.role === 'shul') { delete shulOut.permanent_comments; delete shulOut.min_contribution_default; }
+  if (req.user.role === 'shul') { delete shulOut.permanent_comments; delete shulOut.min_contribution_default; delete shulOut.needs_follow_up_call; delete shulOut.comments; }
   // What the live shul application form would still consider missing on
   // this exact row — same schema-driven check the public apply form and
   // admin approval already use (see #147: a shul carried into a new season
@@ -572,7 +572,7 @@ router.put('/:id', (req, res) => {
   if (b.gabai_cell !== undefined) b.gabai_cell = normalizePhone(b.gabai_cell);
   if (!isValidPhone(b.ruv_phone)) return res.status(400).json({ error: 'Rav Phone Number must be a valid phone number (10 digits, or 11 digits starting with 1)' });
   if (!isValidPhone(b.gabai_cell)) return res.status(400).json({ error: 'Gabai Cell Number must be a valid phone number (10 digits, or 11 digits starting with 1)' });
-  const fields = isSelf ? SHUL_SELF_EDITABLE_FIELDS : [...SHUL_SELF_EDITABLE_FIELDS, 'slots_allocated', 'permanent_comments', 'min_contribution_default'];
+  const fields = isSelf ? SHUL_SELF_EDITABLE_FIELDS : [...SHUL_SELF_EDITABLE_FIELDS, 'slots_allocated', 'permanent_comments', 'min_contribution_default', 'needs_follow_up_call', 'comments'];
   const sets = fields.filter(f => b[f] !== undefined);
   if (sets.length) {
     db.prepare(`UPDATE shuls SET ${sets.map(f => `${f}=?`).join(',')}, updated_at=datetime('now') WHERE id=?`).run(...sets.map(f => b[f]), shul.id);
@@ -612,7 +612,7 @@ router.put('/:id', (req, res) => {
     }
   }
   const shulOut = { ...updated };
-  if (isSelf) delete shulOut.permanent_comments;
+  if (isSelf) { delete shulOut.permanent_comments; delete shulOut.needs_follow_up_call; delete shulOut.comments; }
   const missingInfo = shulInfoErrors(updated);
   res.json({ shul: shulOut, missingInfo });
 });

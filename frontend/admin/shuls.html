@@ -92,8 +92,13 @@ const SHUL_COLUMNS = [
   { key: 'slots_allocated', label: 'Slots', sort: 'slots_allocated', render: s => s.slots_allocated ?? 0 },
   { key: 'applicant_count', label: 'Applicants', render: s => s.applicant_count },
   { key: 'created_at', label: 'Submitted', sort: 'created_at', render: s => fmtDate(s.created_at) },
+  // Internal, admin-only, and specific to this season (see src/db.js) —
+  // editable right here so a quick note doesn't require opening the detail
+  // popup. Saves on blur; event.stopPropagation() keeps a click into the
+  // input from also opening the row's detail popup.
+  { key: 'comments', label: 'Seasonal Comments', render: s => `<input type="text" class="inline-comments" value="${esc(s.comments||'')}" data-orig="${esc(s.comments||'')}" placeholder="—" onclick="event.stopPropagation()" onblur="saveShulComments('${s.id}', this)" onkeydown="if(event.key==='Enter') this.blur()">` },
 ];
-const DEFAULT_SHUL_COLUMNS = ['name','state_city','rav','gabai','status','slots_allocated','applicant_count','created_at'];
+const DEFAULT_SHUL_COLUMNS = ['name','state_city','rav','gabai','status','slots_allocated','applicant_count','comments','created_at'];
 let activeColumns = DEFAULT_SHUL_COLUMNS;
 
 function renderThead() {
@@ -159,6 +164,18 @@ function onCheck(e) {
   qs('#btn-mass-apply').textContent = `Apply to Selected (${selected.size})`;
   qs('#btn-mass-apply').disabled = selected.size === 0;
 }
+
+// Inline save for the Seasonal Comments column — skips the round-trip if
+// nothing actually changed (every blur fires this, not just an edit), and
+// updates data-orig on success so the next blur's comparison is against
+// the saved value, not the page-load one.
+window.saveShulComments = async (id, input) => {
+  if (input.value === input.dataset.orig) return;
+  try {
+    await api(`/shuls/${id}`, { method: 'PUT', body: { comments: input.value } });
+    input.dataset.orig = input.value;
+  } catch (err) { toast(err.message, true); input.value = input.dataset.orig; }
+};
 
 qs('#f-search').addEventListener('input', debounce(() => { state.search = qs('#f-search').value; state.page = 1; load(); }, 350));
 qs('#f-status').addEventListener('change', () => { state.status = qs('#f-status').value; state.page = 1; load(); });
@@ -351,6 +368,7 @@ async function openShul(id) {
         <div class="divider"></div>
         <label>Permanent Comments (internal — carries forward to future seasons)</label>
         <textarea id="e-permanent_comments" rows="3">${esc(shul.permanent_comments||'')}</textarea>
+        <div class="checkbox-row" style="margin-top:12px"><input type="checkbox" id="e-needs_follow_up_call" ${shul.needs_follow_up_call ? 'checked' : ''}><label style="margin:0" for="e-needs_follow_up_call">Needs follow up call?</label></div>
         ${flags.length ? `<div class="divider"></div><div style="color:var(--danger)"><strong>&#9888; Duplicate flag open.</strong> Resolve from the Shuls > Duplicates review.</div>` : ''}
       </div>
       <div id="tab-notes" style="display:none">
@@ -404,6 +422,7 @@ window.saveShul = async (id) => {
   body.slots_allocated = +qs('#e-slots_allocated').value;
   const minContrib = qs('#e-min_contribution_default').value;
   body.min_contribution_default = minContrib === '' ? null : +minContrib;
+  body.needs_follow_up_call = qs('#e-needs_follow_up_call').checked ? 1 : 0;
   try { await api(`/shuls/${id}`, { method: 'PUT', body }); toast('Saved'); closeModal(); load(); } catch (err) { toast(err.message, true); }
 };
 window.addShulNote = async (id) => {

@@ -728,6 +728,17 @@ safeAlter(`ALTER TABLE documents ADD COLUMN fields_json TEXT`);
 // while the record is actually soft-rejected.
 safeAlter(`ALTER TABLE applicants ADD COLUMN previous_shul_id TEXT REFERENCES shuls(id)`);
 
+// Internal-only admin flag, same visibility boundary as permanent_comments
+// — a shul is never shown this or told it exists.
+safeAlter(`ALTER TABLE shuls ADD COLUMN needs_follow_up_call INTEGER DEFAULT 0`);
+
+// Seasonal comments — internal, admin-only, and specific to THIS shul row
+// (one row per season), unlike permanent_comments which is deliberately
+// copied forward on carry-forward. A new season's carried-forward shul row
+// starts with this blank on purpose — last season's note doesn't
+// automatically apply to the new one.
+safeAlter(`ALTER TABLE shuls ADD COLUMN comments TEXT`);
+
 // One-time normalization of pre-existing phone numbers to the canonical
 // 123-456-7890 display format (see utils/phone.js). Cheap and idempotent —
 // re-running it on already-normalized numbers is a no-op — so it's safe to
