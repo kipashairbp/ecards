@@ -286,7 +286,26 @@ router.get('/export', requirePermission('shuls', 'can_export'), (req, res) => {
     params.push(like, like, like, like, like, like, like, like, like, like, like, like, like, like, like, like, like, like);
   }
   const rows = db.prepare(`SELECT * FROM shuls ${where} ORDER BY created_at DESC`).all(...params);
-  sendXlsx(res, `shuls-${Date.now()}.xlsx`, redact(rows, req.permission.hidden_fields));
+  // Per-shul applicant counts by status — one grouped query across every
+  // exported shul rather than N+1 per-row queries. Only approved/pending/
+  // rejected are broken out (what an admin actually wants to see at a
+  // glance in the export); anything else (draft, soft_rejected, incomplete)
+  // isn't a real submission yet and stays uncounted here, same as the
+  // "Accepted So Far" season stat elsewhere in this app.
+  const counts = {};
+  if (rows.length) {
+    const ids = rows.map(r => r.id);
+    const placeholders = ids.map(() => '?').join(',');
+    db.prepare(`SELECT shul_id, approval_status, COUNT(*) c FROM applicants WHERE shul_id IN (${placeholders}) AND approval_status IN ('approved','pending','rejected') GROUP BY shul_id, approval_status`)
+      .all(...ids).forEach(r => { (counts[r.shul_id] ||= {})[r.approval_status] = r.c; });
+  }
+  const withCounts = rows.map(r => ({
+    ...r,
+    applicants_approved: counts[r.id]?.approved || 0,
+    applicants_pending: counts[r.id]?.pending || 0,
+    applicants_rejected: counts[r.id]?.rejected || 0,
+  }));
+  sendXlsx(res, `shuls-${Date.now()}.xlsx`, redact(withCounts, req.permission.hidden_fields));
 });
 
 router.get('/:id', (req, res) => {
@@ -1067,9 +1086,9 @@ router.get('/duplicates/:flagId/group', requireAdmin, (req, res) => {
 router.post('/duplicates/:flagId/merge', requirePermission('shuls', 'can_edit'), (req, res) => {
   const flag = db.prepare(`SELECT * FROM duplicate_flags WHERE id = ? AND org_id = ? AND entity_type='shul'`).get(req.params.flagId, req.user.org_id);
   if (!flag) return res.status(404).json({ error: 'Not found' });
-  const { primaryId, values } = req.body || {};
+  const { primaryId, values, memberIds } = req.body || {};
   try {
-    const result = mergeShuls(req.user.org_id, req.user.id, { primaryId, values });
+    const result = mergeShuls(req.user.org_id, req.user.id, { primaryId, values, memberIds });
     logAudit(req.user.org_id, req.user.id, 'merge', 'shul', primaryId, null, result, req.ip);
     res.json(result);
   } catch (e) { res.status(400).json({ error: e.message }); }

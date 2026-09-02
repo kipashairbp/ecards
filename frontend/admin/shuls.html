@@ -39,6 +39,8 @@ renderShell('/admin/shuls', `
       <option value="pause">Pause</option>
       <option value="unpause">Unpause</option>
       <option value="carry-forward">Carry Forward to Season…</option>
+      <option value="email">Email</option>
+      <option value="sms">SMS</option>
       <option value="delete">Delete Permanently</option>
     </select>
     <button class="btn btn-sm btn-primary" id="btn-mass-apply" disabled>Apply to Selected (0)</button>
@@ -97,8 +99,11 @@ const SHUL_COLUMNS = [
   // popup. Saves on blur; event.stopPropagation() keeps a click into the
   // input from also opening the row's detail popup.
   { key: 'comments', label: 'Seasonal Comments', render: s => `<input type="text" class="inline-comments" value="${esc(s.comments||'')}" data-orig="${esc(s.comments||'')}" placeholder="—" onclick="event.stopPropagation()" onblur="saveShulComments('${s.id}', this)" onkeydown="if(event.key==='Enter') this.blur()">` },
+  // Same internal, admin-only, per-season boundary as Seasonal Comments —
+  // saves immediately on toggle, no separate Save step.
+  { key: 'follow_up', label: 'Follow Up?', render: s => `<input type="checkbox" ${s.needs_follow_up_call ? 'checked' : ''} onclick="event.stopPropagation()" onchange="saveShulFollowUp('${s.id}', this.checked)">` },
 ];
-const DEFAULT_SHUL_COLUMNS = ['name','state_city','rav','gabai','status','slots_allocated','applicant_count','comments','created_at'];
+const DEFAULT_SHUL_COLUMNS = ['name','state_city','rav','gabai','status','slots_allocated','applicant_count','comments','follow_up','created_at'];
 let activeColumns = DEFAULT_SHUL_COLUMNS;
 
 function renderThead() {
@@ -176,6 +181,10 @@ window.saveShulComments = async (id, input) => {
     input.dataset.orig = input.value;
   } catch (err) { toast(err.message, true); input.value = input.dataset.orig; }
 };
+window.saveShulFollowUp = async (id, checked) => {
+  try { await api(`/shuls/${id}`, { method: 'PUT', body: { needs_follow_up_call: checked ? 1 : 0 } }); }
+  catch (err) { toast(err.message, true); }
+};
 
 qs('#f-search').addEventListener('input', debounce(() => { state.search = qs('#f-search').value; state.page = 1; load(); }, 350));
 qs('#f-status').addEventListener('change', () => { state.status = qs('#f-status').value; state.page = 1; load(); });
@@ -248,6 +257,16 @@ const MASS_ACTIONS = {
       if (r.duplicatesFlagged) msg += ` — ${r.duplicatesFlagged} flagged as possible duplicate(s)`;
       return { msg, isError: !!r.duplicatesFlagged };
     },
+  },
+  email: {
+    confirm: null,
+    run: (ids) => openMassMessageModal('shul', 'email', ids),
+    summarize: r => ({ msg: `Sent to ${r.sent} of ${r.total} recipient(s)${r.failed ? `, ${r.failed} failed` : ''}`, isError: !!r.failed && r.sent === 0 }),
+  },
+  sms: {
+    confirm: null,
+    run: (ids) => openMassMessageModal('shul', 'sms', ids),
+    summarize: r => ({ msg: `Sent to ${r.sent} of ${r.total} recipient(s)${r.failed ? `, ${r.failed} failed` : ''}`, isError: !!r.failed && r.sent === 0 }),
   },
 };
 
@@ -368,7 +387,6 @@ async function openShul(id) {
         <div class="divider"></div>
         <label>Permanent Comments (internal — carries forward to future seasons)</label>
         <textarea id="e-permanent_comments" rows="3">${esc(shul.permanent_comments||'')}</textarea>
-        <div class="checkbox-row" style="margin-top:12px"><input type="checkbox" id="e-needs_follow_up_call" ${shul.needs_follow_up_call ? 'checked' : ''}><label style="margin:0" for="e-needs_follow_up_call">Needs follow up call?</label></div>
         ${flags.length ? `<div class="divider"></div><div style="color:var(--danger)"><strong>&#9888; Duplicate flag open.</strong> Resolve from the Shuls > Duplicates review.</div>` : ''}
       </div>
       <div id="tab-notes" style="display:none">
@@ -422,7 +440,6 @@ window.saveShul = async (id) => {
   body.slots_allocated = +qs('#e-slots_allocated').value;
   const minContrib = qs('#e-min_contribution_default').value;
   body.min_contribution_default = minContrib === '' ? null : +minContrib;
-  body.needs_follow_up_call = qs('#e-needs_follow_up_call').checked ? 1 : 0;
   try { await api(`/shuls/${id}`, { method: 'PUT', body }); toast('Saved'); closeModal(); load(); } catch (err) { toast(err.message, true); }
 };
 window.addShulNote = async (id) => {
@@ -623,7 +640,13 @@ window.resolveDup = async (id, action) => { try { await api(`/shuls/duplicates/$
 // getShulMergeGroupIds server-side) — always fetches the full connected
 // group, not just the two entities the flag itself names.
 let shulMergeGroupCache = null;
+// Which of this group's members are excluded from the CURRENT merge pass —
+// same idea as applicants' dismissedMemberIds: reset per group, dismissing
+// a member never touches its duplicate flag or status on the backend, it
+// just leaves that record out of the merge this view submits.
+let dismissedShulMemberIds = new Set();
 window.openMergeView = async (flagId) => {
+  dismissedShulMemberIds = new Set();
   try {
     const group = await api(`/shuls/duplicates/${flagId}/group`);
     shulMergeGroupCache = group;
@@ -631,11 +654,13 @@ window.openMergeView = async (flagId) => {
   } catch (err) { toast(err.message, true); }
 };
 function renderShulMergeView() {
-  const { flag, members } = shulMergeGroupCache;
+  const { flag, members: allMembers } = shulMergeGroupCache;
+  const members = allMembers.filter(m => !dismissedShulMemberIds.has(m.id));
   const cols = members.map((m, i) => `<th style="min-width:180px">
       <div class="checkbox-row" style="margin-bottom:4px"><input type="radio" name="shul-merge-primary" value="${esc(m.id)}" id="smp-${i}" ${i===0?'checked':''}>
         <label for="smp-${i}" style="margin:0"><strong>${esc(m.name_en)}</strong></label></div>
       <span class="small-muted">${esc(m.status)}${m.applicant_count!=null?` · ${m.applicant_count} applicant(s)`:''}</span>
+      ${members.length > 2 ? `<div style="margin-top:4px"><button type="button" class="btn btn-sm btn-outline" onclick="dismissShulMergeMember('${m.id}')" title="Leave this one out of this merge — still stays flagged as a duplicate for later">Dismiss</button></div>` : ''}
     </th>`).join('');
   const rows = SHUL_MERGE_FIELDS.map(([key, label]) => {
     const cells = members.map((m, i) => {
@@ -644,16 +669,22 @@ function renderShulMergeView() {
     }).join('');
     return `<tr><td class="small-muted" style="white-space:nowrap">${esc(label)}</td>${cells}</tr>`;
   }).join('');
+  const dismissedCount = allMembers.length - members.length;
   const body = `
-    <p class="small-muted">Reason flagged: ${esc(flag.reason)}. ${members.length > 2 ? `This is a group of ${members.length} records.` : ''}
+    <p class="small-muted">Reason flagged: ${esc(flag.reason)}. ${allMembers.length > 2 ? `This is a group of ${allMembers.length} records.` : ''}
     Pick which record is <strong>Primary</strong> (that's the one that keeps going forward) — every other member's applicants (in the primary's season) move onto it, and it's never deleted, just marked merged. Then pick which value to keep for each field — you can mix and match from any record.</p>
+    ${dismissedCount ? `<p class="small-muted">${dismissedCount} record${dismissedCount>1?'s':''} left out of this merge — still flagged as a duplicate, unchanged. <button type="button" class="btn btn-sm btn-outline" onclick="dismissedShulMemberIds.clear();renderShulMergeView()">Show all again</button></p>` : ''}
     <div style="overflow-x:auto"><table><thead><tr><th></th>${cols}</tr></thead><tbody>${rows}</tbody></table></div>
   `;
   const footer = `<button class="btn btn-outline btn-sm" onclick="showDuplicates()">Back to List</button>
     <button class="btn btn-outline btn-sm" onclick="resolveDup('${flag.id}','bypass')">Bypass (not a duplicate)</button>
-    <button class="btn btn-primary btn-sm" onclick="submitShulMerge('${flag.id}')">Merge &amp; Resolve</button>`;
+    <button class="btn btn-primary btn-sm" onclick="submitShulMerge('${flag.id}')">Merge &amp; Resolve${dismissedCount ? ` (${members.length} of ${allMembers.length})` : ''}</button>`;
   openModal('Compare & Merge Shuls', body, footer);
 }
+window.dismissShulMergeMember = (id) => {
+  dismissedShulMemberIds.add(id);
+  renderShulMergeView();
+};
 window.submitShulMerge = async (flagId) => {
   const primaryId = qs('input[name="shul-merge-primary"]:checked')?.value;
   if (!primaryId) return toast('Pick a primary record', true);
@@ -662,8 +693,11 @@ window.submitShulMerge = async (flagId) => {
     const el = qs(`input[name="smf-${key}"]:checked`);
     if (el) values[key] = el.value;
   }
+  // Only the members still shown (not Dismissed) go into this merge — the
+  // backend leaves everyone else, and their flags, exactly as they are.
+  const memberIds = shulMergeGroupCache.members.filter(m => !dismissedShulMemberIds.has(m.id)).map(m => m.id);
   try {
-    const r = await api(`/shuls/duplicates/${flagId}/merge`, { method: 'POST', body: { primaryId, values } });
+    const r = await api(`/shuls/duplicates/${flagId}/merge`, { method: 'POST', body: { primaryId, values, memberIds } });
     toast(`Merged — ${r.applicantsReassigned} applicant(s) moved to the surviving shul`);
     closeModal(); showDuplicates(); load();
   } catch (err) { toast(err.message, true); }
