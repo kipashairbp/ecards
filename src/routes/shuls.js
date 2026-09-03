@@ -5,7 +5,7 @@ import { auth, requireAdmin } from '../middleware/auth.js';
 import { requirePermission, redact } from '../middleware/permissions.js';
 import { detectAndFlag, resolveFlag, getShulMergeGroupIds, mergeShuls } from '../services/duplicates.js';
 import { generateContractPdf, stampSignatureFields, getSignatureFields, resolveSignatureValues } from '../services/pdf.js';
-import { sendMailChecked, renderSystemTemplate, notifyNewSignup, renderSignupDetails } from '../services/mail.js';
+import { sendMailChecked, renderSystemTemplate, notifyNewSignup, notifyDocSigned, renderSignupDetails } from '../services/mail.js';
 import { sendSmsChecked } from '../services/sms.js';
 import { parseSpreadsheet, buildXlsxTemplate, SHUL_IMPORT_COLUMNS } from '../services/importer.js';
 import { sendXlsx } from '../services/xlsx.js';
@@ -206,7 +206,7 @@ router.post('/contract/:token/sign', async (req, res) => {
   db.prepare(`UPDATE shuls SET status='contract_signed', updated_at=datetime('now') WHERE id=?`).run(contract.shul_id);
   const shul = db.prepare('SELECT * FROM shuls WHERE id = ?').get(contract.shul_id);
   logAudit(shul.org_id, null, 'esign', 'contract', contract.id, null, { signer_name, signedAt }, req.ip);
-  await notifyNewSignup(shul.org_id, 'notify_doc_signed_email', 'docSigned', {
+  await notifyDocSigned(shul.org_id, 'shul', {
     docTitle: 'Shul Contract', entityName: shul.name_en || '', signerName: signer_name, signedAt,
     entityUrl: `${process.env.APP_URL || ''}/admin/shuls?id=${shul.id}`,
   });

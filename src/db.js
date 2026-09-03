@@ -739,6 +739,16 @@ safeAlter(`ALTER TABLE shuls ADD COLUMN needs_follow_up_call INTEGER DEFAULT 0`)
 // automatically apply to the new one.
 safeAlter(`ALTER TABLE shuls ADD COLUMN comments TEXT`);
 
+// Disccardpromos account setup — internal, admin-only tracking of getting a
+// store's own disccardpromos merchant account working (separate from
+// has_provider_account, which just records whether they already had one
+// coming in). Not season-specific like shuls' comments/needs_follow_up_call
+// above — a store's disccardpromos setup is a one-time, real-world account
+// that doesn't reset each season, so this deliberately isn't cleared on
+// carry-forward the way those are.
+safeAlter(`ALTER TABLE stores ADD COLUMN disccard_setup_comments TEXT`);
+safeAlter(`ALTER TABLE stores ADD COLUMN disccard_setup_complete INTEGER DEFAULT 0`);
+
 // One-time normalization of pre-existing phone numbers to the canonical
 // 123-456-7890 display format (see utils/phone.js). Cheap and idempotent —
 // re-running it on already-normalized numbers is a no-op — so it's safe to

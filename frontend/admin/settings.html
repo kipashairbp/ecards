@@ -55,8 +55,10 @@ renderShell('/admin/settings', `
     </div>
     <div class="card" style="margin-top:16px">
       <h3>Notify on Document Signed</h3>
-      <p class="small-muted">Optional — when set, an internal email is sent every time any contract or document is e-signed (shul contracts, store agreements, standalone documents). Multiple addresses can be listed, comma-separated. Leave blank to turn off.</p>
-      <label>Notify Emails</label><input id="org-notify_doc_signed_email" placeholder="e.g. office@yourorg.org">
+      <p class="small-muted">Optional — when set, an internal email is sent every time a contract or document is e-signed. Shuls and stores can be routed to different addresses; anything else (applicant/standalone documents) uses the Default field. Each field can list multiple addresses, comma-separated. Leave a field blank to fall back to Default, or leave Default blank too to turn that category off.</p>
+      <label>Notify on Shul Contracts Signed</label><input id="org-notify_doc_signed_shul_email" placeholder="e.g. office@yourorg.org">
+      <label style="margin-top:10px">Notify on Store Agreements Signed</label><input id="org-notify_doc_signed_store_email" placeholder="e.g. stores-team@yourorg.org">
+      <label style="margin-top:10px">Default (applicant/standalone documents, and fallback for the above)</label><input id="org-notify_doc_signed_email" placeholder="e.g. office@yourorg.org">
       <button class="btn btn-sm btn-primary" style="margin-top:14px" onclick="saveDocSignedNotifyEmail()">Save</button>
     </div>
     <div class="card" style="margin-top:16px">
@@ -190,10 +192,16 @@ window.saveNewSignupNotifyEmails = async () => {
 async function loadDocSignedNotifyEmail() {
   const { settings } = await api('/settings');
   qs('#org-notify_doc_signed_email').value = settings.notify_doc_signed_email || '';
+  qs('#org-notify_doc_signed_shul_email').value = settings.notify_doc_signed_shul_email || '';
+  qs('#org-notify_doc_signed_store_email').value = settings.notify_doc_signed_store_email || '';
 }
 window.saveDocSignedNotifyEmail = async () => {
   try {
-    await api('/settings', { method: 'PUT', body: { notify_doc_signed_email: qs('#org-notify_doc_signed_email').value } });
+    await api('/settings', { method: 'PUT', body: {
+      notify_doc_signed_email: qs('#org-notify_doc_signed_email').value,
+      notify_doc_signed_shul_email: qs('#org-notify_doc_signed_shul_email').value,
+      notify_doc_signed_store_email: qs('#org-notify_doc_signed_store_email').value,
+    } });
     toast('Saved');
   } catch (err) { toast(err.message, true); }
 };
