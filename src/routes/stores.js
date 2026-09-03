@@ -328,7 +328,7 @@ async function inviteStoreToPortal(orgId, store, emailOverride, sentBy = null) {
   const email = normalizeEmail(emailOverride || store.owner_email || store.manager_email);
   if (!email) return { error: 'No email on file for this store' };
   let user = db.prepare('SELECT * FROM users WHERE store_id = ?').get(store.id);
-  const emailTaken = db.prepare('SELECT id FROM users WHERE email = ? AND id != ?').get(email, user?.id || '');
+  const emailTaken = db.prepare('SELECT id FROM users WHERE email = ? COLLATE NOCASE AND id != ?').get(email, user?.id || '');
   if (emailTaken) return { error: `${email} is already used by another account. Update the store's contact email or that account first.` };
   const token = uuid();
   const expires = new Date(Date.now() + 14 * 24 * 3600 * 1000).toISOString();
@@ -450,9 +450,15 @@ router.post('/mass-approve', requirePermission('stores', 'can_edit'), async (req
 function ensureStorePortalUser(orgId, store, emailOverride) {
   let user = db.prepare('SELECT * FROM users WHERE store_id = ?').get(store.id);
   if (user) return user;
-  // Same users.email normalization as inviteStoreToPortal above.
+  // Same users.email normalization as inviteStoreToPortal above. COLLATE
+  // NOCASE here too (matching login/forgot-password in auth.js) — without
+  // it, a legacy or otherwise un-normalized row is invisible to this
+  // lookup, so a returning store gets a brand new SECOND account instead
+  // of reusing the one it already has; the owner keeps logging into (and
+  // "successfully" resetting the password on) the old orphaned one while
+  // this function silently repoints a different account going forward.
   const email = normalizeEmail(emailOverride || store.owner_email || store.manager_email);
-  const existing = email ? db.prepare('SELECT * FROM users WHERE org_id = ? AND email = ?').get(orgId, email) : null;
+  const existing = email ? db.prepare('SELECT * FROM users WHERE org_id = ? AND email = ? COLLATE NOCASE').get(orgId, email) : null;
   if (existing) {
     db.prepare('UPDATE users SET store_id = ? WHERE id = ?').run(store.id, existing.id);
     return db.prepare('SELECT * FROM users WHERE id = ?').get(existing.id);
@@ -687,14 +693,12 @@ router.post('/import', requirePermission('stores', 'can_edit'), upload.single('f
   if (!/\.xlsx$/i.test(req.file.originalname || '')) return res.status(400).json({ error: 'Only .xlsx files are accepted (CSV does not reliably support Hebrew text).' });
   const jobId = uuid();
   const rows = parseSpreadsheet(req.file.buffer, req.file.originalname);
-  // Defaults to the newest active season same as everywhere else; season_id
-  // lets an admin target a specific (e.g. older/already-superseded) season
-  // instead — for a one-time backfill import that shouldn't land in
-  // whatever season happens to be current right now.
-  const season = req.body.season_id
-    ? db.prepare('SELECT * FROM seasons WHERE id = ? AND org_id = ?').get(req.body.season_id, req.user.org_id)
-    : db.prepare('SELECT * FROM seasons WHERE org_id = ? AND is_active = 1 ORDER BY created_at DESC LIMIT 1').get(req.user.org_id);
-  if (req.body.season_id && !season) return res.status(400).json({ error: 'Season not found' });
+  // Required, not defaulted — an admin must explicitly pick which season
+  // every row in this upload lands in, rather than silently falling back to
+  // whatever happens to be active right now.
+  if (!req.body.season_id) return res.status(400).json({ error: 'A season is required for a mass upload.' });
+  const season = db.prepare('SELECT * FROM seasons WHERE id = ? AND org_id = ?').get(req.body.season_id, req.user.org_id);
+  if (!season) return res.status(400).json({ error: 'Season not found' });
 
   // Spreadsheet cells arrive as strings ("TRUE"/"1"/"yes"), not real
   // booleans — normalize the two checkbox columns up front so both

@@ -41,8 +41,18 @@ function ensureShulPortalUser(orgId, shul, portalEmailOverride) {
   // gabai_email stays as typed on the shul row (fine for display/mailing),
   // but the users-table copy must be normalized — login lowercases its
   // lookup, so a mixed-case users.email is an account nobody can sign into.
+  // This existing-account lookup has to be COLLATE NOCASE too (matching
+  // login/forgot-password in auth.js): without it, a legacy row that
+  // predates normalizeEmail() being applied everywhere (or a row skipped by
+  // the boot-time backfill because of an unrelated collision) is invisible
+  // to a case-sensitive match here — a returning shul then gets a brand
+  // new SECOND account instead of reusing the one it already has. That
+  // second account is the one this function repoints going forward, while
+  // the gabai keeps logging into (and resetting the password on) the old,
+  // orphaned one — reset would keep "succeeding" against an account that
+  // was never actually theirs to use anymore.
   const email = normalizeEmail(portalEmailOverride || shul.gabai_email);
-  const existing = email ? db.prepare('SELECT * FROM users WHERE org_id = ? AND email = ?').get(orgId, email) : null;
+  const existing = email ? db.prepare('SELECT * FROM users WHERE org_id = ? AND email = ? COLLATE NOCASE').get(orgId, email) : null;
   if (existing) {
     db.prepare('UPDATE users SET shul_id = ? WHERE id = ?').run(shul.id, existing.id);
     return db.prepare('SELECT * FROM users WHERE id = ?').get(existing.id);
@@ -621,7 +631,7 @@ router.put('/:id', (req, res) => {
       // a blank or colliding value can't be synced to anyway, and an
       // admin's edit is exactly the "cut off the old address" case this
       // whole fix exists for.
-      const clash = newEmail ? db.prepare('SELECT id FROM users WHERE email = ? AND id != ?').get(newEmail, portalUser.id) : null;
+      const clash = newEmail ? db.prepare('SELECT id FROM users WHERE email = ? COLLATE NOCASE AND id != ?').get(newEmail, portalUser.id) : null;
       if (isSelf && newEmail && !clash) {
         db.prepare('UPDATE users SET email = ? WHERE id = ?').run(newEmail, portalUser.id);
       } else {
@@ -1124,14 +1134,12 @@ router.post('/import', requirePermission('shuls', 'can_edit'), upload.single('fi
   if (!/\.xlsx$/i.test(req.file.originalname || '')) return res.status(400).json({ error: 'Only .xlsx files are accepted (CSV does not reliably support Hebrew text).' });
   const jobId = uuid();
   const rows = parseSpreadsheet(req.file.buffer, req.file.originalname);
-  // Defaults to the newest active season same as before; season_id lets an
-  // admin target a specific (e.g. older/already-superseded) season instead —
-  // for a one-time backfill import that shouldn't land in whatever season
-  // happens to be current right now.
-  const season = req.body.season_id
-    ? db.prepare('SELECT * FROM seasons WHERE id = ? AND org_id = ?').get(req.body.season_id, req.user.org_id)
-    : db.prepare('SELECT * FROM seasons WHERE org_id = ? AND is_active = 1 ORDER BY created_at DESC LIMIT 1').get(req.user.org_id);
-  if (req.body.season_id && !season) return res.status(400).json({ error: 'Season not found' });
+  // Required, not defaulted — an admin must explicitly pick which season
+  // every row in this upload lands in, rather than silently falling back to
+  // whatever happens to be active right now.
+  if (!req.body.season_id) return res.status(400).json({ error: 'A season is required for a mass upload.' });
+  const season = db.prepare('SELECT * FROM seasons WHERE id = ? AND org_id = ?').get(req.body.season_id, req.user.org_id);
+  if (!season) return res.status(400).json({ error: 'Season not found' });
   const sendContracts = req.body.send_contracts === 'true' || req.body.send_contracts === true;
 
   // A row with a non-blank `id` column that matches an existing shul in
