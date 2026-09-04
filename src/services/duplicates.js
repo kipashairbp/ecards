@@ -90,8 +90,18 @@ function matchReasons(a, aAddress, c) {
 // candidate counts as new. Omitted (or null) for a genuinely new record —
 // nothing "already existed" for it, so every match is new by definition,
 // same as the original one-time creation-only check.
+// 'draft' (shul-portal bulk upload, not yet submitted) and 'incomplete'
+// (carried-forward, awaiting re-enrollment) rows are excluded from the
+// candidate pool entirely — not "real" submissions yet, so they never
+// count as either side of a match: two drafts that happen to share a name
+// don't flag each other, and an already-active applicant never gets
+// flagged just because some unrelated draft shares a field with them. A
+// draft/incomplete row being checked can still match — and get flagged
+// against — a genuinely active (non-draft/incomplete) applicant, since
+// this only narrows the CANDIDATE side, not which row is doing the
+// checking.
 export function checkApplicantDuplicate(orgId, applicant, previousApplicant) {
-  const candidates = db.prepare(`SELECT * FROM applicants WHERE org_id = ? AND season_id = ? AND id != ?`).all(orgId, applicant.season_id, applicant.id);
+  const candidates = db.prepare(`SELECT * FROM applicants WHERE org_id = ? AND season_id = ? AND id != ? AND approval_status NOT IN ('draft', 'incomplete')`).all(orgId, applicant.season_id, applicant.id);
   const applicantAddress = fullAddress(applicant);
   const previousAddress = previousApplicant ? fullAddress(previousApplicant) : null;
   for (const c of candidates) {

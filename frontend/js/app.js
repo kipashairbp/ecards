@@ -106,8 +106,8 @@ async function api(path, { method = 'GET', body, isForm = false } = {}) {
   if (Auth.token()) headers['Authorization'] = `Bearer ${Auth.token()}`;
   if (!isForm) headers['Content-Type'] = 'application/json';
   const res = await fetch(API_BASE + path, { method, headers, body: isForm ? body : (body ? JSON.stringify(body) : undefined) });
-  let data = {};
-  try { data = await res.json(); } catch {}
+  let data = {}, parsed = true;
+  try { data = await res.json(); } catch { parsed = false; }
   // A 401 with no token attached (e.g. a failed /auth/login) is a real
   // credentials/permission error, not a stale session — surface the actual
   // server message instead of forcing a confusing "session expired" logout.
@@ -117,6 +117,16 @@ async function api(path, { method = 'GET', body, isForm = false } = {}) {
   }
   if (res.status === 423) { toast(data.error || 'Account paused', true); throw new Error(data.error); }
   if (!res.ok) { const err = new Error(data.error || `Request failed (${res.status})`); err.data = data; throw err; }
+  // Every route in this app returns a real JSON body on a 2xx response,
+  // never an empty one — getting here with a body that failed to parse
+  // means something between the browser and the server mangled or
+  // truncated a genuinely successful response (a flaky mobile connection,
+  // a proxy hiccup mid-request). Silently returning {} used to let every
+  // call site's blind destructuring (e.g. login.html's `const { user } =
+  // await api(...)`, immediately followed by `user.role`) crash with a
+  // raw, meaningless "undefined is not an object" instead of a real,
+  // actionable message.
+  if (!parsed) throw new Error('Something went wrong loading the response. Please try again.');
   return data;
 }
 
