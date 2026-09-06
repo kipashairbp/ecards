@@ -289,7 +289,74 @@ export function mergeApplicants(orgId, userId, { primaryId, values, memberIds } 
     const fp = flagIds.map(() => '?').join(',');
     db.prepare(`UPDATE duplicate_flags SET status='resolved', resolved_by=?, resolved_at=datetime('now') WHERE id IN (${fp})`).run(userId, ...flagIds);
   }
-  return { primaryId, memberIds: groupIds };
+  // A member that already carries its own disccardpromos account (from
+  // before it was ever recognized as a duplicate) is never touched here —
+  // see reconcileAccountsForGroup below for why that's deliberate.
+  const accountConflicts = reconcileAccountsForGroup(primaryId);
+  return { primaryId, memberIds: groupIds, accountConflicts };
+}
+
+// A merged secondary is only ever supposed to hold the SAME disccardpromos
+// account as its primary (see routes/applicants.js's isMergedSecondary —
+// approval time links it that way going forward). But mergeApplicants above
+// never touches provider_account_id on merge itself, so two cases fall
+// through the cracks:
+//  1. A group merged before an account existed on either side, or where a
+//     secondary just never got re-approved/re-edited since — its row sits
+//     at provider_account_id=NULL forever even though the primary already
+//     has a real account. Safe to just copy the primary's id onto it: it
+//     was never a real distinct disccardpromos customer.
+//  2. A secondary that was independently approved (got its OWN real
+//     disccardpromos account) BEFORE being recognized as a duplicate of
+//     someone else. Overwriting that in our DB wouldn't touch the real
+//     account sitting on disccardpromos' side — it'd just stop us from ever
+//     seeing it again, silently orphaning whatever's on it (possibly
+//     already-loaded funds). That's an admin decision (deactivate/merge the
+//     real accounts on disccardpromos, then re-run), not something to do
+//     silently — returned as a conflict instead of applied.
+// Runs on every merge (folded into mergeApplicants) and is also reusable
+// standalone for a one-time sweep across every merge group that already
+// existed before this reconciliation was added (see routes/applicants.js's
+// POST /reconcile-merged-accounts) — same function, same safety rule,
+// either way it gets invoked.
+export function reconcileAccountsForGroup(primaryId) {
+  const primary = db.prepare('SELECT id, first_name, last_name, provider_account_id FROM applicants WHERE id = ?').get(primaryId);
+  if (!primary?.provider_account_id) return [];
+  const secondaries = db.prepare('SELECT id, first_name, last_name, provider_account_id FROM applicants WHERE merge_group_id = ? AND id != ?').all(primaryId, primaryId);
+  const conflicts = [];
+  for (const s of secondaries) {
+    if (!s.provider_account_id) {
+      db.prepare('UPDATE applicants SET provider_account_id = ? WHERE id = ?').run(primary.provider_account_id, s.id);
+    } else if (s.provider_account_id !== primary.provider_account_id) {
+      conflicts.push({
+        primaryId: primary.id, primaryName: `${primary.first_name} ${primary.last_name}`.trim(), primaryAccountId: primary.provider_account_id,
+        secondaryId: s.id, secondaryName: `${s.first_name} ${s.last_name}`.trim(), secondaryAccountId: s.provider_account_id,
+      });
+    }
+  }
+  return conflicts;
+}
+
+// One-time (or re-runnable) sweep for every merge group in an org — see
+// reconcileAccountsForGroup's comment for what this does per group and why
+// a conflict is reported rather than silently overwritten. seasonId narrows
+// to one season; omit it to sweep every season the org has ever had (old
+// merges predating this reconciliation could be sitting in a past season).
+export function reconcileAllMergedAccounts(orgId, seasonId) {
+  const rows = seasonId
+    ? db.prepare(`SELECT DISTINCT merge_group_id FROM applicants WHERE org_id = ? AND season_id = ? AND merge_group_id IS NOT NULL`).all(orgId, seasonId)
+    : db.prepare(`SELECT DISTINCT merge_group_id FROM applicants WHERE org_id = ? AND merge_group_id IS NOT NULL`).all(orgId);
+  let linked = 0, groupsChecked = 0;
+  const conflicts = [];
+  for (const { merge_group_id } of rows) {
+    const primary = db.prepare('SELECT id, provider_account_id FROM applicants WHERE id = ? AND org_id = ?').get(merge_group_id, orgId);
+    if (!primary) continue;
+    groupsChecked++;
+    const before = db.prepare('SELECT COUNT(*) c FROM applicants WHERE merge_group_id = ? AND id != ? AND provider_account_id IS NULL').get(merge_group_id, merge_group_id).c;
+    conflicts.push(...reconcileAccountsForGroup(merge_group_id));
+    if (primary.provider_account_id) linked += before;
+  }
+  return { groupsChecked, linked, conflicts };
 }
 
 // Same idea as getMergeGroupIds above, but for shuls: chains through open

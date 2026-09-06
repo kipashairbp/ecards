@@ -3,7 +3,7 @@ import multer from 'multer';
 import { db, uuid, DEFAULT_ORG_ID } from '../db.js';
 import { auth, requireAdmin } from '../middleware/auth.js';
 import { requirePermission, redact } from '../middleware/permissions.js';
-import { detectAndFlag, resolveFlag, getMergeGroupIds, mergeApplicants, applicantsSharePhone } from '../services/duplicates.js';
+import { detectAndFlag, resolveFlag, getMergeGroupIds, mergeApplicants, applicantsSharePhone, reconcileAccountsForGroup, reconcileAllMergedAccounts } from '../services/duplicates.js';
 import { sendMailChecked, renderSystemTemplate } from '../services/mail.js';
 import { sendSmsChecked } from '../services/sms.js';
 import * as giftcard from '../services/giftcard.js';
@@ -311,12 +311,39 @@ router.get('/provider-sync-summary', requireAdmin, (req, res) => {
   const rows = db.prepare(`SELECT provider_account_id, provider_exempt FROM applicants WHERE org_id = ? AND season_id = ? AND approval_status = 'approved'`)
     .all(req.user.org_id, seasonId);
   let synced = 0, exempt = 0, missing = 0;
+  const accountIds = new Set();
   for (const r of rows) {
-    if (r.provider_account_id) synced++;
+    if (r.provider_account_id) { synced++; accountIds.add(r.provider_account_id); }
     else if (r.provider_exempt) exempt++;
     else missing++;
   }
-  res.json({ seasonId, approved: rows.length, synced, exempt, missing });
+  // synced counts applicant ROWS with an account — a merged-duplicate group
+  // shares one real disccardpromos account across every member (see
+  // isMergedSecondary), so synced can legitimately run higher than the
+  // actual number of accounts disccardpromos shows. distinctAccounts is the
+  // number that should match their side; a gap between the two here means
+  // some merged group still has a member pointing at a stale/different
+  // account than its primary — see POST /reconcile-merged-accounts.
+  res.json({ seasonId, approved: rows.length, synced, exempt, missing, distinctAccounts: accountIds.size });
+});
+
+// One-time (re-runnable) fix for merge groups that predate
+// reconcileAccountsForGroup being folded into mergeApplicants/approve — see
+// that function's comment in services/duplicates.js. Copies a primary's
+// disccardpromos account onto any secondary still sitting at NULL; a
+// secondary that already carries its OWN different real account is left
+// untouched and reported back instead, since that needs an admin to decide
+// (deactivate/merge the real accounts on disccardpromos, then re-run this)
+// rather than silently losing track of it. seasonId optional — omitted
+// sweeps every season the org has, since a stale merge could be sitting in
+// an old one.
+router.post('/reconcile-merged-accounts', requireAdmin, (req, res) => {
+  const result = reconcileAllMergedAccounts(req.user.org_id, req.body?.season_id || null);
+  logAudit(req.user.org_id, req.user.id, 'mass-reconcile-accounts', 'applicant', null, null, {
+    count: result.linked, groupsChecked: result.groupsChecked, conflicts: result.conflicts.length,
+    conflictDetails: result.conflicts.map(c => `${c.secondaryName}: has its own account (${c.secondaryAccountId}) — primary ${c.primaryName} uses ${c.primaryAccountId}`),
+  }, req.ip);
+  res.json(result);
 });
 
 // Shul-portal export: the shul's own pending/approved applicants, in the
@@ -911,10 +938,13 @@ router.post('/:id/approve', requirePermission('applicants', 'can_edit'), async (
     // card merging was meant to prevent. It just links straight to whatever
     // the primary member already has (nothing yet if the primary hasn't
     // been approved either) so admin views show the connection.
+    // reconcileAccountsForGroup (not a bare overwrite) so a secondary that
+    // already carries its OWN real disccardpromos account — from before it
+    // was ever recognized as a duplicate — never gets silently clobbered;
+    // see that function's comment for why that case is reported instead.
     let providerAccountError = null, providerFundsError = null;
     if (isMergedSecondary(applicant)) {
-      const primary = db.prepare('SELECT provider_account_id FROM applicants WHERE id = ?').get(applicant.merge_group_id);
-      if (primary?.provider_account_id) db.prepare('UPDATE applicants SET provider_account_id = ? WHERE id = ?').run(primary.provider_account_id, applicant.id);
+      reconcileAccountsForGroup(applicant.merge_group_id);
     } else {
       // Writes/links the disccardpromos account for this applicant — idempotent
       // by external_id (existing account just gets the current season added;
@@ -1148,10 +1178,11 @@ router.post('/mass-approve', requirePermission('applicants', 'can_edit'), async 
     // route — see the comments there. A disccardpromos hiccup on one
     // applicant never stops the rest of the batch. A merged-duplicate
     // secondary (see isMergedSecondary) never gets its own account/card —
-    // just links to whatever the primary already has.
+    // just links to whatever the primary already has, via
+    // reconcileAccountsForGroup so a secondary with its own pre-existing
+    // real account is reported as a conflict rather than clobbered.
     if (isMergedSecondary(applicant)) {
-      const primary = db.prepare('SELECT provider_account_id FROM applicants WHERE id = ?').get(applicant.merge_group_id);
-      if (primary?.provider_account_id) db.prepare('UPDATE applicants SET provider_account_id = ? WHERE id = ?').run(primary.provider_account_id, id);
+      reconcileAccountsForGroup(applicant.merge_group_id);
     } else if (applicant.shul_id && !applicant.provider_exempt) {
       let accountOk = false;
       try {

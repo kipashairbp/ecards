@@ -184,16 +184,22 @@ async function showProviderSync() {
   try {
     const params = state.season_id ? `?season_id=${state.season_id}` : '';
     const s = await api('/applicants/provider-sync-summary' + params);
+    const gap = s.synced - s.distinctAccounts;
     const body = `
       <p class="small-muted">For the season currently selected in the filter above (${s.approved} approved applicants).</p>
       <table style="width:100%">
-        <tr><td>Synced to disccardpromos</td><td style="text-align:right"><strong>${s.synced}</strong></td></tr>
+        <tr><td>Synced to disccardpromos (applicant records)</td><td style="text-align:right"><strong>${s.synced}</strong></td></tr>
+        <tr><td>Actual distinct disccardpromos accounts</td><td style="text-align:right"><strong>${s.distinctAccounts}</strong></td></tr>
         <tr><td>Marked exempt (backfill import — never sent, on purpose)</td><td style="text-align:right">${s.exempt}</td></tr>
         <tr style="border-top:1px solid var(--border)"><td><strong>Missing — should have an account but doesn't</strong></td><td style="text-align:right"><strong>${s.missing}</strong></td></tr>
       </table>
-      ${s.missing ? `<p class="small-muted" style="margin-top:12px">These likely hit a disccardpromos error at approval time (a rate limit, a temporary outage, or a data issue) that nothing retried automatically. Click below to see exactly which applicants these are.</p>` : `<p class="small-muted" style="margin-top:12px">Nothing missing for this season — the full gap is accounted for by exempt records.</p>`}
+      ${gap > 0 ? `<p class="small-muted" style="margin-top:12px">${s.synced} applicant records point at only ${s.distinctAccounts} real accounts — ${gap} of them are merged-duplicate records correctly sharing their primary's account (a family merged into one card holder shows up as multiple "Synced" rows for one real account, so this gap on its own is expected, not an error). If disccardpromos' own count is still below ${s.distinctAccounts}, click Reconcile below — some merges from before that sharing was automatic may still have a stale/duplicate account of their own.</p>` : ''}
+      ${s.missing ? `<p class="small-muted" style="margin-top:12px">"Missing" applicants likely hit a disccardpromos error at approval time (a rate limit, a temporary outage, or a data issue) that nothing retried automatically. Click below to see exactly which ones.</p>` : ''}
     `;
-    const footer = s.missing ? `<button class="btn btn-primary btn-sm" onclick="closeModal();viewMissingProviderSync()">View the ${s.missing} Missing</button>` : '';
+    const footer = `
+      <button class="btn btn-outline btn-sm" onclick="closeModal();reconcileMergedAccounts()">Reconcile Merged Accounts</button>
+      ${s.missing ? `<button class="btn btn-primary btn-sm" onclick="closeModal();viewMissingProviderSync()">View the ${s.missing} Missing</button>` : ''}
+    `;
     openModal('Disccardpromos Sync Status', body, footer);
   } catch (err) { toast(err.message, true); }
 }
@@ -203,6 +209,29 @@ function viewMissingProviderSync() {
   load();
 }
 function clearProviderSyncFilter() { state.provider_sync = ''; load(); }
+// Backfill for merge groups that predate a merged secondary automatically
+// sharing its primary's disccardpromos account — see
+// services/duplicates.js's reconcileAccountsForGroup. Sweeps every season
+// (not just the one currently filtered) since a stale merge from an old
+// season is just as real a duplicate account as a current one.
+async function reconcileMergedAccounts() {
+  try {
+    const r = await api('/applicants/reconcile-merged-accounts', { method: 'POST', body: {} });
+    const conflictRows = r.conflicts.map(c => `<tr><td>${esc(c.secondaryName)}</td><td>${esc(c.secondaryAccountId)}</td><td>${esc(c.primaryName)}</td><td>${esc(c.primaryAccountId)}</td></tr>`).join('');
+    const body = `
+      <p>Checked ${r.groupsChecked} merge group(s). Linked ${r.linked} applicant record(s) to their primary's disccardpromos account.</p>
+      ${r.conflicts.length ? `
+        <p class="small-muted" style="margin-top:12px;color:var(--danger)">${r.conflicts.length} secondary record(s) already have their OWN disccardpromos account, separate from their primary's — these were left untouched since overwriting could orphan a real (possibly funded) account. Review these on disccardpromos directly and decide whether to deactivate/merge them there, then re-run this.</p>
+        <table style="width:100%;margin-top:8px;font-size:13px">
+          <tr><th style="text-align:left">Secondary</th><th style="text-align:left">Its account</th><th style="text-align:left">Primary</th><th style="text-align:left">Primary's account</th></tr>
+          ${conflictRows}
+        </table>
+      ` : `<p class="small-muted" style="margin-top:12px">No conflicts — every merged group now shares one account with its primary.</p>`}
+    `;
+    openModal('Reconcile Merged Accounts', body, '');
+    load();
+  } catch (err) { toast(err.message, true); }
+}
 const MASS_ACTIONS = {
   approve: {
     confirm: null,

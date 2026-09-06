@@ -38,7 +38,7 @@ const ACTION_VERBS = { create: 'Created', update: 'Updated', delete: 'Deleted', 
 // and the record ids/names/counts live in after_json instead of a normal
 // before/after diff. Rendered with their own headline/detail below rather
 // than forced through headline()/changeList(), which assume a single entity.
-const MASS_VERBS = { 'mass-approve': 'Approved', 'mass-reject': 'Rejected', 'mass-set-pending': 'Set to pending', 'mass-delete': 'Deleted', 'mass-delete-undo': 'Restored', 'mass-import': 'Imported', 'mass-set-status': 'Updated status for', 'mass-deactivate': 'Deactivated', 'mass-activate': 'Activated' };
+const MASS_VERBS = { 'mass-approve': 'Approved', 'mass-reject': 'Rejected', 'mass-set-pending': 'Set to pending', 'mass-delete': 'Deleted', 'mass-delete-undo': 'Restored', 'mass-import': 'Imported', 'mass-set-status': 'Updated status for', 'mass-deactivate': 'Deactivated', 'mass-activate': 'Activated', 'mass-reconcile-accounts': 'Linked' };
 const FIELD_LABELS = {
   approval_status: 'Status', card_amount: 'Card Amount', is_active: 'Active', first_name: 'First Name', last_name: 'Last Name',
   name_en: 'Name', name: 'Name', role: 'Role', phone: 'Phone', slots_allocated: 'Slots', email: 'Email', home_phone: 'Home Phone',
@@ -129,6 +129,8 @@ function massDetail(a) {
   if (after.zeroAmountSkipped) bits.push(`${after.zeroAmountSkipped} had a $0 card amount, nothing sent to disccardpromos`);
   if (after.emailErrors) bits.push(`${after.emailErrors} email errors`);
   if (after.cardLockErrors) bits.push(`${after.cardLockErrors} card-lock errors`);
+  if (after.groupsChecked) bits.push(`${after.groupsChecked} merge groups checked`);
+  if (after.conflicts) bits.push(`${after.conflicts} need manual review`);
   let html = bits.length ? `<div class="small-muted" style="margin-top:6px">${esc(bits.join(' · '))}</div>` : '';
   // Real per-applicant reasons for the gift-card provider errors counted
   // above — see routes/applicants.js's mass-approve for why this exists
@@ -137,6 +139,14 @@ function massDetail(a) {
   const providerErrorDetails = (after.providerErrorDetails || []).filter(Boolean);
   if (providerErrorDetails.length) {
     html += `<div class="small-muted" style="margin-top:4px;color:var(--danger)">${providerErrorDetails.map(d => esc(d)).join('<br>')}</div>`;
+  }
+  // Merge groups where a secondary already had its own disccardpromos
+  // account before it was ever recognized as a duplicate — see
+  // reconcileAccountsForGroup's comment in services/duplicates.js for why
+  // these are surfaced instead of silently overwritten.
+  const conflictDetails = (after.conflictDetails || []).filter(Boolean);
+  if (conflictDetails.length) {
+    html += `<div class="small-muted" style="margin-top:4px;color:var(--danger)">${conflictDetails.map(d => esc(d)).join('<br>')}</div>`;
   }
   const names = (after.names || []).filter(Boolean);
   if (names.length) {
