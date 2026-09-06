@@ -101,7 +101,26 @@ function matchReasons(a, aAddress, c) {
 // this only narrows the CANDIDATE side, not which row is doing the
 // checking.
 export function checkApplicantDuplicate(orgId, applicant, previousApplicant) {
+  // 'incomplete' (carried-forward, awaiting re-enrollment) is excluded as
+  // the SUBJECT too, not just the candidate side above — unlike 'draft',
+  // which is still deliberately checked as subject against a genuinely
+  // active applicant (see the comment above). An admin/shul editing basic
+  // info on a carried-forward row before ever re-enrolling it (PUT /:id
+  // calls this on every save, regardless of status) used to be able to
+  // trigger a real flag+pause against, most commonly, its own prior-season
+  // self or a sibling record sharing carried-over data — before the shul
+  // has done anything that counts as "activating" it (complete-
+  // reenrollment/mass-complete-reenrollment, which turns it into 'pending'
+  // and runs this same check for real at that point).
+  if (applicant.approval_status === 'incomplete') return null;
   const candidates = db.prepare(`SELECT * FROM applicants WHERE org_id = ? AND season_id = ? AND id != ? AND approval_status NOT IN ('draft', 'incomplete')`).all(orgId, applicant.season_id, applicant.id);
+  return checkAgainst(applicant, candidates, previousApplicant);
+}
+
+// Extracted so recheckAllApplicantDuplicates below can share the exact same
+// matching logic against a candidate list it already has in hand, instead
+// of re-querying per applicant.
+function checkAgainst(applicant, candidates, previousApplicant) {
   const applicantAddress = fullAddress(applicant);
   const previousAddress = previousApplicant ? fullAddress(previousApplicant) : null;
   for (const c of candidates) {
@@ -147,6 +166,60 @@ export function detectAndFlag(orgId, entityType, entity, excludeIds = [], previo
   else db.prepare(`UPDATE applicants SET duplicate_status = 'flagged', duplicate_of_applicant_id = ? WHERE id = ?`).run(match.matchedId, entity.id);
   pauseAccountsFor(entityType, entity.id, match.matchedId);
   return db.prepare('SELECT * FROM duplicate_flags WHERE id = ?').get(id);
+}
+
+// Org-wide sweep, run once after the 'incomplete' fix above landed (and
+// safe to re-run any time). Two passes:
+//  1. Undoes every flag+pause that only exists because of the bug just
+//     fixed — an 'incomplete' row was checked as SUBJECT and flagged
+//     against a real applicant before it was ever re-enrolled. Only
+//     entity_id needs checking: 'incomplete' is excluded from the
+//     candidate pool, so it can never appear as matched_entity_id. The
+//     matched real applicant is unpaused too, but only if nothing ELSE
+//     still has an open flag against it — a genuinely separate duplicate
+//     on that same record must stay paused.
+//  2. A fresh, no-previousApplicant check (so anything true right now
+//     counts, not just what changed since a last save) across every real
+//     (non-draft/incomplete), currently-unpaused applicant in the org —
+//     catches anything a bug, an import, or a direct DB edit ever let
+//     through without ever being checked.
+// seasonId narrows pass 2 to one season (duplicate flags are always
+// within a season); pass 1 always runs org-wide since a spurious flag from
+// this bug could be sitting in any season.
+export function recheckAllApplicantDuplicates(orgId, seasonId) {
+  const spurious = db.prepare(`
+    SELECT f.* FROM duplicate_flags f JOIN applicants a ON a.id = f.entity_id
+    WHERE f.org_id = ? AND f.entity_type = 'applicant' AND f.status = 'open' AND a.approval_status = 'incomplete'
+  `).all(orgId);
+  let cleared = 0;
+  for (const f of spurious) {
+    db.prepare(`UPDATE duplicate_flags SET status = 'resolved', resolved_at = datetime('now') WHERE id = ?`).run(f.id);
+    db.prepare(`UPDATE applicants SET is_paused = 0, duplicate_status = NULL, duplicate_of_applicant_id = NULL WHERE id = ?`).run(f.entity_id);
+    const stillFlagged = db.prepare(`SELECT 1 FROM duplicate_flags WHERE status = 'open' AND (entity_id = ? OR matched_entity_id = ?)`).get(f.matched_entity_id, f.matched_entity_id);
+    if (!stillFlagged) db.prepare(`UPDATE applicants SET is_paused = 0, duplicate_status = NULL, duplicate_of_applicant_id = NULL WHERE id = ?`).run(f.matched_entity_id);
+    cleared++;
+  }
+
+  const rows = seasonId
+    ? db.prepare(`SELECT * FROM applicants WHERE org_id = ? AND season_id = ? AND approval_status NOT IN ('draft', 'incomplete') AND is_paused = 0`).all(orgId, seasonId)
+    : db.prepare(`SELECT * FROM applicants WHERE org_id = ? AND approval_status NOT IN ('draft', 'incomplete') AND is_paused = 0`).all(orgId);
+  const bySeasonAndOrg = new Map();
+  for (const r of rows) { const k = r.season_id; if (!bySeasonAndOrg.has(k)) bySeasonAndOrg.set(k, db.prepare(`SELECT * FROM applicants WHERE org_id = ? AND season_id = ? AND approval_status NOT IN ('draft', 'incomplete')`).all(orgId, k)); }
+  let flagged = 0;
+  for (const a of rows) {
+    const candidates = bySeasonAndOrg.get(a.season_id).filter(c => c.id !== a.id);
+    const match = checkAgainst(a, candidates, null);
+    if (!match) continue;
+    const existingOpen = db.prepare(`SELECT * FROM duplicate_flags WHERE org_id = ? AND entity_type = 'applicant' AND status = 'open'
+      AND ((entity_id = ? AND matched_entity_id = ?) OR (entity_id = ? AND matched_entity_id = ?))`).get(orgId, a.id, match.matchedId, match.matchedId, a.id);
+    if (existingOpen) continue;
+    const id = uuid();
+    db.prepare(`INSERT INTO duplicate_flags (id, org_id, entity_type, entity_id, matched_entity_id, reason, status) VALUES (?,?,?,?,?,?,'open')`).run(id, orgId, 'applicant', a.id, match.matchedId, match.reason);
+    db.prepare(`UPDATE applicants SET duplicate_status = 'flagged', duplicate_of_applicant_id = ? WHERE id = ?`).run(match.matchedId, a.id);
+    pauseAccountsFor('applicant', a.id, match.matchedId);
+    flagged++;
+  }
+  return { cleared, checked: rows.length, flagged };
 }
 
 // Which fields count as "a phone number" for the never-bypass-if-matched

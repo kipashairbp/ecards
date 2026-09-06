@@ -726,10 +726,26 @@ async function showDuplicates() {
 function renderDuplicatesList() {
   const body = `<input id="dup-search" placeholder="Search by name, shul, or reason…" value="${esc(dupSearchTerm)}" style="margin-bottom:12px">
     <div id="dup-list">${renderDupListOnly()}</div>`;
-  openModal('Duplicate Applicant Flags', body);
+  const footer = `<button class="btn btn-outline btn-sm" onclick="recheckAllDuplicates()">Recheck All (org-wide)</button>`;
+  openModal('Duplicate Applicant Flags', body, footer);
   qs('#dup-search').addEventListener('input', (e) => { dupSearchTerm = e.target.value; qs('#dup-list').innerHTML = renderDupListOnly(); });
   qs('#dup-search').focus();
   qs('#dup-search').selectionStart = qs('#dup-search').selectionEnd = dupSearchTerm.length;
+}
+// 'incomplete' (carried-forward, awaiting re-enrollment) applicants used to
+// still get checked as the SUBJECT of a duplicate check on every edit,
+// which could flag+pause one before it was ever re-enrolled — see
+// services/duplicates.js's checkApplicantDuplicate. This sweep undoes any
+// flag that only exists because of that (org-wide, since it could be
+// sitting in any season) and freshly re-checks every other currently-
+// unpaused real applicant to catch anything a bug ever let through.
+async function recheckAllDuplicates() {
+  if (!confirm('Recheck every applicant org-wide? This clears any duplicate flag caused by the incomplete-applicant bug, and freshly checks everyone else for anything that was missed. Safe to re-run.')) return;
+  try {
+    const r = await api('/applicants/duplicates/recheck-all', { method: 'POST', body: {} });
+    toast(`Checked ${r.checked}. Cleared ${r.cleared} spurious flag(s), found ${r.flagged} new one(s).`);
+    showDuplicates();
+  } catch (err) { toast(err.message, true); }
 }
 function renderDupListOnly() {
   const term = dupSearchTerm.trim().toLowerCase();

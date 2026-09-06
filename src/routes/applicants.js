@@ -3,7 +3,7 @@ import multer from 'multer';
 import { db, uuid, DEFAULT_ORG_ID } from '../db.js';
 import { auth, requireAdmin } from '../middleware/auth.js';
 import { requirePermission, redact } from '../middleware/permissions.js';
-import { detectAndFlag, resolveFlag, getMergeGroupIds, mergeApplicants, applicantsSharePhone, reconcileAccountsForGroup, reconcileAllMergedAccounts } from '../services/duplicates.js';
+import { detectAndFlag, resolveFlag, getMergeGroupIds, mergeApplicants, applicantsSharePhone, reconcileAccountsForGroup, reconcileAllMergedAccounts, recheckAllApplicantDuplicates } from '../services/duplicates.js';
 import { sendMailChecked, renderSystemTemplate } from '../services/mail.js';
 import { sendSmsChecked } from '../services/sms.js';
 import * as giftcard from '../services/giftcard.js';
@@ -1800,6 +1800,16 @@ router.post('/import', requirePermission('applicants', 'can_edit'), upload.singl
 // a duplicate), so this filter is just keeping flags for a *different*
 // season's applicant entirely out of whatever season the admin is currently
 // working in.
+// One-time (re-runnable) cleanup for the 'incomplete' fix above — see
+// services/duplicates.js's recheckAllApplicantDuplicates for exactly what it
+// does. season_id optional; org-wide when omitted.
+router.post('/duplicates/recheck-all', requireAdmin, (req, res) => {
+  const result = recheckAllApplicantDuplicates(req.user.org_id, req.body?.season_id || null);
+  logAudit(req.user.org_id, req.user.id, 'mass-recheck-duplicates', 'applicant', null, null,
+    { count: result.cleared + result.flagged, cleared: result.cleared, checked: result.checked, flagged: result.flagged }, req.ip);
+  res.json(result);
+});
+
 router.get('/duplicates/open', requireAdmin, (req, res) => {
   const { season_id } = req.query;
   const rows = season_id
