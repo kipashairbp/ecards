@@ -602,6 +602,14 @@ safeAlter(`ALTER TABLE applicants ADD COLUMN external_id TEXT`);
 // services/giftcard.js's upsertAccountForApproval) — distinct from
 // cards.provider_card_id, which is the actual gift card assigned later.
 safeAlter(`ALTER TABLE applicants ADD COLUMN provider_account_id TEXT`);
+// What disccardpromos itself last said about provider_account_id when asked
+// directly (routes/applicants.js's provider-audit): active | inactive |
+// not_found | mock | error | relinked | cleared. Ground truth from their
+// API, as opposed to provider_account_id's "what we stored at approval
+// time" — the two can drift (a customer deleted on their dashboard, an id
+// written while a season was still in mock mode, ...).
+safeAlter(`ALTER TABLE applicants ADD COLUMN provider_check_status TEXT`);
+safeAlter(`ALTER TABLE applicants ADD COLUMN provider_check_at TEXT`);
 safeAlter(`ALTER TABLE forms ADD COLUMN opens_at TEXT`);
 safeAlter(`ALTER TABLE forms ADD COLUMN closes_at TEXT`);
 safeAlter(`ALTER TABLE forms ADD COLUMN is_default INTEGER DEFAULT 0`);

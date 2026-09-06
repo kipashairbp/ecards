@@ -388,6 +388,36 @@ export async function updateCustomer(seasonId, customerId, opts) {
   return call(seasonId, `/org/customers/${normalizeCustomerId(customerId)}/`, { method: 'PATCH', body: JSON.stringify(customerPayload(opts)) });
 }
 
+// Every customer in the season's disccardpromos org — the other half of a
+// real two-way reconciliation (routes/applicants.js's provider-audit):
+// checking each id WE hold against them only ever finds ids that are stale
+// on our side; this is what finds customers that exist on THEIR side with
+// nothing here pointing at them. Their docs list the endpoint alongside
+// create/get/delete but don't pin down the pagination shape, so this
+// accepts the three common ones (a bare array, DRF-style {results, next},
+// or {data}) and follows `next` until it runs out, with a hard page cap so
+// a self-linking `next` can't loop forever. Throws on any HTTP failure —
+// the caller treats "couldn't list" as a distinct, reported outcome rather
+// than an empty org.
+export async function listCustomers(seasonId) {
+  if (isMockMode(seasonId)) return [];
+  const all = [];
+  let path = '/org/customers/';
+  const cfg = resolveConfig(seasonId);
+  for (let page = 0; page < 500 && path; page++) {
+    const body = await call(seasonId, path);
+    const items = Array.isArray(body) ? body : Array.isArray(body?.results) ? body.results : Array.isArray(body?.data) ? body.data : null;
+    if (!items) throw new Error(`disccardpromos customer list came back in an unrecognized shape (keys: ${Object.keys(body || {}).join(', ') || 'none'})`);
+    all.push(...items);
+    const next = body?.next;
+    if (!next || Array.isArray(body)) break;
+    // `next` is usually an absolute URL — strip the base so call() can
+    // re-prefix it (and re-apply the auth header) the same as any other path.
+    path = String(next).startsWith(cfg.apiBase) ? String(next).slice(cfg.apiBase.length) : String(next).replace(/^https?:\/\/[^/]+/, '');
+  }
+  return all;
+}
+
 export async function deleteCustomer(seasonId, customerId) {
   if (isMockMode(seasonId)) return { ok: true };
   return call(seasonId, `/org/customers/${normalizeCustomerId(customerId)}/`, { method: 'DELETE' });

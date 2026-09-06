@@ -55,7 +55,7 @@ renderShell('/admin/applicants', `
   <div class="paginator" id="pager"></div>
 `);
 
-let state = { search:'', status:'', paused:'', marital_status:'', shul_id:'', season_id:'', provider_sync:'', sort:'created_at', dir:'DESC', page:1, pageSize:25 };
+let state = { search:'', status:'', paused:'', marital_status:'', shul_id:'', season_id:'', provider_sync:'', provider_check:'', sort:'created_at', dir:'DESC', page:1, pageSize:25 };
 let selected = new Set();
 
 // Every field a column can show, plus how to render it — the checkbox
@@ -83,6 +83,7 @@ const APPLICANT_COLUMNS = [
   { key: 'approval_status', label: 'Status', sort: 'approval_status', render: a => badge(a.approval_status, a.approval_status) },
   { key: 'card_amount', label: 'Card $', sort: 'card_amount', render: a => a.card_amount != null ? fmtMoney(a.card_amount) : '' },
   { key: 'provider_sync', label: 'Disccardpromos', render: a => providerSyncBadge(a.provider_sync) },
+  { key: 'provider_check_status', label: 'Disccardpromos Says', render: a => providerCheckBadge(a.provider_check_status) },
   { key: 'comments', label: 'Comments', render: a => esc(a.comments||'') },
   { key: 'created_at', label: 'Submitted', sort: 'created_at', render: a => fmtDate(a.created_at) },
 ];
@@ -108,7 +109,8 @@ qs('#thead').parentElement.addEventListener('click', (e) => {
 
 async function load() {
   const params = new URLSearchParams(Object.fromEntries(Object.entries(state).filter(([,v]) => v !== '')));
-  const providerSyncBannerText = { missing: 'Showing only approved applicants missing a disccardpromos account.', deactivated: 'Showing only no-longer-approved applicants that still carry a real disccardpromos account.' }[state.provider_sync];
+  const providerSyncBannerText = { missing: 'Showing only approved applicants missing a disccardpromos account.', deactivated: 'Showing only no-longer-approved applicants that still carry a real disccardpromos account.' }[state.provider_sync]
+    || (state.provider_check ? `Showing only applicants disccardpromos reported as "${PROVIDER_CHECK_LABELS[state.provider_check] || state.provider_check}" in the last verification.` : '');
   qs('#provider-sync-banner').innerHTML = providerSyncBannerText
     ? `<div class="card" style="padding:10px 14px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center">
         <span>${providerSyncBannerText}</span>
@@ -202,6 +204,7 @@ async function showProviderSync() {
       ${s.missing ? `<p class="small-muted" style="margin-top:8px">"Missing" applicants likely hit a disccardpromos error at approval time (a rate limit, a temporary outage, or a data issue) that nothing retried automatically. Click below to see exactly which ones.</p>` : ''}
     `;
     const footer = `
+      <button class="btn btn-primary btn-sm" onclick="closeModal();startProviderAudit()">Verify Against Disccardpromos</button>
       <button class="btn btn-outline btn-sm" onclick="closeModal();reconcileMergedAccounts()">Reconcile Merged Accounts</button>
       ${s.deactivated ? `<button class="btn btn-outline btn-sm" onclick="closeModal();retryDeactivation()">Retry Deactivation</button>` : ''}
       ${s.deactivated ? `<button class="btn btn-outline btn-sm" onclick="closeModal();viewDeactivatedProviderSync()">View the ${s.deactivated} Deactivated</button>` : ''}
@@ -223,7 +226,113 @@ function viewDeactivatedProviderSync() {
   state.provider_sync = 'deactivated'; state.page = 1;
   load();
 }
-function clearProviderSyncFilter() { state.provider_sync = ''; load(); }
+function clearProviderSyncFilter() { state.provider_sync = ''; state.provider_check = ''; load(); }
+
+// --- Verify Against Disccardpromos — ground truth from their API, both
+// directions. See routes/applicants.js's runProviderAudit for what each
+// outcome means. Runs server-side as a job (one API call per account), so
+// this polls for progress and then renders the saved result.
+const PROVIDER_CHECK_LABELS = { active: 'Exists, active', inactive: 'Exists, inactive', not_found: 'Does not exist', mock: 'Mock-mode id (never real)', error: 'Could not check', relinked: 'Found + relinked', missing: 'No account there either', cleared: 'Phantom id cleared' };
+function providerCheckBadge(status) {
+  if (!status) return '';
+  const classes = { active: 'approved', inactive: 'pending', not_found: 'rejected', mock: 'rejected', error: 'rejected', relinked: 'approved', missing: 'rejected', cleared: 'submitted' };
+  return badge(PROVIDER_CHECK_LABELS[status] || status, classes[status] || 'submitted');
+}
+function seasonParam() { return state.season_id ? `?season_id=${state.season_id}` : ''; }
+function seasonBody() { return state.season_id ? { season_id: state.season_id } : {}; }
+async function startProviderAudit() {
+  try {
+    await api('/applicants/provider-audit', { method: 'POST', body: seasonBody() });
+  } catch (err) {
+    // 409 = already running: just attach to it and show progress.
+    if (!/already running/i.test(err.message)) { toast(err.message, true); return; }
+  }
+  openModal('Verifying Against Disccardpromos', `<p id="provider-audit-progress">Starting…</p><p class="small-muted">One call per account — a few hundred accounts takes a minute or two. You can close this; the result is saved and reopens from the same button.</p>`, '');
+  const poll = async () => {
+    let r;
+    try { r = await api('/applicants/provider-audit' + seasonParam()); } catch (err) { toast(err.message, true); return; }
+    if (r.status === 'running') {
+      const el = qs('#provider-audit-progress');
+      if (el) el.textContent = `Checked ${r.progress} of ${r.total || '…'}`;
+      setTimeout(poll, 1500);
+      return;
+    }
+    if (r.status === 'error') { openModal('Verification Failed', `<p style="color:var(--danger)">${esc(r.error || 'Unknown error')}</p>`, ''); return; }
+    showProviderAuditResult(r.result);
+  };
+  setTimeout(poll, 800);
+}
+async function showLastProviderAudit() {
+  try {
+    const r = await api('/applicants/provider-audit' + seasonParam());
+    if (r.status === 'running') return startProviderAudit();
+    if (!r.result) return toast('No verification has been run for this season yet.', true);
+    showProviderAuditResult(r.result);
+  } catch (err) { toast(err.message, true); }
+}
+function showProviderAuditResult(res) {
+  const o = res.ours, p = res.provider;
+  const list = (items, fmt) => items.length ? `<ul style="margin:6px 0 0;padding-left:18px;font-size:13px">${items.slice(0, 60).map(fmt).join('')}${items.length > 60 ? `<li>…and ${items.length - 60} more (use the View button)</li>` : ''}</ul>` : '';
+  const phantom = o.not_found + o.mock;
+  const body = `
+    <p class="small-muted">Ran ${fmtDateTime(res.ranAt)}. Every account id this season holds was checked directly against disccardpromos${p ? ', and their full customer list was pulled for the reverse check' : ''}.</p>
+    <table style="width:100%">
+      <tr><td>Distinct account ids we hold</td><td style="text-align:right"><strong>${o.distinctAccounts}</strong></td></tr>
+      <tr><td>… disccardpromos confirms, active</td><td style="text-align:right">${o.active}</td></tr>
+      <tr><td>… disccardpromos confirms, inactive</td><td style="text-align:right">${o.inactive}</td></tr>
+      <tr><td style="color:var(--danger)">… disccardpromos says do NOT exist</td><td style="text-align:right;color:var(--danger)"><strong>${o.not_found}</strong></td></tr>
+      <tr><td style="color:var(--danger)">… mock-mode placeholders (never real)</td><td style="text-align:right;color:var(--danger)"><strong>${o.mock}</strong></td></tr>
+      ${o.error ? `<tr><td>… could not be checked (API error)</td><td style="text-align:right">${o.error}</td></tr>` : ''}
+      <tr><td>Approved applicants with no id here, but found on disccardpromos and relinked</td><td style="text-align:right">${o.relinked}</td></tr>
+      <tr><td>Approved applicants with no account anywhere (still missing)</td><td style="text-align:right">${o.stillMissing}</td></tr>
+      ${p ? `
+        <tr style="border-top:1px solid var(--border)"><td><strong>disccardpromos' own customer count</strong></td><td style="text-align:right"><strong>${p.total}</strong></td></tr>
+        <tr><td>… active / inactive</td><td style="text-align:right">${p.active} / ${p.inactive}</td></tr>
+        <tr><td style="color:var(--danger)">… customers there that nothing here points at</td><td style="text-align:right;color:var(--danger)"><strong>${p.orphans.length}</strong></td></tr>
+      ` : `<tr style="border-top:1px solid var(--border)"><td colspan="2" class="small-muted">Their customer list could not be pulled${res.listError ? `: ${esc(res.listError)}` : ''} — only our side was verified.</td></tr>`}
+    </table>
+    ${phantom ? `<p class="small-muted" style="margin-top:12px"><strong>${phantom} phantom id(s)</strong> — we count these as accounts, disccardpromos doesn't have them. This is what inflates our number above theirs. Clear them, then Retry Sync re-creates real accounts for any that are approved.</p>${list(res.details.not_found.concat(res.details.mock), d => `<li>${esc(d.names)} — ${esc(d.statuses)} — id ${esc(d.accountId)}</li>`)}` : ''}
+    ${o.relinked ? `<p class="small-muted" style="margin-top:12px"><strong>${o.relinked} relinked</strong> — these already existed on disccardpromos; we'd only lost the id. Nothing to re-create.</p>${list(res.details.relinked, d => `<li>${esc(d.names)} — id ${esc(d.accountId)}</li>`)}` : ''}
+    ${p && p.orphans.length ? `<p class="small-muted" style="margin-top:12px"><strong>${p.orphans.length} customer(s) on disccardpromos with no applicant here</strong> — created directly on their dashboard, or from a record deleted here. These count on their side, never on ours.</p>${list(p.orphans, c => `<li>${esc(c.name)} — id ${esc(c.accountId)}${c.externalId ? `, external id ${esc(c.externalId)}` : ', no external id'}${c.groupName ? `, group ${esc(c.groupName)}` : ''} — ${c.isActive ? 'active' : 'inactive'}</li>`)}` : ''}
+    ${o.error ? `<p class="small-muted" style="margin-top:12px;color:var(--danger)">Could not check:</p>${list(res.details.error, d => `<li>${esc(d.names)}: ${esc(d.message || '')}</li>`)}` : ''}
+  `;
+  const footer = `
+    ${phantom ? `<button class="btn btn-outline btn-sm" onclick="viewProviderCheck('not_found')">View Phantoms</button><button class="btn btn-primary btn-sm" onclick="clearPhantomAccounts()">Clear ${phantom} Phantom Id(s)</button>` : ''}
+    ${o.stillMissing ? `<button class="btn btn-primary btn-sm" onclick="retryProviderSync()">Retry Sync for ${o.stillMissing} Missing</button>` : ''}
+    <button class="btn btn-outline btn-sm" onclick="closeModal();startProviderAudit()">Run Again</button>
+  `;
+  openModal('Disccardpromos Verification', body, footer);
+}
+function viewProviderCheck(status) {
+  closeModal();
+  qs('#f-status').value = ''; state.status = ''; state.provider_sync = '';
+  state.provider_check = status; state.page = 1;
+  load();
+}
+async function clearPhantomAccounts() {
+  if (!confirm('Clear every account id that disccardpromos says does not exist (or that was only a mock-mode placeholder)? Nothing on disccardpromos is touched — those accounts are not there. Approved applicants become "Missing" and can then be re-synced.')) return;
+  try {
+    const r = await api('/applicants/provider-audit/clear-phantoms', { method: 'POST', body: seasonBody() });
+    toast(`Cleared ${r.cleared} phantom id(s)`);
+    closeModal(); load();
+    showProviderSync();
+  } catch (err) { toast(err.message, true); }
+}
+async function retryProviderSync() {
+  if (!confirm('Re-create a disccardpromos account for every approved applicant that has none? A brand-new account is loaded with that applicant\'s Card Amount, exactly as approval would have done — real money. An account that turns out to already exist is only linked back, never re-loaded.')) return;
+  try {
+    closeModal();
+    toast('Re-syncing missing applicants with disccardpromos…');
+    const r = await api('/applicants/retry-provider-sync', { method: 'POST', body: seasonBody() });
+    const body = `
+      <p>Attempted ${r.attempted}. Created ${r.created} new account(s)${r.fundsLoaded ? ` (${r.fundsLoaded} loaded with funds)` : ''}, linked ${r.linkedExisting} that already existed, linked ${r.linkedSecondaries} merged record(s) to their primary${r.failed ? `, <strong style="color:var(--danger)">${r.failed} failed</strong>` : ''}.</p>
+      ${r.failureDetails.length ? `<div class="small-muted" style="margin-top:8px;color:var(--danger)">${r.failureDetails.map(d => esc(d)).join('<br>')}</div>` : ''}
+      ${r.notes.length ? `<div class="small-muted" style="margin-top:8px">${r.notes.map(d => esc(d)).join('<br>')}</div>` : ''}
+    `;
+    openModal('Retry Sync', body, '');
+    load();
+  } catch (err) { toast(err.message, true); }
+}
 async function retryDeactivation() {
   try {
     const r = await api('/applicants/retry-deactivation', { method: 'POST', body: {} });

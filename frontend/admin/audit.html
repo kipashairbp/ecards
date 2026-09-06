@@ -38,7 +38,7 @@ const ACTION_VERBS = { create: 'Created', update: 'Updated', delete: 'Deleted', 
 // and the record ids/names/counts live in after_json instead of a normal
 // before/after diff. Rendered with their own headline/detail below rather
 // than forced through headline()/changeList(), which assume a single entity.
-const MASS_VERBS = { 'mass-approve': 'Approved', 'mass-reject': 'Rejected', 'mass-set-pending': 'Set to pending', 'mass-delete': 'Deleted', 'mass-delete-undo': 'Restored', 'mass-import': 'Imported', 'mass-set-status': 'Updated status for', 'mass-deactivate': 'Deactivated', 'mass-activate': 'Activated', 'mass-reconcile-accounts': 'Linked', 'mass-retry-deactivation': 'Deactivated on disccardpromos' };
+const MASS_VERBS = { 'mass-approve': 'Approved', 'mass-reject': 'Rejected', 'mass-set-pending': 'Set to pending', 'mass-delete': 'Deleted', 'mass-delete-undo': 'Restored', 'mass-import': 'Imported', 'mass-set-status': 'Updated status for', 'mass-deactivate': 'Deactivated', 'mass-activate': 'Activated', 'mass-reconcile-accounts': 'Linked', 'mass-retry-deactivation': 'Deactivated on disccardpromos', 'mass-provider-audit': 'Verified against disccardpromos', 'mass-clear-phantom-accounts': 'Cleared phantom disccardpromos ids on', 'mass-retry-provider-sync': 'Re-synced to disccardpromos' };
 const FIELD_LABELS = {
   approval_status: 'Status', card_amount: 'Card Amount', is_active: 'Active', first_name: 'First Name', last_name: 'Last Name',
   name_en: 'Name', name: 'Name', role: 'Role', phone: 'Phone', slots_allocated: 'Slots', email: 'Email', home_phone: 'Home Phone',
@@ -133,6 +133,14 @@ function massDetail(a) {
   if (after.conflicts) bits.push(`${after.conflicts} need manual review`);
   if (after.attempted) bits.push(`${after.attempted} attempted`);
   if (after.failed) bits.push(`${after.failed} still failed`);
+  if (after.notFound) bits.push(`${after.notFound} not found on disccardpromos`);
+  if (after.mock) bits.push(`${after.mock} mock-mode ids`);
+  if (after.relinked) bits.push(`${after.relinked} relinked`);
+  if (after.providerTotal != null) bits.push(`disccardpromos total ${after.providerTotal}`);
+  if (after.orphansOnProvider) bits.push(`${after.orphansOnProvider} on disccardpromos with no applicant here`);
+  if (after.created) bits.push(`${after.created} created`);
+  if (after.linkedExisting) bits.push(`${after.linkedExisting} linked to existing`);
+  if (after.fundsLoaded) bits.push(`${after.fundsLoaded} loaded with funds`);
   let html = bits.length ? `<div class="small-muted" style="margin-top:6px">${esc(bits.join(' · '))}</div>` : '';
   // Real per-applicant reasons for the gift-card provider errors counted
   // above — see routes/applicants.js's mass-approve for why this exists
@@ -155,6 +163,10 @@ function massDetail(a) {
   const failureDetails = (after.failureDetails || []).filter(Boolean);
   if (failureDetails.length) {
     html += `<div class="small-muted" style="margin-top:4px;color:var(--danger)">${failureDetails.map(d => esc(d)).join('<br>')}</div>`;
+  }
+  const notes = (after.notes || []).filter(Boolean);
+  if (notes.length) {
+    html += `<div class="small-muted" style="margin-top:4px">${notes.map(d => esc(d)).join('<br>')}</div>`;
   }
   const names = (after.names || []).filter(Boolean);
   if (names.length) {

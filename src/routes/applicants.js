@@ -253,7 +253,7 @@ function scopeWhere(req) {
 }
 
 router.get('/', (req, res) => {
-  const { search, status, shul_id, season_id, home_for_yomtov, marital_status, paused, provider_sync, sort = 'created_at', dir = 'DESC', page = 1, pageSize = 50 } = req.query;
+  const { search, status, shul_id, season_id, home_for_yomtov, marital_status, paused, provider_sync, provider_check, sort = 'created_at', dir = 'DESC', page = 1, pageSize = 50 } = req.query;
   let { where, params } = scopeWhere(req);
   if (status) { where += ' AND a.approval_status = ?'; params.push(status); }
   if (paused === '1' || paused === '0') { where += ' AND a.is_paused = ?'; params.push(+paused); }
@@ -271,6 +271,10 @@ router.get('/', (req, res) => {
   } else if (provider_sync === 'deactivated') {
     where += ` AND a.approval_status != 'approved' AND a.provider_account_id IS NOT NULL`;
   }
+  // What disccardpromos itself said about this row's account the last time
+  // the provider audit ran (see runProviderAudit below) — not_found / mock
+  // / inactive / active / relinked / error / missing / cleared.
+  if (provider_check) { where += ' AND a.provider_check_status = ?'; params.push(provider_check); }
   if (search) {
     where += ` AND (a.first_name LIKE ? OR a.last_name LIKE ? OR a.email LIKE ? OR a.home_phone LIKE ? OR a.husband_cell LIKE ? OR a.wife_cell LIKE ? OR a.external_id LIKE ?
       OR a.address LIKE ? OR a.city LIKE ? OR a.state LIKE ? OR a.zip LIKE ? OR a.comments LIKE ? OR a.permanent_comments LIKE ?)`;
@@ -400,6 +404,242 @@ router.post('/retry-deactivation', requireAdmin, async (req, res) => {
   logAudit(req.user.org_id, req.user.id, 'mass-retry-deactivation', 'applicant', null, null,
     { count: succeeded, attempted: rows.length, failed, failureDetails }, req.ip);
   res.json({ attempted: rows.length, succeeded, failed, failureDetails });
+});
+
+// ---------------------------------------------------------------------------
+// Provider audit — ground truth from disccardpromos itself, both directions.
+//
+// Everything above (provider-sync-summary, reconcile, retry-deactivation)
+// reasons purely from what OUR database says, and every one of those
+// numbers kept failing to line up with what disccardpromos' own dashboard
+// shows. This stops inferring and asks: for every account id we hold, does
+// it actually exist on their side, and is it active? And, listing THEIR
+// customers, which of those does nothing here point at? That's the only
+// way to explain a gap in either direction without guessing:
+//  - not_found: we hold an id disccardpromos says doesn't exist (deleted on
+//    their dashboard, or never really created) — counted by us, not them.
+//  - mock: an id written while the season was still in mock mode (no API
+//    key configured yet) — was never real at all.
+//  - relinked: an approved applicant we had NO id for, but disccardpromos
+//    already has their customer (matched by external_id) — we'd lost the
+//    id, not the account. Fixed on the spot, nothing to re-create.
+//  - orphans (their side): customers with no applicant here at all —
+//    created directly on their dashboard, or belonging to a record that
+//    was hard-deleted here before hard-delete learned to lock them.
+// Runs as a background job (one per org, single-instance app — same
+// assumption as approvalsInFlight) because it's one API call per account;
+// the UI polls GET /provider-audit for progress. The final result is also
+// saved to settings so it survives a restart, and every applicant row gets
+// provider_check_status stamped so the list can filter on it.
+// ---------------------------------------------------------------------------
+const providerAuditJobs = new Map();
+const cleanProviderId = id => String(id).replace(/\.0$/, '');
+function saveProviderAudit(orgId, seasonId, result) {
+  db.prepare(`INSERT INTO settings (org_id, key, value) VALUES (?,?,?) ON CONFLICT(org_id, key) DO UPDATE SET value = excluded.value`)
+    .run(orgId, `provider_audit_last_${seasonId}`, JSON.stringify(result));
+}
+function loadProviderAudit(orgId, seasonId) {
+  const row = db.prepare('SELECT value FROM settings WHERE org_id = ? AND key = ?').get(orgId, `provider_audit_last_${seasonId}`);
+  try { return row ? JSON.parse(row.value) : null; } catch { return null; }
+}
+async function runWithConcurrency(items, limit, fn) {
+  let next = 0;
+  await Promise.all(Array(Math.min(limit, items.length)).fill(0).map(async () => {
+    while (next < items.length) { const i = next++; await fn(items[i]); }
+  }));
+}
+
+async function runProviderAudit(orgId, seasonId, job) {
+  const rows = db.prepare(`SELECT a.*, s.name_en AS shul_name FROM applicants a LEFT JOIN shuls s ON s.id = a.shul_id WHERE a.org_id = ? AND a.season_id = ?`).all(orgId, seasonId);
+  const describe = r => `${r.first_name} ${r.last_name}`.trim() + (r.shul_name ? ` (${r.shul_name})` : '');
+  const now = new Date().toISOString();
+  const setCheck = db.prepare(`UPDATE applicants SET provider_check_status = ?, provider_check_at = ? WHERE id = ?`);
+
+  // 1. Every distinct account id we hold, asked about directly.
+  const byAccount = new Map();
+  for (const r of rows) {
+    if (!r.provider_account_id) continue;
+    const k = cleanProviderId(r.provider_account_id);
+    if (!byAccount.has(k)) byAccount.set(k, []);
+    byAccount.get(k).push(r);
+  }
+  const accountIds = [...byAccount.keys()];
+  const missingRows = rows.filter(r => !r.provider_account_id && r.approval_status === 'approved' && !r.provider_exempt && !isMergedSecondary(r));
+  job.total = accountIds.length + missingRows.length + 1; job.progress = 0;
+
+  const counts = { active: 0, inactive: 0, not_found: 0, mock: 0, error: 0, relinked: 0 };
+  const details = { not_found: [], mock: [], error: [], relinked: [] };
+  await runWithConcurrency(accountIds, 4, async (accountId) => {
+    const members = byAccount.get(accountId);
+    let status, message = null;
+    if (/^mock_/.test(accountId)) status = 'mock';
+    else {
+      try {
+        const c = await giftcard.getCustomerById(seasonId, accountId);
+        if (!c) { status = 'error'; message = 'empty response'; }
+        else status = c.is_active === false ? 'inactive' : 'active';
+      } catch (e) {
+        if (e.status === 404) status = 'not_found'; else { status = 'error'; message = e.message; }
+      }
+    }
+    counts[status]++;
+    for (const m of members) setCheck.run(status, now, m.id);
+    if (details[status]) details[status].push({ applicantIds: members.map(m => m.id), accountId, names: members.map(describe).join(' / '), statuses: members.map(m => m.approval_status).join('/'), message });
+    job.progress++;
+  });
+
+  // 2. Approved applicants we hold NO id for — does disccardpromos already
+  //    have them under their external_id? If so, we lost the id, not the
+  //    account: link it back rather than ever creating a duplicate.
+  await runWithConcurrency(missingRows, 4, async (r) => {
+    try {
+      const found = await giftcard.findCustomerByExternalId(seasonId, r.external_id);
+      if (found?.id) {
+        const id = cleanProviderId(found.id);
+        db.prepare('UPDATE applicants SET provider_account_id = ? WHERE id = ?').run(id, r.id);
+        reconcileAccountsForGroup(r.id);
+        setCheck.run('relinked', now, r.id);
+        counts.relinked++; details.relinked.push({ applicantIds: [r.id], accountId: id, names: describe(r), message: 'found on disccardpromos by external id; id restored here' });
+      } else setCheck.run('missing', now, r.id);
+    } catch (e) {
+      counts.error++; setCheck.run('error', now, r.id);
+      details.error.push({ applicantIds: [r.id], accountId: null, names: describe(r), message: e.message });
+    }
+    job.progress++;
+  });
+
+  // 3. Their full customer list — the reverse direction.
+  let provider = null, listError = null;
+  try {
+    const list = await giftcard.listCustomers(seasonId);
+    const ourIds = new Set(db.prepare(`SELECT DISTINCT provider_account_id FROM applicants WHERE org_id = ? AND provider_account_id IS NOT NULL`).all(orgId).map(r => cleanProviderId(r.provider_account_id)));
+    const byExt = new Map(rows.filter(r => r.external_id).map(r => [String(r.external_id), r]));
+    const orphans = [];
+    let active = 0, inactive = 0;
+    for (const c of list) {
+      if (c?.id == null) continue;
+      const id = cleanProviderId(c.id);
+      if (c.is_active === false) inactive++; else active++;
+      if (ourIds.has(id)) continue;
+      const ext = c.external_id != null && c.external_id !== '' ? String(c.external_id) : null;
+      const match = ext ? byExt.get(ext) : null;
+      const current = match ? db.prepare('SELECT provider_account_id FROM applicants WHERE id = ?').get(match.id) : null;
+      if (match && !current?.provider_account_id && !isMergedSecondary(match)) {
+        db.prepare('UPDATE applicants SET provider_account_id = ? WHERE id = ?').run(id, match.id);
+        reconcileAccountsForGroup(match.id);
+        setCheck.run('relinked', now, match.id);
+        ourIds.add(id);
+        counts.relinked++; details.relinked.push({ applicantIds: [match.id], accountId: id, names: describe(match), message: 'matched from disccardpromos customer list by external id; id restored here' });
+        continue;
+      }
+      orphans.push({ accountId: id, name: `${c.first_name || ''} ${c.last_name || ''}`.trim() || '(no name)', externalId: ext, groupName: c.group_name || null, isActive: c.is_active !== false });
+    }
+    provider = { total: list.length, active, inactive, orphans };
+  } catch (e) { listError = e.message; }
+  job.progress++;
+
+  const stillMissing = db.prepare(`SELECT id, first_name, last_name FROM applicants WHERE org_id = ? AND season_id = ? AND approval_status = 'approved' AND provider_exempt = 0 AND provider_account_id IS NULL`).all(orgId, seasonId);
+  const result = {
+    seasonId, ranAt: now,
+    ours: { distinctAccounts: accountIds.length, ...counts, stillMissing: stillMissing.length },
+    provider, listError, details,
+  };
+  saveProviderAudit(orgId, seasonId, result);
+  return result;
+}
+
+router.post('/provider-audit', requireAdmin, (req, res) => {
+  const seasonId = req.body?.season_id || getActiveSeasonId(req.user.org_id);
+  if (giftcard.isMockMode(seasonId)) return res.status(400).json({ error: 'This season has no live disccardpromos API configured (mock mode) — there is nothing real to verify against.' });
+  const existing = providerAuditJobs.get(req.user.org_id);
+  if (existing?.status === 'running') return res.status(409).json({ error: 'A verification is already running — wait for it to finish.' });
+  const job = { status: 'running', seasonId, progress: 0, total: 0, startedAt: new Date().toISOString(), result: null, error: null };
+  providerAuditJobs.set(req.user.org_id, job);
+  const { org_id: orgId, id: userId } = req.user, ip = req.ip;
+  runProviderAudit(orgId, seasonId, job)
+    .then(result => {
+      job.result = result; job.status = 'done';
+      logAudit(orgId, userId, 'mass-provider-audit', 'applicant', null, null, {
+        count: result.ours.distinctAccounts, active: result.ours.active, inactive: result.ours.inactive, notFound: result.ours.not_found, mock: result.ours.mock,
+        relinked: result.ours.relinked, providerErrors: result.ours.error, providerTotal: result.provider?.total ?? null, orphansOnProvider: result.provider?.orphans.length ?? null, listError: result.listError,
+      }, ip);
+    })
+    .catch(e => { job.status = 'error'; job.error = e.message; console.error('[provider-audit] failed:', e); });
+  res.json({ started: true });
+});
+
+router.get('/provider-audit', requireAdmin, (req, res) => {
+  const seasonId = req.query.season_id || getActiveSeasonId(req.user.org_id);
+  const job = providerAuditJobs.get(req.user.org_id);
+  if (job && job.seasonId === seasonId && job.status !== 'done') return res.json({ status: job.status, progress: job.progress, total: job.total, error: job.error });
+  const result = (job?.seasonId === seasonId && job.result) || loadProviderAudit(req.user.org_id, seasonId);
+  res.json({ status: result ? 'done' : 'none', result });
+});
+
+// Drops every account id disccardpromos itself said doesn't exist (or that
+// was only ever a mock-mode placeholder). Nothing is touched on their side
+// — there's nothing there to touch, that's the point. An approved applicant
+// cleared here becomes plain 'missing', which POST /retry-provider-sync
+// below then re-creates for real.
+router.post('/provider-audit/clear-phantoms', requireAdmin, (req, res) => {
+  const seasonId = req.body?.season_id || getActiveSeasonId(req.user.org_id);
+  const rows = db.prepare(`SELECT id, first_name, last_name, provider_account_id FROM applicants WHERE org_id = ? AND season_id = ? AND provider_check_status IN ('not_found','mock') AND provider_account_id IS NOT NULL`).all(req.user.org_id, seasonId);
+  const clear = db.prepare(`UPDATE applicants SET provider_account_id = NULL, provider_check_status = 'cleared' WHERE id = ?`);
+  for (const r of rows) clear.run(r.id);
+  logMassAudit(req.user.org_id, req.user.id, 'mass-clear-phantom-accounts', 'applicant', rows.map(r => r.id),
+    { names: rows.map(r => `${r.first_name} ${r.last_name}`.trim()), previousAccountIds: rows.map(r => r.provider_account_id) }, req.ip);
+  res.json({ cleared: rows.length });
+});
+
+// Re-runs the approval-time account write for every approved applicant
+// still without a disccardpromos account — the retry the approve routes
+// never had. Same upsertAccountForApproval as approval (idempotent by
+// external_id, so an account that turns out to already exist is linked, not
+// duplicated). Funds are loaded ONLY onto a brand-new customer, exactly as
+// approval would have: an existing customer we're merely re-linking may
+// already carry the money from the original approval, and loading again
+// would double it — that case is reported so an admin can check the
+// balance instead. Every failure comes back with disccardpromos' actual
+// error text per applicant, which is the piece that was always missing
+// when "re-approving doesn't do anything" — it did try, it just never said
+// why it failed.
+router.post('/retry-provider-sync', requireAdmin, async (req, res) => {
+  const seasonId = req.body?.season_id || getActiveSeasonId(req.user.org_id);
+  const rows = db.prepare(`SELECT * FROM applicants WHERE org_id = ? AND season_id = ? AND approval_status = 'approved' AND provider_exempt = 0 AND provider_account_id IS NULL`).all(req.user.org_id, seasonId);
+  const discountId = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'disccardpromos_discount_id'`).get(req.user.org_id)?.value;
+  let created = 0, linkedExisting = 0, linkedSecondaries = 0, failed = 0, fundsLoaded = 0;
+  const failureDetails = [], notes = [];
+  for (const applicant of rows) {
+    const name = `${applicant.first_name} ${applicant.last_name}`.trim();
+    if (isMergedSecondary(applicant)) {
+      reconcileAccountsForGroup(applicant.merge_group_id);
+      if (db.prepare('SELECT provider_account_id FROM applicants WHERE id = ?').get(applicant.id)?.provider_account_id) linkedSecondaries++;
+      else { failed++; failureDetails.push(`${name}: merged into another record whose own account is still missing — that primary record has to sync first`); }
+      continue;
+    }
+    if (!applicant.shul_id) { failed++; failureDetails.push(`${name}: no shul assigned, so there is no group to create the account under`); continue; }
+    try {
+      const shul = db.prepare('SELECT name_en FROM shuls WHERE id = ?').get(applicant.shul_id);
+      const result = await giftcard.upsertAccountForApproval(seasonId, buildProviderOpts(req.user.org_id, applicant, shul?.name_en || 'Unknown'));
+      if (!result.accountId) { failed++; failureDetails.push(`${name}: disccardpromos returned no account id`); continue; }
+      db.prepare(`UPDATE applicants SET provider_account_id = ?, provider_check_status = 'active', provider_check_at = datetime('now') WHERE id = ?`).run(result.accountId, applicant.id);
+      db.prepare(`UPDATE applicants SET provider_account_id = ? WHERE merge_group_id = ? AND id != ?`).run(result.accountId, applicant.id, applicant.id);
+      if (result.created) {
+        created++;
+        const amount = applicant.card_amount ?? 0;
+        if (amount > 0 && discountId) {
+          try { await giftcard.addFunds(seasonId, { externalId: applicant.external_id, discountId, amount }); fundsLoaded++; }
+          catch (e) { failureDetails.push(`${name}: account created, but loading $${amount} failed — ${e.message}`); }
+        } else if (amount > 0) notes.push(`${name}: account created, but no disccardpromos Package/Discount ID is configured so $${amount} was not loaded`);
+      } else {
+        linkedExisting++;
+        notes.push(`${name}: an account already existed on disccardpromos and was linked back (not re-created) — funds were NOT re-loaded automatically, check its balance`);
+      }
+    } catch (e) { failed++; failureDetails.push(`${name}: ${e.message}`); }
+  }
+  logAudit(req.user.org_id, req.user.id, 'mass-retry-provider-sync', 'applicant', null, null,
+    { count: created + linkedExisting + linkedSecondaries, attempted: rows.length, created, linkedExisting, linkedSecondaries, fundsLoaded, failed, failureDetails, notes }, req.ip);
+  res.json({ attempted: rows.length, created, linkedExisting, linkedSecondaries, fundsLoaded, failed, failureDetails, notes });
 });
 
 // Shul-portal export: the shul's own pending/approved applicants, in the
