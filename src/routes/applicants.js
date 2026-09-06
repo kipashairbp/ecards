@@ -87,8 +87,16 @@ function buildProviderOpts(orgId, applicant, groupName) {
 // the genuine gap: a disccardpromos API error at approval time (or a
 // merged-secondary whose primary never got approved either) that nothing
 // retried afterward.
+// 'deactivated' means: no longer approved, but still carries a real
+// provider_account_id from when it WAS approved — reject/set-pending/
+// soft-reject/hard-delete all call cardSync.js's lockApplicantCards to
+// deactivate that account on disccardpromos, but that call is best-effort
+// (never blocks the status change) and its failure has historically been
+// easy to miss — see POST /retry-deactivation below, which exists
+// specifically because a bulk check turned up far more of these than
+// disccardpromos itself showed as actually inactive.
 function providerSyncStatus(a) {
-  if (a.approval_status !== 'approved') return null;
+  if (a.approval_status !== 'approved') return a.provider_account_id ? 'deactivated' : null;
   if (a.provider_account_id) return 'synced';
   if (a.provider_exempt) return 'exempt';
   return 'missing';
@@ -260,6 +268,8 @@ router.get('/', (req, res) => {
   // $0 applicant still gets a real account (see providerSyncStatus).
   if (provider_sync === 'missing') {
     where += ` AND a.approval_status = 'approved' AND a.provider_exempt = 0 AND a.provider_account_id IS NULL`;
+  } else if (provider_sync === 'deactivated') {
+    where += ` AND a.approval_status != 'approved' AND a.provider_account_id IS NOT NULL`;
   }
   if (search) {
     where += ` AND (a.first_name LIKE ? OR a.last_name LIKE ? OR a.email LIKE ? OR a.home_phone LIKE ? OR a.husband_cell LIKE ? OR a.wife_cell LIKE ? OR a.external_id LIKE ?
@@ -317,6 +327,20 @@ router.get('/provider-sync-summary', requireAdmin, (req, res) => {
     else if (r.provider_exempt) exempt++;
     else missing++;
   }
+  // A rejected/soft-rejected/pending-reverted applicant that was APPROVED at
+  // some point already had a real disccardpromos account created — reject
+  // and set-pending both call lockApplicantCards, which deactivates that
+  // customer (is_active=false) but never deletes it (real money may already
+  // be loaded on it — see cardSync.js's lockApplicantCards comment). That
+  // account keeps existing, and keeps counting toward disccardpromos' own
+  // total customer count, forever — it just no longer shows up above since
+  // this only counts CURRENTLY-approved rows. Without this, the diagnostic
+  // could never fully reconcile against disccardpromos' real total: every
+  // one of these is a real account that's genuinely just not "approved" by
+  // us anymore, not an error anywhere.
+  const deactivatedRows = db.prepare(`SELECT provider_account_id FROM applicants WHERE org_id = ? AND season_id = ? AND approval_status != 'approved' AND provider_account_id IS NOT NULL`)
+    .all(req.user.org_id, seasonId);
+  const deactivatedAccountIds = new Set(deactivatedRows.map(r => r.provider_account_id).filter(id => !accountIds.has(id)));
   // synced counts applicant ROWS with an account — a merged-duplicate group
   // shares one real disccardpromos account across every member (see
   // isMergedSecondary), so synced can legitimately run higher than the
@@ -324,7 +348,11 @@ router.get('/provider-sync-summary', requireAdmin, (req, res) => {
   // number that should match their side; a gap between the two here means
   // some merged group still has a member pointing at a stale/different
   // account than its primary — see POST /reconcile-merged-accounts.
-  res.json({ seasonId, approved: rows.length, synced, exempt, missing, distinctAccounts: accountIds.size });
+  res.json({
+    seasonId, approved: rows.length, synced, exempt, missing, distinctAccounts: accountIds.size,
+    deactivated: deactivatedAccountIds.size,
+    totalAccountsEverCreated: accountIds.size + deactivatedAccountIds.size,
+  });
 });
 
 // One-time (re-runnable) fix for merge groups that predate
@@ -344,6 +372,34 @@ router.post('/reconcile-merged-accounts', requireAdmin, (req, res) => {
     conflictDetails: result.conflicts.map(c => `${c.secondaryName}: has its own account (${c.secondaryAccountId}) — primary ${c.primaryName} uses ${c.primaryAccountId}`),
   }, req.ip);
   res.json(result);
+});
+
+// Re-attempts the disccardpromos deactivation for every applicant sitting in
+// the 'deactivated' bucket (see providerSyncStatus above) — no longer
+// approved, but still carrying the real account it got while it was.
+// reject/set-pending/soft-reject/hard-delete all call this same
+// lockApplicantCards on the way out, but that call is best-effort and never
+// blocks the status change, so a failure there has historically been easy
+// to miss (surfaced only as a toast at the moment of the original action,
+// nothing persisted). Idempotent — a customer already inactive on
+// disccardpromos' side just gets the same {isActive:false} PATCH again — so
+// safe to run repeatedly. seasonId optional, same all-seasons-by-default
+// rule as reconcile-merged-accounts above.
+router.post('/retry-deactivation', requireAdmin, async (req, res) => {
+  const seasonId = req.body?.season_id || null;
+  const rows = seasonId
+    ? db.prepare(`SELECT * FROM applicants WHERE org_id = ? AND season_id = ? AND approval_status != 'approved' AND provider_account_id IS NOT NULL`).all(req.user.org_id, seasonId)
+    : db.prepare(`SELECT * FROM applicants WHERE org_id = ? AND approval_status != 'approved' AND provider_account_id IS NOT NULL`).all(req.user.org_id);
+  let succeeded = 0, failed = 0;
+  const failureDetails = [];
+  for (const applicant of rows) {
+    const { errors } = await lockApplicantCards(req.user.org_id, applicant);
+    if (errors?.length) { failed++; failureDetails.push(`${applicant.first_name} ${applicant.last_name}: ${errors.join('; ')}`); }
+    else succeeded++;
+  }
+  logAudit(req.user.org_id, req.user.id, 'mass-retry-deactivation', 'applicant', null, null,
+    { count: succeeded, attempted: rows.length, failed, failureDetails }, req.ip);
+  res.json({ attempted: rows.length, succeeded, failed, failureDetails });
 });
 
 // Shul-portal export: the shul's own pending/approved applicants, in the

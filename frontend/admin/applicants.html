@@ -108,9 +108,10 @@ qs('#thead').parentElement.addEventListener('click', (e) => {
 
 async function load() {
   const params = new URLSearchParams(Object.fromEntries(Object.entries(state).filter(([,v]) => v !== '')));
-  qs('#provider-sync-banner').innerHTML = state.provider_sync === 'missing'
+  const providerSyncBannerText = { missing: 'Showing only approved applicants missing a disccardpromos account.', deactivated: 'Showing only no-longer-approved applicants that still carry a real disccardpromos account.' }[state.provider_sync];
+  qs('#provider-sync-banner').innerHTML = providerSyncBannerText
     ? `<div class="card" style="padding:10px 14px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center">
-        <span>Showing only approved applicants missing a disccardpromos account.</span>
+        <span>${providerSyncBannerText}</span>
         <button class="btn btn-sm btn-outline" onclick="clearProviderSyncFilter()">Clear filter</button>
       </div>` : '';
   try {
@@ -172,8 +173,8 @@ qs('#btn-provider-sync').addEventListener('click', showProviderSync);
 // so a $0 applicant still shows as 'synced' once the account exists.
 function providerSyncBadge(status) {
   if (!status) return '';
-  const labels = { synced: 'Synced', exempt: 'Exempt', missing: 'Missing' };
-  const classes = { synced: 'approved', exempt: 'submitted', missing: 'rejected' };
+  const labels = { synced: 'Synced', exempt: 'Exempt', missing: 'Missing', deactivated: 'Deactivated' };
+  const classes = { synced: 'approved', exempt: 'submitted', missing: 'rejected', deactivated: 'pending' };
   return badge(labels[status] || status, classes[status] || status);
 }
 
@@ -189,15 +190,21 @@ async function showProviderSync() {
       <p class="small-muted">For the season currently selected in the filter above (${s.approved} approved applicants).</p>
       <table style="width:100%">
         <tr><td>Synced to disccardpromos (applicant records)</td><td style="text-align:right"><strong>${s.synced}</strong></td></tr>
-        <tr><td>Actual distinct disccardpromos accounts</td><td style="text-align:right"><strong>${s.distinctAccounts}</strong></td></tr>
+        <tr><td>Actual distinct disccardpromos accounts (active)</td><td style="text-align:right"><strong>${s.distinctAccounts}</strong></td></tr>
+        <tr><td>Deactivated (previously approved, no longer — rejected/pending)</td><td style="text-align:right">${s.deactivated}</td></tr>
         <tr><td>Marked exempt (backfill import — never sent, on purpose)</td><td style="text-align:right">${s.exempt}</td></tr>
         <tr style="border-top:1px solid var(--border)"><td><strong>Missing — should have an account but doesn't</strong></td><td style="text-align:right"><strong>${s.missing}</strong></td></tr>
+        <tr style="border-top:1px solid var(--border)"><td><strong>Every account ever created this season</strong></td><td style="text-align:right"><strong>${s.totalAccountsEverCreated}</strong></td></tr>
       </table>
-      ${gap > 0 ? `<p class="small-muted" style="margin-top:12px">${s.synced} applicant records point at only ${s.distinctAccounts} real accounts — ${gap} of them are merged-duplicate records correctly sharing their primary's account (a family merged into one card holder shows up as multiple "Synced" rows for one real account, so this gap on its own is expected, not an error). If disccardpromos' own count is still below ${s.distinctAccounts}, click Reconcile below — some merges from before that sharing was automatic may still have a stale/duplicate account of their own.</p>` : ''}
-      ${s.missing ? `<p class="small-muted" style="margin-top:12px">"Missing" applicants likely hit a disccardpromos error at approval time (a rate limit, a temporary outage, or a data issue) that nothing retried automatically. Click below to see exactly which ones.</p>` : ''}
+      <p class="small-muted" style="margin-top:12px">This last line is the one that should match disccardpromos' own customer count for this season (since each season has its own separate API key) — it includes accounts that are now deactivated because the applicant was later rejected or set back to pending, not just currently-active ones. A rejected applicant's account is deliberately never deleted (it may already have real funds loaded), only deactivated, so it keeps counting on disccardpromos' side.</p>
+      ${gap > 0 ? `<p class="small-muted" style="margin-top:8px">${s.synced} currently-approved applicant records point at only ${s.distinctAccounts} distinct active accounts — ${gap} of them are merged-duplicate records correctly sharing their primary's account (a family merged into one card holder shows up as multiple "Synced" rows for one real account). If disccardpromos' total is still below "Every account ever created" above, click Reconcile below — some merges from before that sharing was automatic may still have a stale/duplicate account of their own.</p>` : ''}
+      ${s.deactivated ? `<p class="small-muted" style="margin-top:8px">If disccardpromos shows fewer actually-inactive accounts than the ${s.deactivated} counted here, the deactivation call itself likely failed silently for some of them at the time (best-effort — it never blocks the reject/pending action). Click Retry Deactivation to re-attempt it for all of them now; it's safe to run repeatedly.</p>` : ''}
+      ${s.missing ? `<p class="small-muted" style="margin-top:8px">"Missing" applicants likely hit a disccardpromos error at approval time (a rate limit, a temporary outage, or a data issue) that nothing retried automatically. Click below to see exactly which ones.</p>` : ''}
     `;
     const footer = `
       <button class="btn btn-outline btn-sm" onclick="closeModal();reconcileMergedAccounts()">Reconcile Merged Accounts</button>
+      ${s.deactivated ? `<button class="btn btn-outline btn-sm" onclick="closeModal();retryDeactivation()">Retry Deactivation</button>` : ''}
+      ${s.deactivated ? `<button class="btn btn-outline btn-sm" onclick="closeModal();viewDeactivatedProviderSync()">View the ${s.deactivated} Deactivated</button>` : ''}
       ${s.missing ? `<button class="btn btn-primary btn-sm" onclick="closeModal();viewMissingProviderSync()">View the ${s.missing} Missing</button>` : ''}
     `;
     openModal('Disccardpromos Sync Status', body, footer);
@@ -208,7 +215,26 @@ function viewMissingProviderSync() {
   state.provider_sync = 'missing'; state.page = 1;
   load();
 }
+// Deactivated spans every non-approved status (rejected/pending/soft_rejected)
+// — clears the status filter entirely rather than forcing one, unlike
+// viewMissingProviderSync which only ever means 'approved'.
+function viewDeactivatedProviderSync() {
+  qs('#f-status').value = ''; state.status = '';
+  state.provider_sync = 'deactivated'; state.page = 1;
+  load();
+}
 function clearProviderSyncFilter() { state.provider_sync = ''; load(); }
+async function retryDeactivation() {
+  try {
+    const r = await api('/applicants/retry-deactivation', { method: 'POST', body: {} });
+    const body = `
+      <p>Attempted ${r.attempted} applicant(s). ${r.succeeded} deactivated successfully${r.failed ? `, ${r.failed} still failed` : ''}.</p>
+      ${r.failureDetails.length ? `<div class="small-muted" style="margin-top:8px;color:var(--danger)">${r.failureDetails.map(d => esc(d)).join('<br>')}</div>` : ''}
+    `;
+    openModal('Retry Deactivation', body, '');
+    load();
+  } catch (err) { toast(err.message, true); }
+}
 // Backfill for merge groups that predate a merged secondary automatically
 // sharing its primary's disccardpromos account — see
 // services/duplicates.js's reconcileAccountsForGroup. Sweeps every season
