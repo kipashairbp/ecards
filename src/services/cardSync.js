@@ -42,6 +42,14 @@ export async function syncOneCard(orgId, card) {
 export async function lockApplicantCards(orgId, applicant) {
   db.prepare(`UPDATE cards SET status='deactivated', deactivated_at=datetime('now') WHERE applicant_id = ? AND status IN ('assigned','activated')`).run(applicant.id);
   if (!applicant.provider_account_id) return { errors: [] };
+  // A merged-duplicate group shares ONE disccardpromos customer (see
+  // services/duplicates.js's reconcileAccountsForGroup). Rejecting one
+  // shul's copy of the person must not lock the real card the other shul's
+  // still-approved copy is entitled to — only when no approved record is
+  // left holding the account does the customer itself get deactivated.
+  const stillHeld = db.prepare(`SELECT id FROM applicants WHERE provider_account_id = ? AND id != ? AND season_id = ? AND approval_status = 'approved'`)
+    .get(applicant.provider_account_id, applicant.id, applicant.season_id);
+  if (stillHeld) return { errors: [], skipped: 'account is shared with a record that is still approved' };
   try {
     // externalId included alongside isActive — live-tested 2026-08-19 that a
     // bare {is_active:false}-only PATCH clears the customer's external_id

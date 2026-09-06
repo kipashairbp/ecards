@@ -319,18 +319,27 @@ export function mergeApplicants(orgId, userId, { primaryId, values, memberIds } 
 // existed before this reconciliation was added (see routes/applicants.js's
 // POST /reconcile-merged-accounts) — same function, same safety rule,
 // either way it gets invoked.
+// The account "holder" is the primary when it has one, otherwise whichever
+// member does — a live audit found 16 approved secondaries stuck with no
+// account forever because their primary (the losing shul's copy) was never
+// approved, so nothing ever created the group's account. The rule is now
+// simply "a merged group shares ONE account; whoever was approved first
+// created it; everyone else links to it" — see routes/applicants.js's
+// ensureProviderAccount for the creating half.
 export function reconcileAccountsForGroup(primaryId) {
-  const primary = db.prepare('SELECT id, first_name, last_name, provider_account_id FROM applicants WHERE id = ?').get(primaryId);
-  if (!primary?.provider_account_id) return [];
-  const secondaries = db.prepare('SELECT id, first_name, last_name, provider_account_id FROM applicants WHERE merge_group_id = ? AND id != ?').all(primaryId, primaryId);
+  const members = db.prepare('SELECT id, first_name, last_name, provider_account_id FROM applicants WHERE merge_group_id = ? OR id = ?').all(primaryId, primaryId);
+  const primary = members.find(m => m.id === primaryId);
+  const holder = primary?.provider_account_id ? primary : members.find(m => m.provider_account_id);
+  if (!holder) return [];
   const conflicts = [];
-  for (const s of secondaries) {
-    if (!s.provider_account_id) {
-      db.prepare('UPDATE applicants SET provider_account_id = ? WHERE id = ?').run(primary.provider_account_id, s.id);
-    } else if (s.provider_account_id !== primary.provider_account_id) {
+  for (const m of members) {
+    if (m.id === holder.id) continue;
+    if (!m.provider_account_id) {
+      db.prepare('UPDATE applicants SET provider_account_id = ? WHERE id = ?').run(holder.provider_account_id, m.id);
+    } else if (m.provider_account_id !== holder.provider_account_id) {
       conflicts.push({
-        primaryId: primary.id, primaryName: `${primary.first_name} ${primary.last_name}`.trim(), primaryAccountId: primary.provider_account_id,
-        secondaryId: s.id, secondaryName: `${s.first_name} ${s.last_name}`.trim(), secondaryAccountId: s.provider_account_id,
+        primaryId: holder.id, primaryName: `${holder.first_name} ${holder.last_name}`.trim(), primaryAccountId: holder.provider_account_id,
+        secondaryId: m.id, secondaryName: `${m.first_name} ${m.last_name}`.trim(), secondaryAccountId: m.provider_account_id,
       });
     }
   }
@@ -352,9 +361,10 @@ export function reconcileAllMergedAccounts(orgId, seasonId) {
     const primary = db.prepare('SELECT id, provider_account_id FROM applicants WHERE id = ? AND org_id = ?').get(merge_group_id, orgId);
     if (!primary) continue;
     groupsChecked++;
-    const before = db.prepare('SELECT COUNT(*) c FROM applicants WHERE merge_group_id = ? AND id != ? AND provider_account_id IS NULL').get(merge_group_id, merge_group_id).c;
+    const nulls = () => db.prepare('SELECT COUNT(*) c FROM applicants WHERE merge_group_id = ? AND provider_account_id IS NULL').get(merge_group_id).c;
+    const before = nulls();
     conflicts.push(...reconcileAccountsForGroup(merge_group_id));
-    if (primary.provider_account_id) linked += before;
+    linked += before - nulls();
   }
   return { groupsChecked, linked, conflicts };
 }

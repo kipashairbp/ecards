@@ -293,7 +293,7 @@ function showProviderAuditResult(res) {
     </table>
     ${phantom ? `<p class="small-muted" style="margin-top:12px"><strong>${phantom} phantom id(s)</strong> — we count these as accounts, disccardpromos doesn't have them. This is what inflates our number above theirs. Clear them, then Retry Sync re-creates real accounts for any that are approved.</p>${list(res.details.not_found.concat(res.details.mock), d => `<li>${esc(d.names)} — ${esc(d.statuses)} — id ${esc(d.accountId)}</li>`)}` : ''}
     ${o.relinked ? `<p class="small-muted" style="margin-top:12px"><strong>${o.relinked} relinked</strong> — these already existed on disccardpromos; we'd only lost the id. Nothing to re-create.</p>${list(res.details.relinked, d => `<li>${esc(d.names)} — id ${esc(d.accountId)}</li>`)}` : ''}
-    ${p && p.orphans.length ? `<p class="small-muted" style="margin-top:12px"><strong>${p.orphans.length} customer(s) on disccardpromos with no applicant here</strong> — created directly on their dashboard, or from a record deleted here. These count on their side, never on ours.</p>${list(p.orphans, c => `<li>${esc(c.name)} — id ${esc(c.accountId)}${c.externalId ? `, external id ${esc(c.externalId)}` : ', no external id'}${c.groupName ? `, group ${esc(c.groupName)}` : ''} — ${c.isActive ? 'active' : 'inactive'}</li>`)}` : ''}
+    ${p && p.orphans.length ? `<p class="small-muted" style="margin-top:12px"><strong>${p.orphans.length} customer(s) on disccardpromos with no applicant here</strong> — created directly on their dashboard, or from a record deleted here. These count on their side, never on ours. Deactivating locks the card there (reversible on their dashboard); nothing is deleted.</p>${list(p.orphans, c => `<li>${esc(c.name)} — id ${esc(c.accountId)}${c.externalId ? `, external id ${esc(c.externalId)}` : ', no external id'}${c.groupName ? `, group ${esc(c.groupName)}` : ''} — ${c.isActive ? 'active' : 'inactive'}${c.origin ? `<br><span class="small-muted">${esc(c.origin)}</span>` : ''}${c.isActive ? ` <button class="btn btn-outline btn-sm" style="margin-left:6px" onclick="deactivateOrphan('${esc(c.accountId)}')">Deactivate</button>` : ''}</li>`)}` : ''}
     ${o.error ? `<p class="small-muted" style="margin-top:12px;color:var(--danger)">Could not check:</p>${list(res.details.error, d => `<li>${esc(d.names)}: ${esc(d.message || '')}</li>`)}` : ''}
   `;
   const footer = `
@@ -302,6 +302,14 @@ function showProviderAuditResult(res) {
     <button class="btn btn-outline btn-sm" onclick="closeModal();startProviderAudit()">Run Again</button>
   `;
   openModal('Disccardpromos Verification', body, footer);
+}
+async function deactivateOrphan(accountId) {
+  if (!confirm(`Deactivate disccardpromos customer ${accountId}? No applicant here holds it. The card is locked on their side (reversible there); nothing is deleted.`)) return;
+  try {
+    await api('/applicants/provider-audit/deactivate-orphan', { method: 'POST', body: { ...seasonBody(), account_id: accountId } });
+    toast(`Customer ${accountId} deactivated on disccardpromos`);
+    showLastProviderAudit();
+  } catch (err) { toast(err.message, true); }
 }
 function viewProviderCheck(status) {
   closeModal();

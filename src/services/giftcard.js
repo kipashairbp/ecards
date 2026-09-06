@@ -418,6 +418,20 @@ export async function listCustomers(seasonId) {
   return all;
 }
 
+// Flips an existing customer back to active without disturbing anything
+// else on it. A merged group shares one customer, so when a secondary gets
+// (re-)approved the customer may have been locked by an earlier reject —
+// but the PATCH has to carry external_id or disccardpromos wipes it (see
+// linkCardToCustomer's comment), and a shared customer's external_id is
+// whichever member created it, not necessarily this one's. So read it
+// first and send back exactly what's there.
+export async function reactivateCustomer(seasonId, customerId, fallbackExternalId) {
+  if (isMockMode(seasonId)) return { id: customerId, is_active: true };
+  const current = await getCustomerById(seasonId, customerId);
+  if (current?.is_active !== false) return current;
+  return call(seasonId, `/org/customers/${normalizeCustomerId(customerId)}/`, { method: 'PATCH', body: JSON.stringify({ is_active: true, external_id: current?.external_id || fallbackExternalId || undefined }) });
+}
+
 export async function deleteCustomer(seasonId, customerId) {
   if (isMockMode(seasonId)) return { ok: true };
   return call(seasonId, `/org/customers/${normalizeCustomerId(customerId)}/`, { method: 'DELETE' });

@@ -114,6 +114,7 @@ function massHeadline(a) {
     if (unrestorable) parts.push(`${unrestorable} older ${unrestorable === 1 ? 'update' : 'updates'} couldn't be reverted`);
     return `Reversed an import${parts.length ? ' — ' + parts.join(', ') : ''}`;
   }
+  if (a.action === 'mass-deactivate-orphans') return `Deactivated ${after.count || 1} stray disccardpromos customer(s) with no applicant here`;
   const verb = MASS_VERBS[a.action] || (a.action.replace(/^mass-/, '').replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase()));
   const count = after.count || 0;
   return `${verb} ${count} ${count === 1 ? label : label + 's'}`;

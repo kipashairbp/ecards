@@ -610,6 +610,12 @@ safeAlter(`ALTER TABLE applicants ADD COLUMN provider_account_id TEXT`);
 // written while a season was still in mock mode, ...).
 safeAlter(`ALTER TABLE applicants ADD COLUMN provider_check_status TEXT`);
 safeAlter(`ALTER TABLE applicants ADD COLUMN provider_check_at TEXT`);
+// A numeric id bound straight into this TEXT column used to land as
+// "74421.0" (see giftcard.js's normalizeCustomerId). Every reader strips it,
+// but "74421" and "74421.0" in two rows of one merged group still counted
+// as two different accounts in any DISTINCT — one live season showed 667
+// "accounts ever created" against 641 real ones for exactly this reason.
+db.prepare(`UPDATE applicants SET provider_account_id = substr(provider_account_id, 1, length(provider_account_id) - 2) WHERE provider_account_id LIKE '%.0'`).run();
 safeAlter(`ALTER TABLE forms ADD COLUMN opens_at TEXT`);
 safeAlter(`ALTER TABLE forms ADD COLUMN closes_at TEXT`);
 safeAlter(`ALTER TABLE forms ADD COLUMN is_default INTEGER DEFAULT 0`);

@@ -110,6 +110,67 @@ function isMergedSecondary(applicant) {
   return !!applicant.merge_group_id && applicant.merge_group_id !== applicant.id;
 }
 
+// Same trailing-".0" strip giftcard.js applies on every read (see its
+// normalizeCustomerId) — db.js now rewrites stored ids too, but anything
+// that compares/dedupes ids still goes through this so a fresh corruption
+// can never split one account into two.
+const cleanProviderId = id => String(id).replace(/\.0$/, '');
+
+// A merged-duplicate group shares ONE disccardpromos account: whichever
+// member is approved first creates it, every other member links to it.
+// (It used to be "only the primary ever creates it", which left an approved
+// secondary with no account forever whenever the primary — often the
+// losing shul's copy — was never approved at all. A live audit found 16
+// applicants in exactly that state.) Best-effort like every other provider
+// write at approval: returns { accountId, created, linked, error } and
+// never throws.
+async function ensureProviderAccount(orgId, applicant) {
+  if (!applicant.shul_id || applicant.provider_exempt) return { skipped: true };
+  if (!applicant.provider_account_id && applicant.merge_group_id) {
+    reconcileAccountsForGroup(applicant.merge_group_id);
+    const shared = db.prepare('SELECT provider_account_id FROM applicants WHERE id = ?').get(applicant.id)?.provider_account_id;
+    if (shared) {
+      // Linked to the group's existing customer — make sure it's active
+      // again in case a reject on another member locked it since.
+      try { await giftcard.reactivateCustomer(applicant.season_id, shared, applicant.external_id); }
+      catch (e) { return { accountId: shared, linked: true, error: `linked to the shared account ${shared}, but re-activating it failed — ${e.message}` }; }
+      return { accountId: shared, linked: true };
+    }
+  }
+  const shul = db.prepare('SELECT name_en FROM shuls WHERE id = ?').get(applicant.shul_id);
+  const opts = buildProviderOpts(orgId, applicant, shul?.name_en || 'Unknown');
+  if (applicant.provider_account_id) {
+    // Already holds an account — refresh it BY ID, never by an external_id
+    // lookup: a shared customer carries whichever member's external_id
+    // created it, so looking this member's up would 404 and create a
+    // duplicate (and a customer whose external_id got wiped — see
+    // giftcard.js — would too, which is how earlier duplicates happened).
+    // A shared customer only gets re-activated, not overwritten with this
+    // member's copy of the name/contact details.
+    try {
+      const current = await giftcard.getCustomerById(applicant.season_id, applicant.provider_account_id);
+      const shared = db.prepare('SELECT 1 FROM applicants WHERE provider_account_id = ? AND id != ?').get(applicant.provider_account_id, applicant.id);
+      if (shared) await giftcard.reactivateCustomer(applicant.season_id, applicant.provider_account_id, current?.external_id || applicant.external_id);
+      else await giftcard.updateCustomer(applicant.season_id, applicant.provider_account_id, { ...opts, isActive: true, externalId: current?.external_id || applicant.external_id });
+      return { accountId: cleanProviderId(applicant.provider_account_id), created: false, linked: !!shared };
+    } catch (e) {
+      // 404 = the stored id is stale (deleted on their side) — fall through
+      // and create a fresh one. Anything else is a real failure.
+      if (e.status !== 404) return { accountId: applicant.provider_account_id, error: e.message };
+    }
+  }
+  try {
+    const result = await giftcard.upsertAccountForApproval(applicant.season_id, opts);
+    if (!result.accountId) return { error: 'disccardpromos returned no account id' };
+    db.prepare('UPDATE applicants SET provider_account_id = ? WHERE id = ?').run(result.accountId, applicant.id);
+    // Every other member of the group without an account links to this one
+    // (a member that already holds a DIFFERENT real account is left alone —
+    // reconcileAccountsForGroup reports those as conflicts, never clobbers).
+    db.prepare(`UPDATE applicants SET provider_account_id = ? WHERE merge_group_id = ? AND id != ? AND provider_account_id IS NULL`).run(result.accountId, applicant.merge_group_id || applicant.id, applicant.id);
+    return { accountId: result.accountId, created: !!result.created };
+  } catch (e) { return { error: e.message }; }
+}
+
 // Season setting "require_shul_contribution": before an applicant can be
 // approved/carded, the shul must have confirmed how much they personally
 // gave the family, and that amount must meet the effective minimum bar
@@ -327,7 +388,7 @@ router.get('/provider-sync-summary', requireAdmin, (req, res) => {
   let synced = 0, exempt = 0, missing = 0;
   const accountIds = new Set();
   for (const r of rows) {
-    if (r.provider_account_id) { synced++; accountIds.add(r.provider_account_id); }
+    if (r.provider_account_id) { synced++; accountIds.add(cleanProviderId(r.provider_account_id)); }
     else if (r.provider_exempt) exempt++;
     else missing++;
   }
@@ -344,7 +405,7 @@ router.get('/provider-sync-summary', requireAdmin, (req, res) => {
   // us anymore, not an error anywhere.
   const deactivatedRows = db.prepare(`SELECT provider_account_id FROM applicants WHERE org_id = ? AND season_id = ? AND approval_status != 'approved' AND provider_account_id IS NOT NULL`)
     .all(req.user.org_id, seasonId);
-  const deactivatedAccountIds = new Set(deactivatedRows.map(r => r.provider_account_id).filter(id => !accountIds.has(id)));
+  const deactivatedAccountIds = new Set(deactivatedRows.map(r => cleanProviderId(r.provider_account_id)).filter(id => !accountIds.has(id)));
   // synced counts applicant ROWS with an account — a merged-duplicate group
   // shares one real disccardpromos account across every member (see
   // isMergedSecondary), so synced can legitimately run higher than the
@@ -433,7 +494,6 @@ router.post('/retry-deactivation', requireAdmin, async (req, res) => {
 // provider_check_status stamped so the list can filter on it.
 // ---------------------------------------------------------------------------
 const providerAuditJobs = new Map();
-const cleanProviderId = id => String(id).replace(/\.0$/, '');
 function saveProviderAudit(orgId, seasonId, result) {
   db.prepare(`INSERT INTO settings (org_id, key, value) VALUES (?,?,?) ON CONFLICT(org_id, key) DO UPDATE SET value = excluded.value`)
     .run(orgId, `provider_audit_last_${seasonId}`, JSON.stringify(result));
@@ -474,12 +534,20 @@ async function runProviderAudit(orgId, seasonId, job) {
     let status, message = null;
     if (/^mock_/.test(accountId)) status = 'mock';
     else {
-      try {
-        const c = await giftcard.getCustomerById(seasonId, accountId);
-        if (!c) { status = 'error'; message = 'empty response'; }
-        else status = c.is_active === false ? 'inactive' : 'active';
-      } catch (e) {
-        if (e.status === 404) status = 'not_found'; else { status = 'error'; message = e.message; }
+      // One retry after a short pause on anything that isn't a definite
+      // answer (a 504 gateway timeout on a single lookup is exactly the kind
+      // of thing that shouldn't leave one applicant "could not be checked").
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const c = await giftcard.getCustomerById(seasonId, accountId);
+          if (!c) { status = 'error'; message = 'empty response'; }
+          else { status = c.is_active === false ? 'inactive' : 'active'; message = null; }
+          if (status !== 'error') break;
+        } catch (e) {
+          if (e.status === 404) { status = 'not_found'; message = null; break; }
+          status = 'error'; message = e.message;
+        }
+        if (attempt === 0) await new Promise(r => setTimeout(r, 1500));
       }
     }
     counts[status]++;
@@ -532,7 +600,21 @@ async function runProviderAudit(orgId, seasonId, job) {
         counts.relinked++; details.relinked.push({ applicantIds: [match.id], accountId: id, names: describe(match), message: 'matched from disccardpromos customer list by external id; id restored here' });
         continue;
       }
-      orphans.push({ accountId: id, name: `${c.first_name || ''} ${c.last_name || ''}`.trim() || '(no name)', externalId: ext, groupName: c.group_name || null, isActive: c.is_active !== false });
+      // Trace where it came from: a record in another season with the same
+      // external id (carry-forward reuses it), or one hard-deleted here —
+      // the delete snapshot in the audit log still carries the row.
+      let origin = null;
+      if (ext) {
+        const elsewhere = db.prepare(`SELECT a.first_name, a.last_name, a.approval_status, s.name AS season_name FROM applicants a LEFT JOIN seasons s ON s.id = a.season_id WHERE a.org_id = ? AND a.external_id = ? AND a.season_id != ? LIMIT 1`).get(orgId, ext, seasonId);
+        if (elsewhere) origin = `same external id as ${elsewhere.first_name} ${elsewhere.last_name} in season "${elsewhere.season_name || '?'}" (${elsewhere.approval_status})`;
+        else {
+          const deleted = db.prepare(`SELECT before_json, created_at FROM audit_log WHERE org_id = ? AND entity_type = 'applicant' AND action = 'delete' AND before_json LIKE ? ORDER BY created_at DESC LIMIT 1`).get(orgId, `%"external_id":"${ext}"%`);
+          if (deleted) {
+            try { const rowSnap = JSON.parse(deleted.before_json)?.row; if (rowSnap) origin = `was ${rowSnap.first_name} ${rowSnap.last_name}, permanently deleted here ${deleted.created_at}`; } catch {}
+          }
+        }
+      }
+      orphans.push({ accountId: id, name: `${c.first_name || ''} ${c.last_name || ''}`.trim() || '(no name)', externalId: ext, groupName: c.group_name || null, isActive: c.is_active !== false, origin });
     }
     provider = { total: list.length, active, inactive, orphans };
   } catch (e) { listError = e.message; }
@@ -576,6 +658,32 @@ router.get('/provider-audit', requireAdmin, (req, res) => {
   res.json({ status: result ? 'done' : 'none', result });
 });
 
+// Locks a customer that exists on disccardpromos with no applicant here to
+// hold it (an orphan from the audit above). Deactivate, never delete —
+// same rule as lockApplicantCards: it may already carry real money, and
+// deactivating is reversible on their dashboard. Only ever for an id the
+// last audit actually reported as an orphan, so this can't be pointed at
+// an account some applicant still legitimately holds.
+router.post('/provider-audit/deactivate-orphan', requireAdmin, async (req, res) => {
+  const seasonId = req.body?.season_id || getActiveSeasonId(req.user.org_id);
+  const accountId = req.body?.account_id ? cleanProviderId(req.body.account_id) : null;
+  if (!accountId) return res.status(400).json({ error: 'account_id is required' });
+  const last = loadProviderAudit(req.user.org_id, seasonId);
+  const orphan = last?.provider?.orphans?.find(o => o.accountId === accountId);
+  if (!orphan) return res.status(400).json({ error: 'That account was not reported as an orphan by the last verification — run Verify again first.' });
+  if (db.prepare('SELECT 1 FROM applicants WHERE org_id = ? AND provider_account_id = ?').get(req.user.org_id, accountId)) {
+    return res.status(400).json({ error: 'An applicant here now holds that account — nothing to do.' });
+  }
+  try {
+    await giftcard.updateCustomer(seasonId, accountId, { isActive: false, externalId: orphan.externalId || undefined });
+  } catch (e) { return res.status(502).json({ error: e.message }); }
+  orphan.isActive = false;
+  saveProviderAudit(req.user.org_id, seasonId, last);
+  logAudit(req.user.org_id, req.user.id, 'mass-deactivate-orphans', 'applicant', null, null,
+    { count: 1, names: [`disccardpromos customer ${accountId}${orphan.externalId ? ` (external id ${orphan.externalId})` : ''}${orphan.origin ? ` — ${orphan.origin}` : ''}`] }, req.ip);
+  res.json({ ok: true });
+});
+
 // Drops every account id disccardpromos itself said doesn't exist (or that
 // was only ever a mock-mode placeholder). Nothing is touched on their side
 // — there's nothing there to touch, that's the point. An approved applicant
@@ -611,19 +719,17 @@ router.post('/retry-provider-sync', requireAdmin, async (req, res) => {
   const failureDetails = [], notes = [];
   for (const applicant of rows) {
     const name = `${applicant.first_name} ${applicant.last_name}`.trim();
-    if (isMergedSecondary(applicant)) {
-      reconcileAccountsForGroup(applicant.merge_group_id);
-      if (db.prepare('SELECT provider_account_id FROM applicants WHERE id = ?').get(applicant.id)?.provider_account_id) linkedSecondaries++;
-      else { failed++; failureDetails.push(`${name}: merged into another record whose own account is still missing — that primary record has to sync first`); }
-      continue;
-    }
-    if (!applicant.shul_id) { failed++; failureDetails.push(`${name}: no shul assigned, so there is no group to create the account under`); continue; }
-    try {
-      const shul = db.prepare('SELECT name_en FROM shuls WHERE id = ?').get(applicant.shul_id);
-      const result = await giftcard.upsertAccountForApproval(seasonId, buildProviderOpts(req.user.org_id, applicant, shul?.name_en || 'Unknown'));
-      if (!result.accountId) { failed++; failureDetails.push(`${name}: disccardpromos returned no account id`); continue; }
-      db.prepare(`UPDATE applicants SET provider_account_id = ?, provider_check_status = 'active', provider_check_at = datetime('now') WHERE id = ?`).run(result.accountId, applicant.id);
-      db.prepare(`UPDATE applicants SET provider_account_id = ? WHERE merge_group_id = ? AND id != ?`).run(result.accountId, applicant.id, applicant.id);
+    if (!applicant.shul_id) { failed++; failureDetails.push(`${name}: no shul assigned, so there is no group to create the account under — assign a shul, then run this again`); continue; }
+    // A row in this list may already have been linked by an earlier
+    // iteration (its group-mate created the account) — re-read before acting.
+    const fresh = db.prepare('SELECT * FROM applicants WHERE id = ?').get(applicant.id);
+    if (fresh.provider_account_id) { linkedSecondaries++; continue; }
+    {
+      const result = await ensureProviderAccount(req.user.org_id, fresh);
+      if (result.error && !result.accountId) { failed++; failureDetails.push(`${name}: ${result.error}`); continue; }
+      if (result.error) notes.push(`${name}: ${result.error}`);
+      db.prepare(`UPDATE applicants SET provider_check_status = 'active', provider_check_at = datetime('now') WHERE id = ?`).run(applicant.id);
+      if (result.linked) { linkedSecondaries++; continue; }
       if (result.created) {
         created++;
         const amount = applicant.card_amount ?? 0;
@@ -635,7 +741,7 @@ router.post('/retry-provider-sync', requireAdmin, async (req, res) => {
         linkedExisting++;
         notes.push(`${name}: an account already existed on disccardpromos and was linked back (not re-created) — funds were NOT re-loaded automatically, check its balance`);
       }
-    } catch (e) { failed++; failureDetails.push(`${name}: ${e.message}`); }
+    }
   }
   logAudit(req.user.org_id, req.user.id, 'mass-retry-provider-sync', 'applicant', null, null,
     { count: created + linkedExisting + linkedSecondaries, attempted: rows.length, created, linkedExisting, linkedSecondaries, fundsLoaded, failed, failureDetails, notes }, req.ip);
@@ -1239,33 +1345,18 @@ router.post('/:id/approve', requirePermission('applicants', 'can_edit'), async (
     // was ever recognized as a duplicate — never gets silently clobbered;
     // see that function's comment for why that case is reported instead.
     let providerAccountError = null, providerFundsError = null;
-    if (isMergedSecondary(applicant)) {
-      reconcileAccountsForGroup(applicant.merge_group_id);
-    } else {
-      // Writes/links the disccardpromos account for this applicant — idempotent
-      // by external_id (existing account just gets the current season added;
-      // a new one is created under a group matching the shul's English name,
-      // creating that group first if needed — see giftcard.js's
-      // upsertAccountForApproval). Best-effort: a disccardpromos hiccup here
-      // must never undo or block the approval that already committed above,
-      // same "external side-effect can fail without failing the action" pattern
-      // as the approval email right above.
-      if (applicant.shul_id && !applicant.provider_exempt) {
-        try {
-          const shul = db.prepare('SELECT name_en FROM shuls WHERE id = ?').get(applicant.shul_id);
-          const result = await giftcard.upsertAccountForApproval(applicant.season_id, buildProviderOpts(req.user.org_id, applicant, shul?.name_en || 'Unknown'));
-          if (result.accountId) {
-            db.prepare('UPDATE applicants SET provider_account_id = ? WHERE id = ?').run(result.accountId, applicant.id);
-            // This applicant is (or might become) a merge-group primary —
-            // propagate the account to any secondaries linked to it so
-            // their views catch up once this write finally happened.
-            db.prepare(`UPDATE applicants SET provider_account_id = ? WHERE merge_group_id = ? AND id != ?`).run(result.accountId, applicant.id, applicant.id);
-          }
-        } catch (e) {
-          providerAccountError = e.message;
-          console.error('[giftcard] failed to write disccardpromos account on approval:', e.message);
-        }
-      }
+    // Writes/links the disccardpromos account for this applicant — idempotent
+    // by external_id (existing account just gets the current season added;
+    // a new one is created under a group matching the shul's English name,
+    // creating that group first if needed — see giftcard.js's
+    // upsertAccountForApproval, via ensureProviderAccount above for the
+    // merged-group rule). Best-effort: a disccardpromos hiccup here must
+    // never undo or block the approval that already committed above, same
+    // "external side-effect can fail without failing the action" pattern as
+    // the approval email right above.
+    const account = await ensureProviderAccount(req.user.org_id, applicant);
+    if (account.error) { providerAccountError = account.error; console.error('[giftcard] failed to write disccardpromos account on approval:', account.error); }
+    {
       // disccardpromos has no separate "assign/activate a card" step — crediting
       // a customer's balance against a configured Package (Settings >
       // Organization > Gift Card Loading) via add-funds IS how a card actually
@@ -1273,8 +1364,11 @@ router.post('/:id/approve', requirePermission('applicants', 'can_edit'), async (
       // write above: skipped if that write failed (nothing to credit yet), and
       // never blocks/undoes the approval itself. provider_exempt applicants
       // (one-time backfill import — see POST /import) never reach either block,
-      // permanently, no matter how many times they're approved/rejected.
-      if (applicant.shul_id && !applicant.provider_exempt && !providerAccountError) {
+      // permanently, no matter how many times they're approved/rejected. A
+      // member merely linked to its group's existing shared account (not the
+      // one that created it) never loads funds — the person already has
+      // their card through the other record.
+      if (applicant.shul_id && !applicant.provider_exempt && !providerAccountError && !account.linked) {
         if (amount > 0) {
           const discountId = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'disccardpromos_discount_id'`).get(req.user.org_id)?.value;
           if (!discountId) {
@@ -1477,22 +1571,15 @@ router.post('/mass-approve', requirePermission('applicants', 'can_edit'), async 
     // just links to whatever the primary already has, via
     // reconcileAccountsForGroup so a secondary with its own pre-existing
     // real account is reported as a conflict rather than clobbered.
-    if (isMergedSecondary(applicant)) {
-      reconcileAccountsForGroup(applicant.merge_group_id);
-    } else if (applicant.shul_id && !applicant.provider_exempt) {
-      let accountOk = false;
-      try {
-        const shul = db.prepare('SELECT name_en FROM shuls WHERE id = ?').get(applicant.shul_id);
-        const result = await giftcard.upsertAccountForApproval(applicant.season_id, buildProviderOpts(req.user.org_id, applicant, shul?.name_en || 'Unknown'));
-        if (result.accountId) {
-          db.prepare('UPDATE applicants SET provider_account_id = ? WHERE id = ?').run(result.accountId, id);
-          db.prepare(`UPDATE applicants SET provider_account_id = ? WHERE merge_group_id = ? AND id != ?`).run(result.accountId, id, id);
-        }
-        accountOk = true;
-      } catch (e) {
+    if (applicant.shul_id && !applicant.provider_exempt) {
+      // See ensureProviderAccount — a member linked to its group's existing
+      // shared account (accountOk stays false) never loads funds here.
+      const account = await ensureProviderAccount(req.user.org_id, applicant);
+      let accountOk = !!account.accountId && !account.error && !account.linked;
+      if (account.error) {
         providerErrors++;
-        providerErrorDetails.push(`${applicant.first_name} ${applicant.last_name}: account write failed — ${e.message}`);
-        console.error('[giftcard] failed to write disccardpromos account on mass-approve:', e.message);
+        providerErrorDetails.push(`${applicant.first_name} ${applicant.last_name}: account write failed — ${account.error}`);
+        console.error('[giftcard] failed to write disccardpromos account on mass-approve:', account.error);
       }
       if (accountOk && amount > 0 && discountId) {
         try { await giftcard.addFunds(applicant.season_id, { externalId: applicant.external_id, discountId, amount }); }
