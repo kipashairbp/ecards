@@ -17,6 +17,7 @@ import { validateBySchema, validateRowsBySchema, shulInfoErrors, getEffectiveSch
 import { logAudit, logMassAudit, getEntityHistory } from '../services/audit.js';
 import { hardDeleteApplicant, captureApplicantSnapshot } from '../utils/entityDelete.js';
 import { lockApplicantCards } from '../services/cardSync.js';
+import { registerProviderEnforceRunner, scheduleProviderEnforceSoon } from '../services/providerEnforce.js';
 
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -161,14 +162,20 @@ async function ensureProviderAccount(orgId, applicant) {
   }
   try {
     const result = await giftcard.upsertAccountForApproval(applicant.season_id, opts);
-    if (!result.accountId) return { error: 'disccardpromos returned no account id' };
+    if (!result.accountId) { scheduleProviderEnforceSoon(orgId, `no account id for applicant ${applicant.id}`); return { error: 'disccardpromos returned no account id' }; }
     db.prepare('UPDATE applicants SET provider_account_id = ? WHERE id = ?').run(result.accountId, applicant.id);
     // Every other member of the group without an account links to this one
     // (a member that already holds a DIFFERENT real account is left alone —
     // reconcileAccountsForGroup reports those as conflicts, never clobbers).
     db.prepare(`UPDATE applicants SET provider_account_id = ? WHERE merge_group_id = ? AND id != ? AND provider_account_id IS NULL`).run(result.accountId, applicant.merge_group_id || applicant.id, applicant.id);
     return { accountId: result.accountId, created: !!result.created };
-  } catch (e) { return { error: e.message }; }
+  } catch (e) {
+    // Best-effort at approval time, but the enforcer re-runs shortly and
+    // finishes the job — an approved applicant never stays without an
+    // account just because disccardpromos hiccupped once.
+    scheduleProviderEnforceSoon(orgId, `account write failed for applicant ${applicant.id}`);
+    return { error: e.message };
+  }
 }
 
 // Season setting "require_shul_contribution": before an applicant can be
@@ -655,6 +662,206 @@ router.get('/provider-audit', requireAdmin, (req, res) => {
   const job = providerAuditJobs.get(req.user.org_id);
   if (job && job.seasonId === seasonId && job.status !== 'done') return res.json({ status: job.status, progress: job.progress, total: job.total, error: job.error });
   const result = (job?.seasonId === seasonId && job.result) || loadProviderAudit(req.user.org_id, seasonId);
+  res.json({ status: result ? 'done' : 'none', result });
+});
+
+// ---------------------------------------------------------------------------
+// Make disccardpromos match — one idempotent job that ENFORCES the rule
+// instead of just reporting against it:
+//   every approved, non-exempt applicant with a shul holds exactly one
+//   ACTIVE customer there (a merged group shares one); every customer held
+//   only by non-approved applicants, or by nobody at all, is INACTIVE.
+// Order matters and is deliberate: pull their list once, fix our side
+// (link → reactivate → create), then lock what shouldn't be active, then
+// re-pull and put their active count next to our approved count so the
+// admin sees whether it matched and, if not, exactly which applicants are
+// left and why. Nothing is ever deleted on either side. Funds are loaded
+// only onto a customer this run CREATED — exactly what approval would have
+// done — never onto one that already existed.
+// ---------------------------------------------------------------------------
+async function runProviderEnforce(orgId, seasonId, job) {
+  const now = new Date().toISOString();
+  const discountId = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'disccardpromos_discount_id'`).get(orgId)?.value;
+  const describe = r => `${r.first_name} ${r.last_name}`.trim() + (r.shul_name ? ` (${r.shul_name})` : '');
+  const setCheck = db.prepare(`UPDATE applicants SET provider_check_status = ?, provider_check_at = ? WHERE id = ?`);
+  const counts = { alreadyRight: 0, relinked: 0, reactivated: 0, created: 0, fundsLoaded: 0, deactivatedNonApproved: 0, deactivatedOrphans: 0, sharedByMerge: 0, exemptSkipped: 0 };
+  const unfixable = [], notes = [];
+
+  const pullList = async () => {
+    const list = await giftcard.listCustomers(seasonId);
+    const byId = new Map(), byExt = new Map();
+    for (const c of list) {
+      if (c?.id == null) continue;
+      const id = cleanProviderId(c.id);
+      c._id = id; byId.set(id, c);
+      if (c.external_id != null && c.external_id !== '') byExt.set(String(c.external_id), c);
+    }
+    return { list, byId, byExt };
+  };
+  const before = await pullList();
+  const { byId, byExt } = before;
+  const beforeTally = { total: before.list.length, active: before.list.filter(c => c.is_active !== false).length };
+  beforeTally.inactive = beforeTally.total - beforeTally.active;
+
+  const approved = db.prepare(`SELECT a.*, s.name_en AS shul_name FROM applicants a LEFT JOIN shuls s ON s.id = a.shul_id WHERE a.org_id = ? AND a.season_id = ? AND a.approval_status = 'approved'`).all(orgId, seasonId);
+  job.total = approved.length + 2; job.progress = 0;
+
+  // 1. Our side: every approved applicant ends up holding an ACTIVE customer.
+  const groupOf = a => a.merge_group_id ? db.prepare('SELECT * FROM applicants WHERE merge_group_id = ?').all(a.merge_group_id) : [a];
+  const seenAccounts = new Set();
+  for (const stale of approved) {
+    job.progress++;
+    const a = { ...db.prepare('SELECT * FROM applicants WHERE id = ?').get(stale.id), shul_name: stale.shul_name };
+    if (a.provider_exempt) { counts.exemptSkipped++; continue; }
+    if (!a.shul_id) { unfixable.push({ id: a.id, name: describe(a), reason: 'no shul assigned — nothing to create the account under' }); setCheck.run('missing', now, a.id); continue; }
+    const members = groupOf(a);
+    let cust = a.provider_account_id ? byId.get(cleanProviderId(a.provider_account_id)) : null;
+    if (!cust) for (const m of members) { if (m.provider_account_id && byId.has(cleanProviderId(m.provider_account_id))) { cust = byId.get(cleanProviderId(m.provider_account_id)); break; } }
+    if (!cust) for (const ext of [a.external_id, ...members.map(m => m.external_id)].filter(Boolean)) { if (byExt.has(String(ext))) { cust = byExt.get(String(ext)); break; } }
+    try {
+      if (cust) {
+        if (cleanProviderId(a.provider_account_id || '') !== cust._id) {
+          db.prepare('UPDATE applicants SET provider_account_id = ? WHERE id = ?').run(cust._id, a.id);
+          db.prepare(`UPDATE applicants SET provider_account_id = ? WHERE merge_group_id = ? AND id != ? AND provider_account_id IS NULL`).run(cust._id, a.merge_group_id || a.id, a.id);
+          counts.relinked++;
+        } else if (cust.is_active !== false) counts.alreadyRight++;
+        if (cust.is_active === false) {
+          await giftcard.reactivateCustomer(seasonId, cust._id, cust.external_id || a.external_id);
+          cust.is_active = true; counts.reactivated++;
+        }
+        if (seenAccounts.has(cust._id)) counts.sharedByMerge++;
+        seenAccounts.add(cust._id);
+        setCheck.run('active', now, a.id);
+      } else {
+        const r = await ensureProviderAccount(orgId, a);
+        if (!r.accountId) { unfixable.push({ id: a.id, name: describe(a), reason: r.error || 'disccardpromos returned no account id' }); setCheck.run('error', now, a.id); continue; }
+        if (r.error) notes.push(`${describe(a)}: ${r.error}`);
+        const id = cleanProviderId(r.accountId);
+        const created = { _id: id, id, external_id: a.external_id, is_active: true, first_name: a.first_name, last_name: a.last_name };
+        byId.set(id, created); if (a.external_id) byExt.set(String(a.external_id), created);
+        if (r.linked || seenAccounts.has(id)) counts.sharedByMerge++;
+        else {
+          counts.created++;
+          const amount = a.card_amount ?? 0;
+          if (r.created && amount > 0 && discountId) {
+            try { await giftcard.addFunds(seasonId, { externalId: a.external_id, discountId, amount }); counts.fundsLoaded++; }
+            catch (e) { notes.push(`${describe(a)}: account created, but loading $${amount} failed — ${e.message}`); }
+          } else if (r.created && amount > 0) notes.push(`${describe(a)}: account created, but no disccardpromos Package/Discount ID is configured so $${amount} was not loaded`);
+        }
+        seenAccounts.add(id);
+        setCheck.run('active', now, a.id);
+      }
+    } catch (e) {
+      unfixable.push({ id: a.id, name: describe(a), reason: e.message }); setCheck.run('error', now, a.id);
+    }
+  }
+
+  // 2. Their side: anything not held by an approved applicant goes inactive.
+  const heldByApproved = new Set(db.prepare(`SELECT DISTINCT provider_account_id FROM applicants WHERE org_id = ? AND approval_status = 'approved' AND provider_account_id IS NOT NULL`).all(orgId).map(r => cleanProviderId(r.provider_account_id)));
+  const heldByAnyone = new Set(db.prepare(`SELECT DISTINCT provider_account_id FROM applicants WHERE org_id = ? AND provider_account_id IS NOT NULL`).all(orgId).map(r => cleanProviderId(r.provider_account_id)));
+  const deactivated = [];
+  for (const c of byId.values()) {
+    if (c.is_active === false || heldByApproved.has(c._id)) continue;
+    const holder = heldByAnyone.has(c._id)
+      ? db.prepare(`SELECT first_name, last_name, approval_status, external_id FROM applicants WHERE org_id = ? AND provider_account_id = ? ORDER BY updated_at DESC LIMIT 1`).get(orgId, c._id)
+      : null;
+    try {
+      await giftcard.updateCustomer(seasonId, c._id, { isActive: false, externalId: c.external_id || holder?.external_id || undefined });
+      c.is_active = false;
+      if (holder) { counts.deactivatedNonApproved++; deactivated.push(`${holder.first_name} ${holder.last_name} (${holder.approval_status}) — customer ${c._id}`); }
+      else { counts.deactivatedOrphans++; deactivated.push(`customer ${c._id}${c.external_id ? ` (external id ${c.external_id})` : ''} — held by no applicant here`); }
+    } catch (e) { notes.push(`could not deactivate customer ${c._id}: ${e.message}`); }
+  }
+  job.progress++;
+
+  // 3. Re-pull and put the two numbers side by side.
+  let after = null;
+  try {
+    const re = await pullList();
+    after = { total: re.list.length, active: re.list.filter(c => c.is_active !== false).length };
+    after.inactive = after.total - after.active;
+  } catch (e) { notes.push(`could not re-pull their customer list for the final tally: ${e.message}`); }
+  job.progress++;
+
+  const ours = {
+    approved: approved.length,
+    exempt: counts.exemptSkipped,
+    distinctActiveAccounts: heldByApproved.size,
+    unfixable: unfixable.length,
+  };
+  const result = { seasonId, ranAt: now, before: beforeTally, after, ours, counts, unfixable, deactivated, notes,
+    matched: !!after && after.active === ours.distinctActiveAccounts };
+  db.prepare(`INSERT INTO settings (org_id, key, value) VALUES (?,?,?) ON CONFLICT(org_id, key) DO UPDATE SET value = excluded.value`)
+    .run(orgId, `provider_enforce_last_${seasonId}`, JSON.stringify(result));
+  return result;
+}
+
+const providerEnforceJobs = new Map();
+
+// The automatic version — what actually keeps the two systems matched
+// without anyone clicking anything. src/index.js runs this once shortly
+// after boot (so a deploy heals whatever old drift is sitting there) and
+// every 15 minutes after; services/providerEnforce.js also fires it about
+// a minute after any single disccardpromos write fails mid-action. Active
+// season only — that's where approvals happen; an old season is reachable
+// through the manual button with the season filter. Skips silently in
+// mock mode or while a run is already in progress, and only writes an
+// audit row when it actually changed something (or something's stuck), so
+// a quiet 15-minute tick leaves no trace.
+export async function enforceProviderForOrg(orgId, trigger = 'scheduled') {
+  const seasonId = getActiveSeasonId(orgId);
+  if (!seasonId || giftcard.isMockMode(seasonId)) return null;
+  const existing = providerEnforceJobs.get(orgId);
+  if (existing?.status === 'running') return null;
+  const job = { status: 'running', seasonId, progress: 0, total: 0, startedAt: new Date().toISOString(), result: null, error: null, trigger };
+  providerEnforceJobs.set(orgId, job);
+  try {
+    const result = await runProviderEnforce(orgId, seasonId, job);
+    job.result = result; job.status = 'done';
+    const c = result.counts;
+    const changed = c.relinked + c.reactivated + c.created + c.deactivatedNonApproved + c.deactivatedOrphans;
+    if (changed || result.unfixable.length || !result.matched) {
+      logAudit(orgId, null, 'mass-provider-enforce', 'applicant', null, null, {
+        count: result.ours.approved, trigger, matched: result.matched, theirActiveBefore: result.before.active, theirActiveAfter: result.after?.active ?? null,
+        ...c, unfixable: result.unfixable.length, failureDetails: result.unfixable.map(u => `${u.name}: ${u.reason}`), notes: result.notes,
+      }, null);
+    }
+    console.log(`[providerEnforce] ${trigger}: ${changed} change(s), ${result.unfixable.length} unfixable, matched=${result.matched}`);
+    return result;
+  } catch (e) {
+    job.status = 'error'; job.error = e.message;
+    console.error('[providerEnforce] run failed:', e.message);
+    return null;
+  }
+}
+registerProviderEnforceRunner(enforceProviderForOrg);
+
+router.post('/provider-enforce', requireAdmin, (req, res) => {
+  const seasonId = req.body?.season_id || getActiveSeasonId(req.user.org_id);
+  if (giftcard.isMockMode(seasonId)) return res.status(400).json({ error: 'This season has no live disccardpromos API configured (mock mode) — there is nothing real to match against.' });
+  const existing = providerEnforceJobs.get(req.user.org_id);
+  if (existing?.status === 'running') return res.status(409).json({ error: 'A match run is already in progress — wait for it to finish.' });
+  const job = { status: 'running', seasonId, progress: 0, total: 0, startedAt: new Date().toISOString(), result: null, error: null };
+  providerEnforceJobs.set(req.user.org_id, job);
+  const { org_id: orgId, id: userId } = req.user, ip = req.ip;
+  runProviderEnforce(orgId, seasonId, job)
+    .then(result => {
+      job.result = result; job.status = 'done';
+      logAudit(orgId, userId, 'mass-provider-enforce', 'applicant', null, null, {
+        count: result.ours.approved, matched: result.matched, theirActiveBefore: result.before.active, theirActiveAfter: result.after?.active ?? null,
+        ...result.counts, unfixable: result.unfixable.length, failureDetails: result.unfixable.map(u => `${u.name}: ${u.reason}`), notes: result.notes,
+      }, ip);
+    })
+    .catch(e => { job.status = 'error'; job.error = e.message; console.error('[provider-enforce] failed:', e); });
+  res.json({ started: true });
+});
+router.get('/provider-enforce', requireAdmin, (req, res) => {
+  const seasonId = req.query.season_id || getActiveSeasonId(req.user.org_id);
+  const job = providerEnforceJobs.get(req.user.org_id);
+  if (job && job.seasonId === seasonId && job.status !== 'done') return res.json({ status: job.status, progress: job.progress, total: job.total, error: job.error });
+  const row = db.prepare('SELECT value FROM settings WHERE org_id = ? AND key = ?').get(req.user.org_id, `provider_enforce_last_${seasonId}`);
+  let saved = null; try { saved = row ? JSON.parse(row.value) : null; } catch {}
+  const result = (job?.seasonId === seasonId && job.result) || saved;
   res.json({ status: result ? 'done' : 'none', result });
 });
 

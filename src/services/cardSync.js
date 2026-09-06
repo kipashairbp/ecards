@@ -1,6 +1,7 @@
 import { db, uuid } from '../db.js';
 import * as giftcard from './giftcard.js';
 import { resolveStoreId } from './storeMatch.js';
+import { scheduleProviderEnforceSoon } from './providerEnforce.js';
 
 // Pulls new transactions for a single card from disccardpromos and inserts
 // them into the ledger, resolving each to a known store where possible.
@@ -60,6 +61,9 @@ export async function lockApplicantCards(orgId, applicant) {
     return { errors: [] };
   } catch (e) {
     console.error('[cardSync] failed to lock disccardpromos customer for applicant', applicant.id, ':', e.message);
+    // Best-effort here, but never silently forgotten: the enforcer re-runs
+    // shortly and locks it then (see services/providerEnforce.js).
+    scheduleProviderEnforceSoon(orgId, `lock failed for applicant ${applicant.id}`);
     return { errors: [e.message] };
   }
 }

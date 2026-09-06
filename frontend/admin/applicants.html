@@ -183,34 +183,48 @@ function providerSyncBadge(status) {
 // Answers "594 approved but only 567 in disccardpromos" directly, with the
 // breakdown behind the gap — 'exempt' is expected and not a problem;
 // 'missing' is the one number worth acting on.
+// Status only — nothing here needs clicking to keep the two systems matched.
+// The automatic match (routes/applicants.js's enforceProviderForOrg) runs
+// on its own after every deploy, every 15 minutes, and right after any
+// approval/rejection whose disccardpromos call failed. This just shows the
+// last run's verdict and the few things only a human can fix (an approved
+// applicant with no shul, a data value disccardpromos rejects outright).
 async function showProviderSync() {
   try {
-    const params = state.season_id ? `?season_id=${state.season_id}` : '';
-    const s = await api('/applicants/provider-sync-summary' + params);
-    const gap = s.synced - s.distinctAccounts;
+    const params = seasonParam();
+    const [s, e] = await Promise.all([api('/applicants/provider-sync-summary' + params), api('/applicants/provider-enforce' + params)]);
+    const r = e.result;
+    const verdict = e.status === 'running'
+      ? `<p><strong>Automatic match is running right now</strong> (${e.progress} of ${e.total || '…'})…</p>`
+      : !r ? `<p class="small-muted">The automatic match hasn't run for this season yet. It runs about 40 seconds after every deploy or restart, then every 15 minutes. (It never runs while the season has no live disccardpromos API key.)</p>`
+      : r.matched
+        ? `<p style="color:var(--success,green)"><strong>Matched.</strong> disccardpromos active accounts: <strong>${r.after.active}</strong> = your distinct accounts: <strong>${r.ours.distinctActiveAccounts}</strong>. Last checked ${fmtDateTime(r.ranAt)}.</p>`
+        : `<p style="color:var(--danger)"><strong>Not matched.</strong> disccardpromos active: <strong>${r.after?.active ?? '?'}</strong> vs your distinct accounts: <strong>${r.ours.distinctActiveAccounts}</strong>. Last run ${fmtDateTime(r.ranAt)}.${r.after ? '' : ' (Their customer list could not be pulled on that run.)'}</p>`;
+    const needs = r?.unfixable?.length
+      ? `<p class="small-muted" style="margin-top:10px;color:var(--danger)"><strong>${r.unfixable.length} need a human</strong> — the automatic match cannot fix these:</p><ul style="margin:6px 0 0;padding-left:18px;font-size:13px">${r.unfixable.map(u => `<li>${esc(u.name)} — ${esc(u.reason)}</li>`).join('')}</ul>`
+      : '';
     const body = `
-      <p class="small-muted">For the season currently selected in the filter above (${s.approved} approved applicants).</p>
-      <table style="width:100%">
-        <tr><td>Synced to disccardpromos (applicant records)</td><td style="text-align:right"><strong>${s.synced}</strong></td></tr>
-        <tr><td>Actual distinct disccardpromos accounts (active)</td><td style="text-align:right"><strong>${s.distinctAccounts}</strong></td></tr>
-        <tr><td>Deactivated (previously approved, no longer — rejected/pending)</td><td style="text-align:right">${s.deactivated}</td></tr>
-        <tr><td>Marked exempt (backfill import — never sent, on purpose)</td><td style="text-align:right">${s.exempt}</td></tr>
-        <tr style="border-top:1px solid var(--border)"><td><strong>Missing — should have an account but doesn't</strong></td><td style="text-align:right"><strong>${s.missing}</strong></td></tr>
-        <tr style="border-top:1px solid var(--border)"><td><strong>Every account ever created this season</strong></td><td style="text-align:right"><strong>${s.totalAccountsEverCreated}</strong></td></tr>
+      ${verdict}
+      ${needs}
+      <table style="width:100%;margin-top:12px">
+        <tr><td>Approved applicants this season</td><td style="text-align:right"><strong>${s.approved}</strong></td></tr>
+        ${r ? `<tr><td>… sharing one account as merged duplicates</td><td style="text-align:right">${r.counts.sharedByMerge}</td></tr>` : ''}
+        <tr><td>… exempt (backfill import — never sent, on purpose)</td><td style="text-align:right">${s.exempt}</td></tr>
+        <tr><td>… without any account right now</td><td style="text-align:right">${s.missing}</td></tr>
+        <tr style="border-top:1px solid var(--border)"><td><strong>Distinct accounts that should be active</strong></td><td style="text-align:right"><strong>${r ? r.ours.distinctActiveAccounts : s.distinctAccounts}</strong></td></tr>
+        ${r?.after ? `
+          <tr style="border-top:1px solid var(--border)"><td>disccardpromos — active</td><td style="text-align:right"><strong>${r.after.active}</strong></td></tr>
+          <tr><td>disccardpromos — inactive (rejected/pending/held by nobody, locked on purpose)</td><td style="text-align:right">${r.after.inactive}</td></tr>
+          <tr><td>disccardpromos — total customers</td><td style="text-align:right">${r.after.total}</td></tr>` : ''}
       </table>
-      <p class="small-muted" style="margin-top:12px">This last line is the one that should match disccardpromos' own customer count for this season (since each season has its own separate API key) — it includes accounts that are now deactivated because the applicant was later rejected or set back to pending, not just currently-active ones. A rejected applicant's account is deliberately never deleted (it may already have real funds loaded), only deactivated, so it keeps counting on disccardpromos' side.</p>
-      ${gap > 0 ? `<p class="small-muted" style="margin-top:8px">${s.synced} currently-approved applicant records point at only ${s.distinctAccounts} distinct active accounts — ${gap} of them are merged-duplicate records correctly sharing their primary's account (a family merged into one card holder shows up as multiple "Synced" rows for one real account). If disccardpromos' total is still below "Every account ever created" above, click Reconcile below — some merges from before that sharing was automatic may still have a stale/duplicate account of their own.</p>` : ''}
-      ${s.deactivated ? `<p class="small-muted" style="margin-top:8px">If disccardpromos shows fewer actually-inactive accounts than the ${s.deactivated} counted here, the deactivation call itself likely failed silently for some of them at the time (best-effort — it never blocks the reject/pending action). Click Retry Deactivation to re-attempt it for all of them now; it's safe to run repeatedly.</p>` : ''}
-      ${s.missing ? `<p class="small-muted" style="margin-top:8px">"Missing" applicants likely hit a disccardpromos error at approval time (a rate limit, a temporary outage, or a data issue) that nothing retried automatically. Click below to see exactly which ones.</p>` : ''}
+      ${r ? `<p class="small-muted" style="margin-top:12px">Last run: ${r.counts.alreadyRight} already right · ${r.counts.relinked} relinked · ${r.counts.reactivated} re-activated · ${r.counts.created} created${r.counts.fundsLoaded ? ` (${r.counts.fundsLoaded} loaded with funds)` : ''} · ${r.counts.deactivatedNonApproved + r.counts.deactivatedOrphans} deactivated.</p>` : ''}
+      ${r?.notes?.length ? `<p class="small-muted" style="margin-top:8px">Notes:</p><ul style="margin:6px 0 0;padding-left:18px;font-size:13px">${r.notes.map(n => `<li>${esc(n)}</li>`).join('')}</ul>` : ''}
     `;
     const footer = `
-      <button class="btn btn-primary btn-sm" onclick="closeModal();startProviderAudit()">Verify Against Disccardpromos</button>
-      <button class="btn btn-outline btn-sm" onclick="closeModal();reconcileMergedAccounts()">Reconcile Merged Accounts</button>
-      ${s.deactivated ? `<button class="btn btn-outline btn-sm" onclick="closeModal();retryDeactivation()">Retry Deactivation</button>` : ''}
-      ${s.deactivated ? `<button class="btn btn-outline btn-sm" onclick="closeModal();viewDeactivatedProviderSync()">View the ${s.deactivated} Deactivated</button>` : ''}
-      ${s.missing ? `<button class="btn btn-primary btn-sm" onclick="closeModal();viewMissingProviderSync()">View the ${s.missing} Missing</button>` : ''}
+      ${s.missing ? `<button class="btn btn-outline btn-sm" onclick="closeModal();viewMissingProviderSync()">View the ${s.missing} without an account</button>` : ''}
+      <button class="btn btn-outline btn-sm" onclick="closeModal();startProviderAudit()">Verify Against Disccardpromos (read-only)</button>
     `;
-    openModal('Disccardpromos Sync Status', body, footer);
+    openModal('Disccardpromos Match Status', body, footer);
   } catch (err) { toast(err.message, true); }
 }
 function viewMissingProviderSync() {
@@ -296,12 +310,66 @@ function showProviderAuditResult(res) {
     ${p && p.orphans.length ? `<p class="small-muted" style="margin-top:12px"><strong>${p.orphans.length} customer(s) on disccardpromos with no applicant here</strong> — created directly on their dashboard, or from a record deleted here. These count on their side, never on ours. Deactivating locks the card there (reversible on their dashboard); nothing is deleted.</p>${list(p.orphans, c => `<li>${esc(c.name)} — id ${esc(c.accountId)}${c.externalId ? `, external id ${esc(c.externalId)}` : ', no external id'}${c.groupName ? `, group ${esc(c.groupName)}` : ''} — ${c.isActive ? 'active' : 'inactive'}${c.origin ? `<br><span class="small-muted">${esc(c.origin)}</span>` : ''}${c.isActive ? ` <button class="btn btn-outline btn-sm" style="margin-left:6px" onclick="deactivateOrphan('${esc(c.accountId)}')">Deactivate</button>` : ''}</li>`)}` : ''}
     ${o.error ? `<p class="small-muted" style="margin-top:12px;color:var(--danger)">Could not check:</p>${list(res.details.error, d => `<li>${esc(d.names)}: ${esc(d.message || '')}</li>`)}` : ''}
   `;
+  // Read-only: anything actionable here is picked up by the automatic match
+  // on its next run (see showProviderSync) — no buttons to click.
   const footer = `
-    ${phantom ? `<button class="btn btn-outline btn-sm" onclick="viewProviderCheck('not_found')">View Phantoms</button><button class="btn btn-primary btn-sm" onclick="clearPhantomAccounts()">Clear ${phantom} Phantom Id(s)</button>` : ''}
-    ${o.stillMissing ? `<button class="btn btn-primary btn-sm" onclick="retryProviderSync()">Retry Sync for ${o.stillMissing} Missing</button>` : ''}
+    ${phantom ? `<button class="btn btn-outline btn-sm" onclick="viewProviderCheck('not_found')">View Phantoms</button>` : ''}
     <button class="btn btn-outline btn-sm" onclick="closeModal();startProviderAudit()">Run Again</button>
   `;
   openModal('Disccardpromos Verification', body, footer);
+}
+// --- Make Disccardpromos Match — see routes/applicants.js's
+// runProviderEnforce. One job, in order: link/reactivate/create for every
+// approved applicant, deactivate everything nobody approved holds, then
+// re-pull their list and show their active count next to ours.
+async function startProviderEnforce() {
+  if (!confirm('Make disccardpromos match this season?\n\n• Every approved applicant gets one ACTIVE account (existing ones are re-activated or linked; missing ones are CREATED and loaded with their Card Amount — real money).\n• Accounts held only by rejected/pending applicants, or by nobody, are DEACTIVATED (never deleted).\n\nSafe to run again any time. Continue?')) return;
+  try {
+    await api('/applicants/provider-enforce', { method: 'POST', body: seasonBody() });
+  } catch (err) {
+    if (!/already in progress/i.test(err.message)) { toast(err.message, true); return; }
+  }
+  openModal('Making Disccardpromos Match', `<p id="provider-enforce-progress">Starting…</p><p class="small-muted">Only applicants that actually need a change trigger a call, so this is usually quick. You can close this; the result is saved.</p>`, '');
+  const poll = async () => {
+    let r;
+    try { r = await api('/applicants/provider-enforce' + seasonParam()); } catch (err) { toast(err.message, true); return; }
+    if (r.status === 'running') {
+      const el = qs('#provider-enforce-progress');
+      if (el) el.textContent = `Processed ${r.progress} of ${r.total || '…'}`;
+      setTimeout(poll, 1500); return;
+    }
+    if (r.status === 'error') { openModal('Match Run Failed', `<p style="color:var(--danger)">${esc(r.error || 'Unknown error')}</p>`, ''); return; }
+    showProviderEnforceResult(r.result);
+    load();
+  };
+  setTimeout(poll, 800);
+}
+function showProviderEnforceResult(r) {
+  const c = r.counts, o = r.ours, list = (items, fmt) => items.length ? `<ul style="margin:6px 0 0;padding-left:18px;font-size:13px">${items.map(fmt).join('')}</ul>` : '';
+  const verdict = r.after
+    ? (r.matched
+      ? `<p style="margin-top:12px;color:var(--success,green)"><strong>Matched.</strong> disccardpromos active = ${r.after.active} = your ${o.distinctActiveAccounts} distinct active accounts.</p>`
+      : `<p style="margin-top:12px;color:var(--danger)"><strong>Not matched yet:</strong> disccardpromos active ${r.after.active} vs your ${o.distinctActiveAccounts} distinct active accounts (${r.after.active - o.distinctActiveAccounts > 0 ? '+' : ''}${r.after.active - o.distinctActiveAccounts}). The list below is everything that still needs a human.</p>`)
+    : `<p style="margin-top:12px;color:var(--danger)">Their list could not be re-pulled for the final tally — run again.</p>`;
+  const body = `
+    <p class="small-muted">Ran ${fmtDateTime(r.ranAt)}.</p>
+    <table style="width:100%">
+      <tr><td>Approved applicants this season</td><td style="text-align:right"><strong>${o.approved}</strong></td></tr>
+      <tr><td>… sharing one account as merged duplicates</td><td style="text-align:right">${c.sharedByMerge}</td></tr>
+      <tr><td>… exempt (backfill, never sent)</td><td style="text-align:right">${o.exempt}</td></tr>
+      <tr><td>… could not be fixed (see below)</td><td style="text-align:right">${o.unfixable}</td></tr>
+      <tr style="border-top:1px solid var(--border)"><td><strong>= distinct accounts that should be active</strong></td><td style="text-align:right"><strong>${o.distinctActiveAccounts}</strong></td></tr>
+      <tr style="border-top:1px solid var(--border)"><td>disccardpromos active before → after</td><td style="text-align:right">${r.before.active} → <strong>${r.after ? r.after.active : '?'}</strong></td></tr>
+      <tr><td>disccardpromos inactive before → after</td><td style="text-align:right">${r.before.inactive} → ${r.after ? r.after.inactive : '?'}</td></tr>
+      <tr><td>disccardpromos total</td><td style="text-align:right">${r.after ? r.after.total : r.before.total}</td></tr>
+    </table>
+    ${verdict}
+    <p class="small-muted" style="margin-top:12px">This run: ${c.alreadyRight} already right · ${c.relinked} relinked · ${c.reactivated} re-activated · ${c.created} created${c.fundsLoaded ? ` (${c.fundsLoaded} loaded with funds)` : ''} · ${c.deactivatedNonApproved} deactivated (not approved) · ${c.deactivatedOrphans} deactivated (held by nobody)</p>
+    ${r.unfixable.length ? `<p class="small-muted" style="margin-top:10px;color:var(--danger)"><strong>Still need a human:</strong></p>${list(r.unfixable, u => `<li>${esc(u.name)} — ${esc(u.reason)}</li>`)}` : ''}
+    ${r.deactivated.length ? `<p class="small-muted" style="margin-top:10px">Deactivated:</p>${list(r.deactivated, d => `<li>${esc(d)}</li>`)}` : ''}
+    ${r.notes.length ? `<p class="small-muted" style="margin-top:10px">Notes:</p>${list(r.notes, n => `<li>${esc(n)}</li>`)}` : ''}
+  `;
+  openModal('Disccardpromos Match Result', body, `<button class="btn btn-outline btn-sm" onclick="closeModal();startProviderEnforce()">Run Again</button>`);
 }
 async function deactivateOrphan(accountId) {
   if (!confirm(`Deactivate disccardpromos customer ${accountId}? No applicant here holds it. The card is locked on their side (reversible there); nothing is deleted.`)) return;

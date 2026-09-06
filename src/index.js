@@ -16,6 +16,7 @@ import { fileURLToPath } from 'url';
 import { initMail } from './services/mail.js';
 import { sendDueTaskReminders } from './services/reminders.js';
 import { syncAllCards } from './services/cardSync.js';
+import { recheckAllApplicantDuplicates } from './services/duplicates.js';
 import { syncInboundSms, getOwnSmsNumber } from './services/sms.js';
 import { runBackup } from './services/backup.js';
 import { DEFAULT_ORG_ID } from './db.js';
@@ -28,7 +29,7 @@ import settingsRoutes from './routes/settings.js';
 import contractSettingsRoutes from './routes/contractSettings.js';
 import siteContentRoutes from './routes/siteContent.js';
 import shulRoutes from './routes/shuls.js';
-import applicantRoutes from './routes/applicants.js';
+import applicantRoutes, { enforceProviderForOrg } from './routes/applicants.js';
 import cardRoutes from './routes/cards.js';
 import storeRoutes from './routes/stores.js';
 import formRoutes from './routes/forms.js';
@@ -203,6 +204,26 @@ setTimeout(() => { sendDueTaskReminders().catch(e => console.error('[reminders] 
 const CARD_SYNC_INTERVAL_MS = 15 * 60 * 1000;
 setInterval(() => { syncAllCards(DEFAULT_ORG_ID).catch(e => console.error('[cardSync] sweep failed', e.message)); }, CARD_SYNC_INTERVAL_MS);
 setTimeout(() => { syncAllCards(DEFAULT_ORG_ID).catch(e => console.error('[cardSync] sweep failed', e.message)); }, 20 * 1000);
+
+// Automatic disccardpromos match — keeps "approved here" and "active there"
+// identical without anyone clicking anything: every approved applicant
+// holds one active customer, everything nobody approved holds is locked.
+// Runs once shortly after boot (a fresh deploy heals old drift on its own)
+// and every 15 minutes after; a failed write mid-approval also schedules a
+// run about a minute later (see services/providerEnforce.js). No-ops in
+// mock mode.
+const PROVIDER_ENFORCE_INTERVAL_MS = 15 * 60 * 1000;
+setInterval(() => { enforceProviderForOrg(DEFAULT_ORG_ID, 'scheduled').catch(e => console.error('[providerEnforce] sweep failed', e.message)); }, PROVIDER_ENFORCE_INTERVAL_MS);
+setTimeout(() => { enforceProviderForOrg(DEFAULT_ORG_ID, 'startup').catch(e => console.error('[providerEnforce] sweep failed', e.message)); }, 40 * 1000);
+
+// One duplicate-detection sweep per boot — clears any flag left behind by
+// the old "an incomplete applicant could be flagged before re-enrollment"
+// behavior and freshly checks everyone else (idempotent; see
+// services/duplicates.js's recheckAllApplicantDuplicates).
+setTimeout(() => {
+  try { const r = recheckAllApplicantDuplicates(DEFAULT_ORG_ID, null); if (r.cleared || r.flagged) console.log(`[duplicates] startup recheck: cleared ${r.cleared}, flagged ${r.flagged} of ${r.checked}`); }
+  catch (e) { console.error('[duplicates] startup recheck failed', e.message); }
+}, 35 * 1000);
 
 // Automatic inbound-SMS sync — SimpleSender doesn't support webhooks yet, so
 // this polls GET /v1/messages for new incoming replies instead. No-ops
