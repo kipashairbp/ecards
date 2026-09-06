@@ -72,6 +72,28 @@ function buildProviderOpts(orgId, applicant, groupName) {
   return opts;
 }
 
+// Only meaningful for an approved applicant — everyone else is null (no
+// disccardpromos account is ever expected for a pending/rejected/draft/
+// incomplete row). 'synced' means the approve routes' best-effort push
+// (see upsertAccountForApproval below) actually succeeded and stuck.
+// 'exempt' is deliberate (the one-time-backfill provider_exempt flag —
+// see POST /import's initialStatus comment). A $0 card_amount does NOT
+// belong in this list as its own reason: both approve routes always
+// attempt upsertAccountForApproval as long as shul_id is set and the
+// applicant isn't exempt, regardless of amount — amount only gates the
+// separate addFunds call further down (a $0 applicant still gets a real
+// disccardpromos customer record, just with nothing loaded onto it). So
+// anything left over here — approved, not exempt, still no account — is
+// the genuine gap: a disccardpromos API error at approval time (or a
+// merged-secondary whose primary never got approved either) that nothing
+// retried afterward.
+function providerSyncStatus(a) {
+  if (a.approval_status !== 'approved') return null;
+  if (a.provider_account_id) return 'synced';
+  if (a.provider_exempt) return 'exempt';
+  return 'missing';
+}
+
 // True if this applicant was merged into another shul's record as the same
 // real person (see services/duplicates.js's mergeApplicants) — merge_group_id
 // is set to the PRIMARY member's own id on every member of a merged group,
@@ -223,7 +245,7 @@ function scopeWhere(req) {
 }
 
 router.get('/', (req, res) => {
-  const { search, status, shul_id, season_id, home_for_yomtov, marital_status, paused, sort = 'created_at', dir = 'DESC', page = 1, pageSize = 50 } = req.query;
+  const { search, status, shul_id, season_id, home_for_yomtov, marital_status, paused, provider_sync, sort = 'created_at', dir = 'DESC', page = 1, pageSize = 50 } = req.query;
   let { where, params } = scopeWhere(req);
   if (status) { where += ' AND a.approval_status = ?'; params.push(status); }
   if (paused === '1' || paused === '0') { where += ' AND a.is_paused = ?'; params.push(+paused); }
@@ -231,6 +253,14 @@ router.get('/', (req, res) => {
   if (season_id) { where += ' AND a.season_id = ?'; params.push(season_id); }
   if (marital_status) { where += ' AND a.marital_status = ?'; params.push(marital_status); }
   if (home_for_yomtov !== undefined && home_for_yomtov !== '') { where += ' AND a.home_for_yomtov = ?'; params.push(home_for_yomtov === 'true' || home_for_yomtov === '1' ? 1 : 0); }
+  // Only 'missing' is offered as a real filter — the actual, unexplained
+  // gap between "approved" and "has a disccardpromos account" (see
+  // providerSyncStatus above): approved, not deliberately exempt, and
+  // still has no provider_account_id. Not conditioned on card_amount — a
+  // $0 applicant still gets a real account (see providerSyncStatus).
+  if (provider_sync === 'missing') {
+    where += ` AND a.approval_status = 'approved' AND a.provider_exempt = 0 AND a.provider_account_id IS NULL`;
+  }
   if (search) {
     where += ` AND (a.first_name LIKE ? OR a.last_name LIKE ? OR a.email LIKE ? OR a.home_phone LIKE ? OR a.husband_cell LIKE ? OR a.wife_cell LIKE ? OR a.external_id LIKE ?
       OR a.address LIKE ? OR a.city LIKE ? OR a.state LIKE ? OR a.zip LIKE ? OR a.comments LIKE ? OR a.permanent_comments LIKE ?)`;
@@ -243,6 +273,7 @@ router.get('/', (req, res) => {
   const total = db.prepare(`SELECT COUNT(*) c FROM applicants a ${where}`).get(...params).c;
   const offset = (Math.max(1, +page) - 1) * +pageSize;
   const rows = db.prepare(`SELECT a.*, s.name_en as shul_name, ps.name_en as previous_shul_name FROM applicants a LEFT JOIN shuls s ON s.id = a.shul_id LEFT JOIN shuls ps ON ps.id = a.previous_shul_id ${where} ORDER BY ${sortCol} ${sortDir} LIMIT ? OFFSET ?`).all(...params, +pageSize, offset);
+  for (const r of rows) r.provider_sync = providerSyncStatus(r);
   res.json({ applicants: maskForShul(redact(rows, req.permission.hidden_fields), req.user.role, req.user.org_id), total, page: +page, pageSize: +pageSize });
 });
 
@@ -265,6 +296,27 @@ router.get('/export', requirePermission('applicants', 'can_export'), (req, res) 
   }
   const rows = db.prepare(`SELECT a.*, s.name_en as shul_name FROM applicants a LEFT JOIN shuls s ON s.id = a.shul_id ${where} ORDER BY a.created_at DESC`).all(...params);
   sendXlsx(res, `applicants-${Date.now()}.xlsx`, redact(rows, req.permission.hidden_fields));
+});
+
+// Answers "594 approved but only 567 in disccardpromos" — the counts
+// behind providerSyncStatus above, for whichever season is asked about
+// (defaults to the org's active one). 'missing' is the only bucket that
+// actually needs attention; 'exempt' is an expected, deliberate reason an
+// approved applicant never gets an account there. A $0 card amount is
+// NOT its own bucket — see providerSyncStatus's comment for why. Admin-
+// only (requireAdmin below) — this is an org-wide reconciliation view,
+// not something a shul/store portal login has any use for.
+router.get('/provider-sync-summary', requireAdmin, (req, res) => {
+  const seasonId = req.query.season_id || getActiveSeasonId(req.user.org_id);
+  const rows = db.prepare(`SELECT provider_account_id, provider_exempt FROM applicants WHERE org_id = ? AND season_id = ? AND approval_status = 'approved'`)
+    .all(req.user.org_id, seasonId);
+  let synced = 0, exempt = 0, missing = 0;
+  for (const r of rows) {
+    if (r.provider_account_id) synced++;
+    else if (r.provider_exempt) exempt++;
+    else missing++;
+  }
+  res.json({ seasonId, approved: rows.length, synced, exempt, missing });
 });
 
 // Shul-portal export: the shul's own pending/approved applicants, in the

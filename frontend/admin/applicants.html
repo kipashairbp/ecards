@@ -20,6 +20,7 @@ renderShell('/admin/applicants', `
       <button class="btn btn-outline btn-sm" id="btn-import">Mass Upload</button>
       <button class="btn btn-outline btn-sm" id="btn-export">Export Excel</button>
       <button class="btn btn-outline btn-sm" id="f-dupes">Duplicates</button>
+      <button class="btn btn-outline btn-sm" id="btn-provider-sync">Disccardpromos Sync</button>
       <button class="btn btn-outline btn-sm" id="btn-columns">Customize Columns</button>
       <button class="btn btn-primary btn-sm" id="btn-new">+ Add Applicant</button>
     </div>
@@ -44,6 +45,7 @@ renderShell('/admin/applicants', `
     <button class="btn btn-sm btn-primary" id="btn-mass-apply" disabled>Apply to Selected (0)</button>
   </div>
   <div id="live-banner"></div>
+  <div id="provider-sync-banner"></div>
   <div class="card" style="padding:0;overflow-x:auto">
     <table id="tbl">
       <thead id="thead"></thead>
@@ -53,7 +55,7 @@ renderShell('/admin/applicants', `
   <div class="paginator" id="pager"></div>
 `);
 
-let state = { search:'', status:'', paused:'', marital_status:'', shul_id:'', season_id:'', sort:'created_at', dir:'DESC', page:1, pageSize:25 };
+let state = { search:'', status:'', paused:'', marital_status:'', shul_id:'', season_id:'', provider_sync:'', sort:'created_at', dir:'DESC', page:1, pageSize:25 };
 let selected = new Set();
 
 // Every field a column can show, plus how to render it — the checkbox
@@ -80,6 +82,7 @@ const APPLICANT_COLUMNS = [
   { key: 'home_for_yomtov', label: 'Home Yom Tov', render: a => a.home_for_yomtov ? 'Yes' : 'No' },
   { key: 'approval_status', label: 'Status', sort: 'approval_status', render: a => badge(a.approval_status, a.approval_status) },
   { key: 'card_amount', label: 'Card $', sort: 'card_amount', render: a => a.card_amount != null ? fmtMoney(a.card_amount) : '' },
+  { key: 'provider_sync', label: 'Disccardpromos', render: a => providerSyncBadge(a.provider_sync) },
   { key: 'comments', label: 'Comments', render: a => esc(a.comments||'') },
   { key: 'created_at', label: 'Submitted', sort: 'created_at', render: a => fmtDate(a.created_at) },
 ];
@@ -105,6 +108,11 @@ qs('#thead').parentElement.addEventListener('click', (e) => {
 
 async function load() {
   const params = new URLSearchParams(Object.fromEntries(Object.entries(state).filter(([,v]) => v !== '')));
+  qs('#provider-sync-banner').innerHTML = state.provider_sync === 'missing'
+    ? `<div class="card" style="padding:10px 14px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center">
+        <span>Showing only approved applicants missing a disccardpromos account.</span>
+        <button class="btn btn-sm btn-outline" onclick="clearProviderSyncFilter()">Clear filter</button>
+      </div>` : '';
   try {
     const { applicants, total } = await api('/applicants?' + params);
     const cols = activeColumns.map(k => APPLICANT_COLUMNS.find(c => c.key === k)).filter(Boolean);
@@ -154,6 +162,47 @@ qs('#btn-export').addEventListener('click', () => downloadAuthed('/applicants/ex
 qs('#btn-new').addEventListener('click', () => openApplicantForm());
 qs('#btn-import').addEventListener('click', () => openImportModal());
 qs('#f-dupes').addEventListener('click', showDuplicates);
+qs('#btn-provider-sync').addEventListener('click', showProviderSync);
+
+// null = not approved (irrelevant); the three real states an approved
+// applicant can be in — see providerSyncStatus() in routes/applicants.js
+// for what each one actually means. A $0 card amount is NOT its own state
+// here — both approve routes always attempt the account write regardless
+// of amount (amount only gates whether funds get loaded onto it after),
+// so a $0 applicant still shows as 'synced' once the account exists.
+function providerSyncBadge(status) {
+  if (!status) return '';
+  const labels = { synced: 'Synced', exempt: 'Exempt', missing: 'Missing' };
+  const classes = { synced: 'approved', exempt: 'submitted', missing: 'rejected' };
+  return badge(labels[status] || status, classes[status] || status);
+}
+
+// Answers "594 approved but only 567 in disccardpromos" directly, with the
+// breakdown behind the gap — 'exempt' is expected and not a problem;
+// 'missing' is the one number worth acting on.
+async function showProviderSync() {
+  try {
+    const params = state.season_id ? `?season_id=${state.season_id}` : '';
+    const s = await api('/applicants/provider-sync-summary' + params);
+    const body = `
+      <p class="small-muted">For the season currently selected in the filter above (${s.approved} approved applicants).</p>
+      <table style="width:100%">
+        <tr><td>Synced to disccardpromos</td><td style="text-align:right"><strong>${s.synced}</strong></td></tr>
+        <tr><td>Marked exempt (backfill import — never sent, on purpose)</td><td style="text-align:right">${s.exempt}</td></tr>
+        <tr style="border-top:1px solid var(--border)"><td><strong>Missing — should have an account but doesn't</strong></td><td style="text-align:right"><strong>${s.missing}</strong></td></tr>
+      </table>
+      ${s.missing ? `<p class="small-muted" style="margin-top:12px">These likely hit a disccardpromos error at approval time (a rate limit, a temporary outage, or a data issue) that nothing retried automatically. Click below to see exactly which applicants these are.</p>` : `<p class="small-muted" style="margin-top:12px">Nothing missing for this season — the full gap is accounted for by exempt records.</p>`}
+    `;
+    const footer = s.missing ? `<button class="btn btn-primary btn-sm" onclick="closeModal();viewMissingProviderSync()">View the ${s.missing} Missing</button>` : '';
+    openModal('Disccardpromos Sync Status', body, footer);
+  } catch (err) { toast(err.message, true); }
+}
+function viewMissingProviderSync() {
+  qs('#f-status').value = 'approved'; state.status = 'approved';
+  state.provider_sync = 'missing'; state.page = 1;
+  load();
+}
+function clearProviderSyncFilter() { state.provider_sync = ''; load(); }
 const MASS_ACTIONS = {
   approve: {
     confirm: null,
