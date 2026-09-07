@@ -68,7 +68,7 @@ renderShell('/admin/donor-dashboard', `
 // donut's center. Legend is always present (2+ series) per the dataviz
 // skill; label/value text uses textContent, never innerHTML, since these
 // ultimately trace back to database content.
-function renderDonut(containerId, segments) {
+function renderDonut(containerId, segments, formatValue = (v) => v.toLocaleString()) {
   const el = qs('#' + containerId);
   const total = segments.reduce((s, x) => s + (x.value || 0), 0);
   const R = 60, C = 2 * Math.PI * R, CX = 80, CY = 80;
@@ -96,7 +96,7 @@ function renderDonut(containerId, segments) {
     c.setAttribute('role', 'img');
     c.classList.add('donut-arc');
     const titleEl = document.createElementNS(svgNS, 'title');
-    titleEl.textContent = `${s.label}: ${s.value} (${Math.round(frac * 100)}%)`;
+    titleEl.textContent = `${s.label}: ${formatValue(s.value)} (${Math.round(frac * 100)}%)`;
     c.appendChild(titleEl);
     svg.appendChild(c);
     arcEls.push({ el: c, s, frac });
@@ -105,7 +105,7 @@ function renderDonut(containerId, segments) {
   const box = document.createElement('div'); box.className = 'donut-svg-box';
   box.appendChild(svg);
   const center = document.createElement('div'); center.className = 'donut-center';
-  const defaultCenter = () => { center.innerHTML = ''; const n = document.createElement('div'); n.className = 'n'; n.textContent = String(total); const l = document.createElement('div'); l.className = 'l'; l.textContent = 'Total'; center.appendChild(n); center.appendChild(l); };
+  const defaultCenter = () => { center.innerHTML = ''; const n = document.createElement('div'); n.className = 'n'; n.textContent = formatValue(total); const l = document.createElement('div'); l.className = 'l'; l.textContent = 'Total'; center.appendChild(n); center.appendChild(l); };
   defaultCenter();
   box.appendChild(center);
 
@@ -116,7 +116,7 @@ function renderDonut(containerId, segments) {
     const row = document.createElement('div'); row.className = 'donut-legend-row'; row.tabIndex = 0;
     const sw = document.createElement('span'); sw.className = 'donut-swatch'; sw.style.background = s.color;
     const label = document.createElement('span'); label.style.flex = '1'; label.textContent = s.label;
-    const val = document.createElement('span'); val.className = 'small-muted'; val.textContent = `${s.value} (${Math.round(frac * 100)}%)`;
+    const val = document.createElement('span'); val.className = 'small-muted'; val.textContent = `${formatValue(s.value)} (${Math.round(frac * 100)}%)`;
     row.appendChild(sw); row.appendChild(label); row.appendChild(val);
     legend.appendChild(row);
     legendRows.push({ el: row, s, frac });
@@ -125,7 +125,7 @@ function renderDonut(containerId, segments) {
   function showDetail(s, frac) {
     center.innerHTML = '';
     const l = document.createElement('div'); l.className = 'l'; l.textContent = s.label;
-    const n = document.createElement('div'); n.className = 'n'; n.textContent = String(s.value);
+    const n = document.createElement('div'); n.className = 'n'; n.textContent = formatValue(s.value);
     const p = document.createElement('div'); p.className = 'l'; p.textContent = `${Math.round(frac * 100)}%`;
     center.appendChild(l); center.appendChild(n); center.appendChild(p);
   }
@@ -185,7 +185,7 @@ async function loadDonorDashboard() {
     ['Money Loaded', fmtMoney(funds.loaded)],
     ['Money Spent', fmtMoney(funds.spent)],
     ['Open Duplicate Flags', duplicatesOpen],
-  ].map(([label, num]) => `<div class="stat-tile"><div class="num">${typeof num === 'string' ? esc(num) : num}</div><div class="label">${esc(label)}</div></div>`).join('');
+  ].map(([label, num]) => `<div class="stat-tile"><div class="num">${typeof num === 'string' ? esc(num) : num.toLocaleString()}</div><div class="label">${esc(label)}</div></div>`).join('');
 
   // approval_status/shul status are genuine STATE (not identity), so this
   // uses the fixed status palette (good/warning/critical), not the
@@ -200,6 +200,7 @@ async function loadDonorDashboard() {
     { label: 'Approved', value: shuls.approved, color: 'var(--viz-good)' },
     { label: 'Pending', value: shuls.pending, color: 'var(--viz-warning)' },
     { label: 'Rejected', value: shuls.rejected, color: 'var(--viz-critical)' },
+    { label: 'Skipped This Season', value: shuls.skipped, color: 'var(--viz-muted)' },
   ]);
   // Card status is a lifecycle stage, not a good/bad state — categorical
   // slots in fixed order.
@@ -212,7 +213,7 @@ async function loadDonorDashboard() {
   renderDonut('donut-funds', [
     { label: 'Spent', value: funds.spent, color: 'var(--viz-2)' },
     { label: 'Remaining', value: Math.max(0, funds.remaining), color: 'var(--viz-1)' },
-  ]);
+  ], fmtMoney);
 }
 async function loadDailyTrend() {
   const season_id = qs('#f-season').value;

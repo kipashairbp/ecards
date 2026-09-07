@@ -49,6 +49,10 @@ router.get('/stats', (req, res) => {
     pending: shulStatusCount('submitted') + shulStatusCount('contract_sent') + shulStatusCount('contract_signed'),
     approved: shulStatusCount('approved'),
     rejected: shulStatusCount('rejected'),
+    // Opted out of this season on purpose (see shuls.js's skip-season route)
+    // — distinct from rejected (we declined them) and worth its own slice
+    // rather than folding into "other".
+    skipped: shulStatusCount('skipped'),
   };
 
   const cardsTotal = db.prepare(`SELECT COUNT(*) c FROM cards WHERE org_id = ?${seasonClause}`).get(orgId, ...seasonParams).c;

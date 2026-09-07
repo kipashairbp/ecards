@@ -420,7 +420,13 @@ async function openShul(id) {
       ${shul.portal_user_id && ['super_admin','org_admin'].includes(Auth.user()?.role) ? `<button class="btn btn-outline btn-sm" onclick="openSetPasswordModal('${shul.portal_user_id}','${esc(shul.name_en).replace(/'/g,"\\'")}')">Set Password</button>` : ''}
       <button class="btn btn-primary btn-sm" onclick="saveShul('${id}')">Save</button>`;
     carryForwardContext = { id, name: shul.name_en, applicants };
-    openModal(shul.name_en, body, footer);
+    // wide: this footer can carry up to ~10 buttons (season/task/pause/
+    // delete/invite/portal/pending/skip/reject-approve/password/save) —
+    // the default 900px modal wrapped them into a cramped stack; extra
+    // width lets more sit on each row before wrapping (modal-footer itself
+    // also wraps now, see theme.css, so nothing overflows off-screen
+    // either way).
+    openModal(shul.name_en, body, footer, { wide: true });
     qsa('#stabs button').forEach(b => b.addEventListener('click', () => {
       qsa('#stabs button').forEach(x => x.classList.remove('active')); b.classList.add('active');
       ['info','notes','contract','applicants','messages','history'].forEach(t => qs('#tab-'+t).style.display = t === b.dataset.t ? 'block' : 'none');
