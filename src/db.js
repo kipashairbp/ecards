@@ -775,6 +775,22 @@ safeAlter(`ALTER TABLE stores ADD COLUMN disccard_setup_complete INTEGER DEFAULT
 // the current-state source of truth).
 safeAlter(`ALTER TABLE stores ADD COLUMN contract_signed_at TEXT`);
 
+// contract_signed_at only gets set going forward, at the moment
+// routes/documents.js's public sign route fires — a store whose agreement
+// was already signed before this column existed has a signed row sitting
+// in `documents` with nothing carried over onto the store itself. One-time
+// (cheap, idempotent — only touches rows still NULL) backfill from each
+// such store's latest signed document.
+{
+  const missing = db.prepare(`SELECT id FROM stores WHERE contract_signed_at IS NULL`).all();
+  const latestSigned = db.prepare(`SELECT signed_at FROM documents WHERE entity_type = 'store' AND entity_id = ? AND status = 'signed' ORDER BY created_at DESC LIMIT 1`);
+  const setSignedAt = db.prepare('UPDATE stores SET contract_signed_at = ? WHERE id = ?');
+  for (const store of missing) {
+    const doc = latestSigned.get(store.id);
+    if (doc?.signed_at) setSignedAt.run(doc.signed_at, store.id);
+  }
+}
+
 // One-time normalization of pre-existing phone numbers to the canonical
 // 123-456-7890 display format (see utils/phone.js). Cheap and idempotent —
 // re-running it on already-normalized numbers is a no-op — so it's safe to
