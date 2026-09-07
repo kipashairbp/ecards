@@ -32,8 +32,8 @@ renderShell('/admin/stores', `
     <button class="btn btn-sm btn-primary" id="btn-mass-apply" disabled>Apply to Selected (0)</button>
   </div>
   <div class="card" style="padding:0;overflow-x:auto">
-    <table><thead><tr><th style="width:34px"><input type="checkbox" id="chk-all"></th><th>Store</th><th>POS System</th><th>Discount</th><th>Manager</th><th>Owner</th><th>Setup Status</th><th>Onboarding</th><th>Live Spend</th><th>Disccard Setup Comments</th><th>Disccard Complete</th><th></th></tr></thead>
-    <tbody id="tbody"><tr><td colspan="12" class="empty-state">Loading…</td></tr></tbody></table>
+    <table><thead><tr><th style="width:34px"><input type="checkbox" id="chk-all"></th><th>Store</th><th>POS System</th><th>Discount</th><th>Manager</th><th>Owner</th><th>Setup Status</th><th>Contract</th><th>Onboarding</th><th>Live Spend</th><th>Disccard Setup Comments</th><th>Disccard Complete</th><th></th></tr></thead>
+    <tbody id="tbody"><tr><td colspan="13" class="empty-state">Loading…</td></tr></tbody></table>
   </div>
 `);
 
@@ -52,12 +52,13 @@ async function load() {
         <td>${esc(s.manager_name||'')}<br><span class="small-muted">${esc(s.manager_phone||'')}</span></td>
         <td>${esc(s.owner_name||'')}<br><span class="small-muted">${esc(s.owner_phone||'')}</span></td>
         <td>${badge(s.setup_status,s.setup_status)}${s.has_provider_account ? ' <span class="small-muted">(existing account)</span>' : ''}</td>
+        <td>${s.contract_signed_at ? `${badge('signed','active')}<br><span class="small-muted">${fmtDate(s.contract_signed_at)}</span>` : '<span class="small-muted">Not signed</span>'}</td>
         <td>${(s.onboarding_step||0) >= 3 ? badge('complete','active') : (s.portal_user_id ? `Step ${s.onboarding_step||0} of 3` : 'Not invited')}</td>
         <td><strong>${fmtMoney(s.total_purchases)}</strong>${s.total_refunds ? `<br><span class="small-muted">Refunds: ${fmtMoney(s.total_refunds)}</span>` : ''}<br><span class="small-muted">${s.txn_count} txn${s.txn_count===1?'':'s'}</span></td>
         <td onclick="event.stopPropagation()"><input type="text" class="inline-comments" value="${esc(s.disccard_setup_comments||'')}" data-orig="${esc(s.disccard_setup_comments||'')}" placeholder="—" onblur="saveStoreDisccardComments('${s.id}', this)" onkeydown="if(event.key==='Enter') this.blur()"></td>
         <td onclick="event.stopPropagation()"><input type="checkbox" ${s.disccard_setup_complete ? 'checked' : ''} onchange="saveStoreDisccardComplete('${s.id}', this.checked)"></td>
         <td><button class="btn btn-sm btn-outline" onclick="openStore('${s.id}')">Manage</button></td>
-      </tr>`).join('') : '<tr><td colspan="12" class="empty-state">No stores yet.</td></tr>';
+      </tr>`).join('') : '<tr><td colspan="13" class="empty-state">No stores yet.</td></tr>';
     qsa('.row-chk').forEach(c => c.addEventListener('change', onCheck));
   } catch (err) { toast(err.message, true); }
 }
