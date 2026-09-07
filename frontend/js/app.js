@@ -268,6 +268,7 @@ function applyOrgTheme(org) {
 
 const NAV_ITEMS = [
   { href: '/admin/dashboard', label: 'Dashboard', icon: '&#9670;', resource: 'dashboard' },
+  { href: '/admin/donor-dashboard', label: "Donor's Dash", icon: '&#9670;', resource: 'donor_dashboard' },
   { href: '/admin/analytics', label: 'Analytics', icon: '&#9670;', resource: 'dashboard' },
   { href: '/admin/shuls', label: 'Shuls', icon: '&#9670;', resource: 'shuls' },
   { href: '/admin/applicants', label: 'Applicants', icon: '&#9670;', resource: 'applicants' },

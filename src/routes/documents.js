@@ -308,6 +308,14 @@ router.post('/sign/:token/sign', async (req, res) => {
   const signatureData = primary ? values[primary.id] : null;
   db.prepare(`UPDATE documents SET status='signed', signature_data=?, signer_name=?, signer_title=?, signed_at=?, ip_address=?, signed_pdf_path=?, field_values=?, esign_consent_at=? WHERE id=?`)
     .run(signatureData, signer_name, signer_title || '', signedAt, req.ip, signedPath, JSON.stringify(values), signedAt, document.id);
+  // Mirrors shuls.js writing status='contract_signed' straight onto the
+  // shul at sign time — a store's contract goes through this generic
+  // documents system rather than its own dedicated table, so this is the
+  // one place a signed store agreement needs to be reflected back onto the
+  // store's own row (see db.js's contract_signed_at column comment).
+  if (document.entity_type === 'store') {
+    db.prepare('UPDATE stores SET contract_signed_at = ? WHERE id = ?').run(signedAt, document.entity_id);
+  }
 
   // A copy for the signer's own records — same "review & sign" link, which
   // now shows the signed state with a download button (sign-document.html).

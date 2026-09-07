@@ -25,7 +25,7 @@ renderShell('/admin/shuls', `
   </div>
   <div class="toolbar">
     <input id="f-search" placeholder="Search name, city, Rav, Gabai…">
-    <select id="f-status"><option value="">All statuses</option><option value="submitted">Submitted</option><option value="contract_sent">Contract Sent</option><option value="contract_signed">Contract Signed</option><option value="approved">Approved</option><option value="rejected">Rejected</option></select>
+    <select id="f-status"><option value="">All statuses</option><option value="submitted">Submitted</option><option value="contract_sent">Contract Sent</option><option value="contract_signed">Contract Signed</option><option value="approved">Approved</option><option value="rejected">Rejected</option><option value="skipped">X'd This Season</option></select>
     <select id="f-paused"><option value="">Paused: All</option><option value="1">Paused only</option><option value="0">Not paused</option></select>
     <select id="f-season"></select>
     <button class="btn btn-outline btn-sm" id="f-dupes">Duplicates</button>
@@ -70,7 +70,7 @@ if (new URLSearchParams(location.search).get('dup') === '1') showDuplicates();
 // status progression. Once approved/rejected, the ordinary status badge
 // takes back over — there's nothing left to distinguish at that point.
 function carryOverLabel(s) {
-  if (s.source !== 'carried_forward' || ['approved', 'rejected'].includes(s.status)) return null;
+  if (s.source !== 'carried_forward' || ['approved', 'rejected', 'skipped'].includes(s.status)) return null;
   const invited = !!s.portal_user_id;
   const contractSent = ['contract_sent', 'contract_signed'].includes(s.status);
   if (invited && contractSent) return { text: 'All Set', cls: 'active' };
@@ -338,7 +338,7 @@ async function openShul(id) {
       </div>
       <div id="tab-info">
         <div class="grid-2">
-          <div><strong>Status</strong><br>${badge(shul.status, shul.status)} ${shul.is_paused ? badge('paused','paused') : ''}</div>
+          <div><strong>Status</strong><br>${badge(shul.status, shul.status)} ${shul.is_paused ? badge('paused','paused') : ''}${shul.status === 'skipped' && shul.skip_reason ? `<div class="small-muted" style="margin-top:4px">Reason: ${esc(shul.skip_reason)}</div>` : ''}</div>
           <div><label>Slots Allocated</label><input id="e-slots_allocated" type="number" value="${shul.slots_allocated ?? 0}"></div>
         </div>
         <div class="divider"></div>
@@ -415,6 +415,7 @@ async function openShul(id) {
       ${!shul.portal_user_id ? `<button class="btn btn-outline btn-sm" onclick="inviteShul('${id}')">Invite to Portal</button>` : ''}
       ${shul.portal_user_id && Auth.can('portal_impersonation') ? `<button class="btn btn-outline btn-sm" onclick="enterPortal('shuls','${id}','${esc(shul.name_en).replace(/'/g,"\\'")}')">Enter Portal</button>` : ''}
       ${['approved','rejected'].includes(shul.status) ? `<button class="btn btn-outline btn-sm" onclick="setShulPending('${id}')">Set to Pending</button>` : ''}
+      ${shul.status === 'skipped' ? `<button class="btn btn-outline btn-sm" onclick="unskipShulSeason('${id}')">Undo X This Season</button>` : `<button class="btn btn-outline btn-sm" onclick="skipShulSeason('${id}')">X This Season</button>`}
       ${shul.status !== 'approved' ? `<button class="btn btn-outline btn-sm" onclick="rejectShul('${id}')">Reject</button><button class="btn btn-primary btn-sm" onclick="approveShul('${id}')">Approve</button>` : `<button class="btn btn-outline btn-sm" onclick="resendWelcome('${id}')">Resend Welcome Email</button>`}
       ${shul.portal_user_id && ['super_admin','org_admin'].includes(Auth.user()?.role) ? `<button class="btn btn-outline btn-sm" onclick="openSetPasswordModal('${shul.portal_user_id}','${esc(shul.name_en).replace(/'/g,"\\'")}')">Set Password</button>` : ''}
       <button class="btn btn-primary btn-sm" onclick="saveShul('${id}')">Save</button>`;
@@ -468,6 +469,17 @@ window.approveShul = async (id) => {
 };
 window.rejectShul = async (id) => { if (!confirm('Reject this shul application?')) return; try { await api(`/shuls/${id}/reject`, { method: 'POST' }); closeModal(); load(); } catch (err) { toast(err.message, true); } };
 window.setShulPending = async (id) => { try { await api(`/shuls/${id}/set-pending`, { method: 'POST' }); toast('Moved back to pending'); closeModal(); load(); } catch (err) { toast(err.message, true); } };
+// "X This Season" — the shul stays on record (this row, and any applicants
+// under it, are untouched) but is marked as not participating, with a
+// required reason so "why" isn't lost. Distinct from Reject (an actively
+// declined application) — see the route's comment in routes/shuls.js.
+window.skipShulSeason = async (id) => {
+  const reason = prompt('Reason this shul is not joining this season (required):');
+  if (reason === null) return;
+  if (!reason.trim()) { toast('A reason is required.', true); return; }
+  try { await api(`/shuls/${id}/skip-season`, { method: 'POST', body: { reason: reason.trim() } }); toast('Marked as not joining this season'); closeModal(); load(); } catch (err) { toast(err.message, true); }
+};
+window.unskipShulSeason = async (id) => { if (!confirm('Undo "X This Season" and move this shul back to Submitted?')) return; try { await api(`/shuls/${id}/unskip`, { method: 'POST' }); toast('Undone'); closeModal(); load(); } catch (err) { toast(err.message, true); } };
 window.deleteShul = async (id) => {
   if (!confirm('Permanently delete this shul? This removes the shul, its contract, and notes completely and cannot be undone. Its applicants are kept but unlinked from this shul.')) return;
   try { await api(`/shuls/${id}/permanent`, { method: 'DELETE' }); toast('Shul deleted'); closeModal(); load(); } catch (err) { toast(err.message, true); }

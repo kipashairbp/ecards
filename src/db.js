@@ -104,7 +104,7 @@ CREATE TABLE IF NOT EXISTS shuls (
   ruv_address TEXT, ruv_city TEXT, ruv_state TEXT, ruv_zip TEXT, ruv_place_id TEXT,
   gabai_first_name TEXT, gabai_last_name TEXT, gabai_cell TEXT, gabai_email TEXT,
   gabai_address TEXT, gabai_city TEXT, gabai_state TEXT, gabai_zip TEXT, gabai_place_id TEXT,
-  status TEXT NOT NULL DEFAULT 'submitted', -- submitted | contract_sent | contract_signed | approved | rejected
+  status TEXT NOT NULL DEFAULT 'submitted', -- submitted | contract_sent | contract_signed | approved | rejected | skipped
   slots_allocated INTEGER DEFAULT 0,
   is_paused INTEGER DEFAULT 0,       -- duplicate hold freeze
   duplicate_of_shul_id TEXT REFERENCES shuls(id),
@@ -763,6 +763,18 @@ safeAlter(`ALTER TABLE shuls ADD COLUMN comments TEXT`);
 safeAlter(`ALTER TABLE stores ADD COLUMN disccard_setup_comments TEXT`);
 safeAlter(`ALTER TABLE stores ADD COLUMN disccard_setup_complete INTEGER DEFAULT 0`);
 
+// Set when a store's participation agreement gets e-signed (see
+// routes/documents.js's public sign route) — a store's own lifecycle field
+// (setup_status: pending|in_progress|active|inactive|rejected) is an
+// operational status, not a contract-signing checkpoint, so this is a
+// separate direct signal on the store row itself, the same way shuls.js
+// writes status='contract_signed' straight onto the shul. Like that shul
+// field, a later retracted signature deliberately leaves this alone — it
+// records that a contract WAS signed at that point in time, not the
+// document's current live state (routes/documents.js's own signed_at is
+// the current-state source of truth).
+safeAlter(`ALTER TABLE stores ADD COLUMN contract_signed_at TEXT`);
+
 // One-time normalization of pre-existing phone numbers to the canonical
 // 123-456-7890 display format (see utils/phone.js). Cheap and idempotent —
 // re-running it on already-normalized numbers is a no-op — so it's safe to
@@ -972,6 +984,14 @@ db.exec(`CREATE TABLE IF NOT EXISTS impersonation_tokens (
   used_at TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 )`);
+
+// "X This Season" — a shul that's on the list (has a row for this season,
+// e.g. from carry-forward or a prior season's roster) but explicitly isn't
+// participating this time, distinct from 'rejected' (their application was
+// declined) — this is "we know about them, they chose/were told not to
+// join." skip_reason is required by the route, never by the schema, so a
+// pre-existing NULL from before this feature never breaks anything.
+safeAlter(`ALTER TABLE shuls ADD COLUMN skip_reason TEXT`);
 
 export const DEFAULT_ORG_ID = defaultOrgId;
 export function uuid() { return randomUUID(); }

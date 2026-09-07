@@ -181,18 +181,40 @@ export async function refundCard(seasonId, { cardNum, amount }) {
   return call(seasonId, '/v1/refund/', { method: 'POST', body: JSON.stringify({ cardNum, amount }) });
 }
 
-// Credits amount onto a customer's balance against one of their `packages`
-// (discountId) — this is what actually loads money onto a card, identified
-// by OUR applicant's external_id rather than a disccardpromos customer id.
-// Wired into applicant approval (routes/applicants.js) — per-season/package
-// mapping was explicitly ruled out; there's one org-wide Package/Discount ID
-// (Settings > Organization > Gift Card Loading, settings key
-// disccardpromos_discount_id) used for every approval regardless of season.
-export async function addFunds(seasonId, { externalId, discountId, amount }) {
+// Live-confirmed 2026-09-07 (with disccardpromos support, after every
+// attempt at the guessed '/v1/add-funds/' endpoint below 404'd in every
+// live test): there is no separate add-funds endpoint at all. `amount` is
+// a field on the ordinary Customer PATCH (same one create/updateCustomer
+// already send it through via customerPayload) — writing it sets that
+// package's amount OUTRIGHT, it does not increment. "Adding funds" on top
+// of an existing balance means reading the customer's current package
+// amount first and writing back current+delta as the new total ($100 on
+// the card, add $100 more -> write 200, not 100). Every call site in this
+// app only ever loads an applicant's FULL card_amount once, at the moment
+// their account is first created (never a top-up on an existing balance —
+// every call site below gates this on the account having just been
+// created), so none of them need the read-first step; `amount` here is
+// already the absolute total to write, not a delta. customerId is required — writing
+// by external_id alone isn't offered by their Customer PATCH, and a
+// shared (merged-group) customer's own external_id may not even be this
+// applicant's.
+export async function addFunds(seasonId, { customerId, externalId, discountId, amount }) {
   if (isMockMode(seasonId)) return { success: true, mock: true };
-  return call(seasonId, '/v1/add-funds/', { method: 'POST', body: JSON.stringify({
-    external_id: externalId, discount_id: discountId, amount,
+  return call(seasonId, `/org/customers/${normalizeCustomerId(customerId)}/`, { method: 'PATCH', body: JSON.stringify({
+    amount, discount_id: discountId, external_id: externalId,
   }) });
+}
+
+// The read half of "add funds" for the one caller that actually needs it —
+// a future top-up on an EXISTING balance (not first-time loading, which
+// never needs to read first — see addFunds' comment). Returns the current
+// amount on the given package/discount, or 0 if the customer has no such
+// package yet.
+export async function getCustomerPackageAmount(seasonId, customerId, discountId) {
+  if (isMockMode(seasonId)) return 0;
+  const customer = await getCustomerById(seasonId, customerId);
+  const pkg = (customer?.packages || []).find(p => String(p.id) === String(discountId));
+  return pkg ? Number(pkg.amount) || 0 : 0;
 }
 
 // ---------------------------------------------------------------------------

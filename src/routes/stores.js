@@ -221,7 +221,15 @@ router.post('/', requirePermission('stores', 'can_edit'), (req, res) => {
 router.put('/:id', requirePermission('stores', 'can_edit'), (req, res) => {
   const store = db.prepare('SELECT * FROM stores WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!store) return res.status(404).json({ error: 'Not found' });
-  const fields = ['name','address','city','state','zip','phone','pos_system','manager_name','manager_phone','manager_email','owner_name','owner_phone','owner_email','same_person','comments','setup_status','has_provider_account','provider_store_id','discount','disccard_setup_comments','disccard_setup_complete'];
+  // discount is admin-only (see GET /export and GET /:id below, which both
+  // strip it from a store's own view) — this whitelist is the write-side
+  // half of that same rule. Without it, a store's own portal login (which
+  // needs can_edit here to update its own address/phone/manager info) could
+  // set the exact field it's never supposed to see, via a raw API call even
+  // though no store-portal UI exposes it.
+  const fields = req.user.role === 'store'
+    ? ['name','address','city','state','zip','phone','pos_system','manager_name','manager_phone','manager_email','owner_name','owner_phone','owner_email','same_person','comments']
+    : ['name','address','city','state','zip','phone','pos_system','manager_name','manager_phone','manager_email','owner_name','owner_phone','owner_email','same_person','comments','setup_status','has_provider_account','provider_store_id','discount','disccard_setup_comments','disccard_setup_complete'];
   const b = req.body || {};
   if (b.phone !== undefined) b.phone = normalizePhone(b.phone);
   if (b.manager_phone !== undefined) b.manager_phone = normalizePhone(b.manager_phone);

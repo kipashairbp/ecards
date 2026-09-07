@@ -699,6 +699,36 @@ router.post('/:id/reject', requirePermission('shuls', 'can_edit'), (req, res) =>
   res.json({ ok: true });
 });
 
+// "X This Season" — the shul is on the roster (this row exists, most often
+// from carry-forward) but isn't participating this season, distinct from
+// 'rejected' (their application was actively declined). A reason is
+// required so the record of "why" survives, not just "that". Never
+// deletes/locks anything — the row (and its applicants, if any) stays
+// exactly where it is, just marked. Reversible via /:id/unskip below for
+// a genuine mistake, same as pause/unpause.
+router.post('/:id/skip-season', requirePermission('shuls', 'can_edit'), (req, res) => {
+  if (req.user.role === 'shul') return res.status(403).json({ error: 'Not permitted' });
+  const reason = (req.body?.reason || '').trim();
+  if (!reason) return res.status(400).json({ error: 'A reason is required.' });
+  const shul = db.prepare('SELECT * FROM shuls WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
+  if (!shul) return res.status(404).json({ error: 'Not found' });
+  db.prepare(`UPDATE shuls SET status='skipped', skip_reason=?, updated_at=datetime('now') WHERE id=?`).run(reason, shul.id);
+  logAudit(req.user.org_id, req.user.id, 'skip-season', 'shul', shul.id, { status: shul.status }, { status: 'skipped', skip_reason: reason }, req.ip);
+  res.json({ ok: true });
+});
+
+// Reverses skip-season — back to 'submitted' (the same starting point a
+// fresh application or carry-forward row would have), clearing the reason.
+router.post('/:id/unskip', requirePermission('shuls', 'can_edit'), (req, res) => {
+  if (req.user.role === 'shul') return res.status(403).json({ error: 'Not permitted' });
+  const shul = db.prepare('SELECT * FROM shuls WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
+  if (!shul) return res.status(404).json({ error: 'Not found' });
+  if (shul.status !== 'skipped') return res.status(400).json({ error: 'This shul is not marked as skipped.' });
+  db.prepare(`UPDATE shuls SET status='submitted', skip_reason=NULL, updated_at=datetime('now') WHERE id=?`).run(shul.id);
+  logAudit(req.user.org_id, req.user.id, 'unskip', 'shul', shul.id, { status: 'skipped', skip_reason: shul.skip_reason }, { status: 'submitted' }, req.ip);
+  res.json({ ok: true });
+});
+
 router.post('/mass-reject', requirePermission('shuls', 'can_edit'), (req, res) => {
   if (req.user.role === 'shul') return res.status(403).json({ error: 'Not permitted' });
   const { ids } = req.body || {};

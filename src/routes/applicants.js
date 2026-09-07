@@ -509,20 +509,29 @@ function loadProviderAudit(orgId, seasonId) {
   const row = db.prepare('SELECT value FROM settings WHERE org_id = ? AND key = ?').get(orgId, `provider_audit_last_${seasonId}`);
   try { return row ? JSON.parse(row.value) : null; } catch { return null; }
 }
-async function runWithConcurrency(items, limit, fn) {
-  let next = 0;
-  await Promise.all(Array(Math.min(limit, items.length)).fill(0).map(async () => {
-    while (next < items.length) { const i = next++; await fn(items[i]); }
-  }));
-}
-
 async function runProviderAudit(orgId, seasonId, job) {
   const rows = db.prepare(`SELECT a.*, s.name_en AS shul_name FROM applicants a LEFT JOIN shuls s ON s.id = a.shul_id WHERE a.org_id = ? AND a.season_id = ?`).all(orgId, seasonId);
   const describe = r => `${r.first_name} ${r.last_name}`.trim() + (r.shul_name ? ` (${r.shul_name})` : '');
   const now = new Date().toISOString();
   const setCheck = db.prepare(`UPDATE applicants SET provider_check_status = ?, provider_check_at = ? WHERE id = ?`);
 
-  // 1. Every distinct account id we hold, asked about directly.
+  // Pull disccardpromos' full customer list ONCE up front (their List
+  // Customers endpoint) instead of a separate GET per account id we hold
+  // plus a separate GET per external_id lookup plus yet another full list
+  // pull for orphan detection — every classification below (ours by id,
+  // ours by external_id, theirs with nothing pointing at it) reads off this
+  // one in-memory pull, so all three sections see the same snapshot instead
+  // of three snapshots that could disagree with each other mid-run.
+  let list = null, listError = null;
+  try { list = await giftcard.listCustomers(seasonId); } catch (e) { listError = e.message; }
+  const byId = new Map(), byExt = new Map();
+  for (const c of list || []) {
+    if (c?.id == null) continue;
+    byId.set(cleanProviderId(c.id), c);
+    if (c.external_id != null && c.external_id !== '') byExt.set(String(c.external_id), c);
+  }
+
+  // 1. Every distinct account id we hold, classified from the list above.
   const byAccount = new Map();
   for (const r of rows) {
     if (!r.provider_account_id) continue;
@@ -536,39 +545,31 @@ async function runProviderAudit(orgId, seasonId, job) {
 
   const counts = { active: 0, inactive: 0, not_found: 0, mock: 0, error: 0, relinked: 0 };
   const details = { not_found: [], mock: [], error: [], relinked: [] };
-  await runWithConcurrency(accountIds, 4, async (accountId) => {
+  for (const accountId of accountIds) {
     const members = byAccount.get(accountId);
     let status, message = null;
     if (/^mock_/.test(accountId)) status = 'mock';
+    else if (listError) { status = 'error'; message = listError; }
     else {
-      // One retry after a short pause on anything that isn't a definite
-      // answer (a 504 gateway timeout on a single lookup is exactly the kind
-      // of thing that shouldn't leave one applicant "could not be checked").
-      for (let attempt = 0; attempt < 2; attempt++) {
-        try {
-          const c = await giftcard.getCustomerById(seasonId, accountId);
-          if (!c) { status = 'error'; message = 'empty response'; }
-          else { status = c.is_active === false ? 'inactive' : 'active'; message = null; }
-          if (status !== 'error') break;
-        } catch (e) {
-          if (e.status === 404) { status = 'not_found'; message = null; break; }
-          status = 'error'; message = e.message;
-        }
-        if (attempt === 0) await new Promise(r => setTimeout(r, 1500));
-      }
+      const c = byId.get(accountId);
+      status = c ? (c.is_active === false ? 'inactive' : 'active') : 'not_found';
     }
     counts[status]++;
     for (const m of members) setCheck.run(status, now, m.id);
     if (details[status]) details[status].push({ applicantIds: members.map(m => m.id), accountId, names: members.map(describe).join(' / '), statuses: members.map(m => m.approval_status).join('/'), message });
     job.progress++;
-  });
+  }
 
   // 2. Approved applicants we hold NO id for — does disccardpromos already
-  //    have them under their external_id? If so, we lost the id, not the
-  //    account: link it back rather than ever creating a duplicate.
-  await runWithConcurrency(missingRows, 4, async (r) => {
-    try {
-      const found = await giftcard.findCustomerByExternalId(seasonId, r.external_id);
+  //    have them under their external_id (in the list already pulled
+  //    above)? If so, we lost the id, not the account: link it back rather
+  //    than ever creating a duplicate.
+  for (const r of missingRows) {
+    if (listError) {
+      counts.error++; setCheck.run('error', now, r.id);
+      details.error.push({ applicantIds: [r.id], accountId: null, names: describe(r), message: listError });
+    } else {
+      const found = r.external_id ? byExt.get(String(r.external_id)) : null;
       if (found?.id) {
         const id = cleanProviderId(found.id);
         db.prepare('UPDATE applicants SET provider_account_id = ? WHERE id = ?').run(id, r.id);
@@ -576,19 +577,15 @@ async function runProviderAudit(orgId, seasonId, job) {
         setCheck.run('relinked', now, r.id);
         counts.relinked++; details.relinked.push({ applicantIds: [r.id], accountId: id, names: describe(r), message: 'found on disccardpromos by external id; id restored here' });
       } else setCheck.run('missing', now, r.id);
-    } catch (e) {
-      counts.error++; setCheck.run('error', now, r.id);
-      details.error.push({ applicantIds: [r.id], accountId: null, names: describe(r), message: e.message });
     }
     job.progress++;
-  });
+  }
 
-  // 3. Their full customer list — the reverse direction.
-  let provider = null, listError = null;
-  try {
-    const list = await giftcard.listCustomers(seasonId);
+  // 3. Their full customer list — the reverse direction — reusing the same
+  //    `list`/`byId`/`byExt` pulled once at the top of this function.
+  let provider = null;
+  if (!listError) {
     const ourIds = new Set(db.prepare(`SELECT DISTINCT provider_account_id FROM applicants WHERE org_id = ? AND provider_account_id IS NOT NULL`).all(orgId).map(r => cleanProviderId(r.provider_account_id)));
-    const byExt = new Map(rows.filter(r => r.external_id).map(r => [String(r.external_id), r]));
     const orphans = [];
     let active = 0, inactive = 0;
     for (const c of list) {
@@ -597,7 +594,7 @@ async function runProviderAudit(orgId, seasonId, job) {
       if (c.is_active === false) inactive++; else active++;
       if (ourIds.has(id)) continue;
       const ext = c.external_id != null && c.external_id !== '' ? String(c.external_id) : null;
-      const match = ext ? byExt.get(ext) : null;
+      const match = ext ? rows.find(r => r.external_id && String(r.external_id) === ext) : null;
       const current = match ? db.prepare('SELECT provider_account_id FROM applicants WHERE id = ?').get(match.id) : null;
       if (match && !current?.provider_account_id && !isMergedSecondary(match)) {
         db.prepare('UPDATE applicants SET provider_account_id = ? WHERE id = ?').run(id, match.id);
@@ -624,7 +621,7 @@ async function runProviderAudit(orgId, seasonId, job) {
       orphans.push({ accountId: id, name: `${c.first_name || ''} ${c.last_name || ''}`.trim() || '(no name)', externalId: ext, groupName: c.group_name || null, isActive: c.is_active !== false, origin });
     }
     provider = { total: list.length, active, inactive, orphans };
-  } catch (e) { listError = e.message; }
+  }
   job.progress++;
 
   const stillMissing = db.prepare(`SELECT id, first_name, last_name FROM applicants WHERE org_id = ? AND season_id = ? AND approval_status = 'approved' AND provider_exempt = 0 AND provider_account_id IS NULL`).all(orgId, seasonId);
@@ -744,7 +741,7 @@ async function runProviderEnforce(orgId, seasonId, job) {
           counts.created++;
           const amount = a.card_amount ?? 0;
           if (r.created && amount > 0 && discountId) {
-            try { await giftcard.addFunds(seasonId, { externalId: a.external_id, discountId, amount }); counts.fundsLoaded++; }
+            try { await giftcard.addFunds(seasonId, { customerId: id, externalId: a.external_id, discountId, amount }); counts.fundsLoaded++; }
             catch (e) { notes.push(`${describe(a)}: account created, but loading $${amount} failed — ${e.message}`); }
           } else if (r.created && amount > 0) notes.push(`${describe(a)}: account created, but no disccardpromos Package/Discount ID is configured so $${amount} was not loaded`);
         }
@@ -941,7 +938,7 @@ router.post('/retry-provider-sync', requireAdmin, async (req, res) => {
         created++;
         const amount = applicant.card_amount ?? 0;
         if (amount > 0 && discountId) {
-          try { await giftcard.addFunds(seasonId, { externalId: applicant.external_id, discountId, amount }); fundsLoaded++; }
+          try { await giftcard.addFunds(seasonId, { customerId: result.accountId, externalId: applicant.external_id, discountId, amount }); fundsLoaded++; }
           catch (e) { failureDetails.push(`${name}: account created, but loading $${amount} failed — ${e.message}`); }
         } else if (amount > 0) notes.push(`${name}: account created, but no disccardpromos Package/Discount ID is configured so $${amount} was not loaded`);
       } else {
@@ -1582,7 +1579,7 @@ router.post('/:id/approve', requirePermission('applicants', 'can_edit'), async (
             providerFundsError = 'No disccardpromos Package/Discount ID configured (Settings > Organization > Gift Card Loading) — card amount was not loaded.';
           } else {
             try {
-              await giftcard.addFunds(applicant.season_id, { externalId: applicant.external_id, discountId, amount });
+              await giftcard.addFunds(applicant.season_id, { customerId: account.accountId, externalId: applicant.external_id, discountId, amount });
             } catch (e) {
               providerFundsError = e.message;
               console.error('[giftcard] failed to load funds on approval:', e.message);
@@ -1789,7 +1786,7 @@ router.post('/mass-approve', requirePermission('applicants', 'can_edit'), async 
         console.error('[giftcard] failed to write disccardpromos account on mass-approve:', account.error);
       }
       if (accountOk && amount > 0 && discountId) {
-        try { await giftcard.addFunds(applicant.season_id, { externalId: applicant.external_id, discountId, amount }); }
+        try { await giftcard.addFunds(applicant.season_id, { customerId: account.accountId, externalId: applicant.external_id, discountId, amount }); }
         catch (e) {
           providerErrors++;
           providerErrorDetails.push(`${applicant.first_name} ${applicant.last_name}: card not loaded — ${e.message}`);
