@@ -3,19 +3,48 @@ import {
   hardDeleteShul, hardDeleteApplicant, hardDeleteStore,
   restoreShulSnapshot, restoreApplicantSnapshot, restoreStoreSnapshot,
 } from '../utils/entityDelete.js';
+import {
+  restoreDuplicateResolve, restoreDuplicateMergeApplicants, restoreDuplicateMergeShuls,
+} from './duplicates.js';
 
-// Dispatch tables for undoing a hard delete (shul/applicant/store):
-// CASCADE_RESTORERS brings a full snapshot (see entityDelete.js) back —
-// used whenever the audit_log 'before' value is one of these snapshots,
-// i.e. undoing an original delete, or redoing a previous undo of one.
-// HARD_DELETERS is the reverse direction — re-deleting the entity via its
-// real cascade (not a naive single-row DELETE, which would violate FK
-// constraints against contracts/notes a prior undo just restored) — used
-// whenever the target state is "this entity shouldn't exist" (before ===
-// null) for one of these three entity types, whether that's undoing a
-// 'create' or redoing an original delete.
-const CASCADE_RESTORERS = { 'shul-cascade': restoreShulSnapshot, 'applicant-cascade': restoreApplicantSnapshot, 'store-cascade': restoreStoreSnapshot };
+// Dispatch tables for undoing a hard delete (shul/applicant/store), or a
+// duplicate resolve/bypass/merge (see services/duplicates.js): CASCADE_RESTORERS
+// brings a full snapshot back — used whenever the audit_log 'before' value is
+// one of these snapshots, i.e. undoing the original action, or redoing a
+// previous undo of one. HARD_DELETERS is the reverse direction — re-deleting
+// the entity via its real cascade (not a naive single-row DELETE, which
+// would violate FK constraints against contracts/notes a prior undo just
+// restored) — used whenever the target state is "this entity shouldn't
+// exist" (before === null) for one of these three entity types, whether
+// that's undoing a 'create' or redoing an original delete (see
+// SNAPSHOT_ONLY_ACTIONS below for why 'merge'/'resolve_duplicate' never
+// reach this fallback even though their entity_type also appears here).
+const CASCADE_RESTORERS = {
+  'shul-cascade': restoreShulSnapshot, 'applicant-cascade': restoreApplicantSnapshot, 'store-cascade': restoreStoreSnapshot,
+  'duplicate-resolve': restoreDuplicateResolve, 'duplicate-merge-applicant': restoreDuplicateMergeApplicants, 'duplicate-merge-shul': restoreDuplicateMergeShuls,
+};
 const HARD_DELETERS = { shul: hardDeleteShul, applicant: hardDeleteApplicant, store: hardDeleteStore };
+
+// A duplicate resolve/bypass/merge touches several rows at once (both sides
+// of a flag, every member of a merge group, reassigned applicants, ...) —
+// there's no single "this record's prior column values" to fall back to the
+// way restoreEntityState works for a plain update. So these two actions are
+// undoable ONLY via a full kind-tagged snapshot (see services/duplicates.js's
+// resolveFlag/mergeApplicants/mergeShuls) — never via the generic
+// restoreEntityState or HARD_DELETERS fallback below. Rows logged before
+// this snapshot existed (before === null, or a bare post-action summary
+// object with no `kind`) simply predate undo support: the exact prior state
+// was never recorded for them, so undoAuditEntry refuses rather than
+// guessing — critically, refuses rather than falling into HARD_DELETERS,
+// which for entity_type 'applicant'/'shul' would otherwise silently
+// hard-delete the merge's primary record on an old, snapshot-less row.
+const SNAPSHOT_ONLY_ACTIONS = new Set(['merge', 'resolve_duplicate']);
+// Actions where before === null legitimately means "this entity shouldn't
+// exist" — undoing a 'create', or redoing an 'undo' that itself reversed a
+// delete (see the HARD_DELETERS comment above). Deliberately NOT 'merge' or
+// any other action added later — before === null on those means "not
+// captured," never "should be deleted."
+const NULL_BEFORE_MEANS_DELETE = new Set(['create', 'undo']);
 
 // ---------------------------------------------------------------------------
 // Shared audit trail + generic undo/redo. Previously logAudit() was a local,
@@ -43,7 +72,10 @@ const HARD_DELETERS = { shul: hardDeleteShul, applicant: hardDeleteApplicant, st
 // 'undo' is here deliberately: undoing an action logs a new 'undo' entry
 // (see undoAuditEntry below), and that entry must itself be undoable — that
 // symmetry IS how redo works, rather than a separate redo code path.
-export const UNDOABLE_ACTIONS = ['create', 'update', 'delete', 'approve', 'reject', 'undo'];
+// 'merge' and 'resolve_duplicate' are gated further, in getRecentActions and
+// undoAuditEntry, via SNAPSHOT_ONLY_ACTIONS above — being in this list alone
+// isn't enough to make one of those rows undoable.
+export const UNDOABLE_ACTIONS = ['create', 'update', 'delete', 'approve', 'reject', 'undo', 'merge', 'resolve_duplicate'];
 
 // entity_type (as used in audit_log) -> real table + primary key column.
 const ENTITY_TABLES = {
@@ -102,16 +134,27 @@ export function getRecentActions(orgId, hours = 48) {
     db.prepare(`SELECT id FROM audit_log WHERE id IN (${placeholders}) AND undone_at IS NOT NULL`).all(...undoEntryIds)
       .forEach(r => consumedIds.add(r.id));
   }
-  return rows.map(r => ({
-    ...r,
-    before: r.before_json ? JSON.parse(r.before_json) : null,
-    after: r.after_json ? JSON.parse(r.after_json) : null,
-    undoable: (UNDOABLE_ACTIONS.includes(r.action) || r.action === 'mass-import' || r.action === 'mass-delete') && !!ENTITY_TABLES[r.entity_type] && !r.undone_at && !!(r.before_json || r.after_json),
-    // Lets the UI put a "Redo" button directly on an already-undone row
-    // instead of making the admin go find the separate "Reversed a change
-    // to..." entry the undo created.
-    redoable: !!r.undone_at && !!r.undo_entry_id && !consumedIds.has(r.undo_entry_id),
-  }));
+  return rows.map(r => {
+    const before = r.before_json ? JSON.parse(r.before_json) : null;
+    const after = r.after_json ? JSON.parse(r.after_json) : null;
+    // merge/resolve_duplicate rows are only undoable when they carry a real
+    // kind-tagged snapshot (see SNAPSHOT_ONLY_ACTIONS above) — a row logged
+    // before that snapshot existed (before === null, or an old bare
+    // post-action summary) never gets an Undo button, since there's no safe
+    // generic fallback for "put every touched row back" the way there is
+    // for a plain single-entity update.
+    const hasRestorableSnapshot = !!(before && before.kind && CASCADE_RESTORERS[before.kind]);
+    const undoable = SNAPSHOT_ONLY_ACTIONS.has(r.action)
+      ? hasRestorableSnapshot && !r.undone_at
+      : (UNDOABLE_ACTIONS.includes(r.action) || r.action === 'mass-import' || r.action === 'mass-delete') && !!ENTITY_TABLES[r.entity_type] && !r.undone_at && !!(r.before_json || r.after_json);
+    return {
+      ...r, before, after, undoable,
+      // Lets the UI put a "Redo" button directly on an already-undone row
+      // instead of making the admin go find the separate "Reversed a change
+      // to..." entry the undo created.
+      redoable: !!r.undone_at && !!r.undo_entry_id && !consumedIds.has(r.undo_entry_id),
+    };
+  });
 }
 
 // Every audit_log row for ONE specific record (an applicant/shul/store/...),
@@ -270,12 +313,22 @@ export function undoAuditEntry(auditId, actingUser, ip) {
   const after = entry.after_json ? JSON.parse(entry.after_json) : null;
   if (before === null && after === null) throw new Error('Nothing to restore for this action');
 
+  if (SNAPSHOT_ONLY_ACTIONS.has(entry.action) && !(before && before.kind && CASCADE_RESTORERS[before.kind])) {
+    // A merge/resolve touches several rows at once — see SNAPSHOT_ONLY_ACTIONS
+    // above — so without a real snapshot there is no safe way to undo it.
+    // Refuse outright rather than falling through to restoreEntityState or
+    // HARD_DELETERS, either of which would, for entity_type shul/applicant,
+    // wrongly delete the merge's primary record.
+    throw new Error(`This "${entry.action === 'merge' ? 'merge' : 'duplicate resolve'}" action was logged before undo support existed for it, so the exact prior state was never recorded — it can't be undone.`);
+  }
+
   const run = db.transaction(() => {
     if (before && before.kind && CASCADE_RESTORERS[before.kind]) {
-      // Undoing a hard delete (or redoing a previous undo of one) — bring
-      // back the whole snapshot, not just the bare row.
+      // Undoing a hard delete, a duplicate resolve/merge (or redoing a
+      // previous undo of one) — bring back the whole snapshot, not just a
+      // bare row.
       CASCADE_RESTORERS[before.kind](before);
-    } else if (before === null && HARD_DELETERS[entry.entity_type]) {
+    } else if (before === null && NULL_BEFORE_MEANS_DELETE.has(entry.action) && HARD_DELETERS[entry.entity_type]) {
       // Target state is "doesn't exist" for a shul/applicant/store — use
       // the real cascade delete rather than restoreEntityState's naive
       // single-row DELETE, which would fail (or leave orphans) against any

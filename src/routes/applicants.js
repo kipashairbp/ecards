@@ -2031,8 +2031,10 @@ router.get('/duplicates/open', requireAdmin, (req, res) => {
 router.post('/duplicates/:flagId/resolve', requirePermission('applicants', 'can_edit'), (req, res) => {
   const { action } = req.body || {};
   try {
-    const flag = resolveFlag(req.params.flagId, req.user.id, action);
-    if (!flag) return res.status(404).json({ error: 'Not found' });
+    const result = resolveFlag(req.params.flagId, req.user.id, action);
+    if (!result) return res.status(404).json({ error: 'Not found' });
+    const { flag, undoSnapshot } = result;
+    logAudit(req.user.org_id, req.user.id, 'resolve_duplicate', 'applicant', flag.entity_id, undoSnapshot, flag, req.ip);
     res.json({ flag });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
@@ -2065,7 +2067,8 @@ router.post('/duplicates/:flagId/merge', requirePermission('applicants', 'can_ed
   const { primaryId, values, memberIds } = req.body || {};
   try {
     const result = mergeApplicants(req.user.org_id, req.user.id, { primaryId, values, memberIds });
-    logAudit(req.user.org_id, req.user.id, 'merge', 'applicant', primaryId, null, result, req.ip);
+    const { undoSnapshot, ...after } = result;
+    logAudit(req.user.org_id, req.user.id, 'merge', 'applicant', primaryId, undoSnapshot, after, req.ip);
     res.json(result);
   } catch (e) { res.status(400).json({ error: e.message }); }
 });

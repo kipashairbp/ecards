@@ -1056,5 +1056,11 @@ db.exec(`CREATE TABLE IF NOT EXISTS library_documents (
   created_at TEXT DEFAULT (datetime('now'))
 )`);
 
+// Per-user page-size preference for list pages (Applicants, Shuls, etc.) —
+// one JSON blob keyed by page (e.g. {"applicants":50,"shuls":100}) rather
+// than a column per page, since the set of pages that offer a page-size
+// control grows over time and a new one shouldn't need its own migration.
+safeAlter(`ALTER TABLE users ADD COLUMN page_size_prefs TEXT`);
+
 export const DEFAULT_ORG_ID = defaultOrgId;
 export function uuid() { return randomUUID(); }

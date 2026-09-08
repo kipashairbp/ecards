@@ -55,7 +55,7 @@ renderShell('/admin/shuls', `
   <div class="paginator" id="pager"></div>
 `);
 
-let state = { search:'', status:'', paused:'', season_id:'', sort:'created_at', dir:'DESC', page:1, pageSize:25 };
+let state = { search:'', status:'', paused:'', season_id:'', sort:'created_at', dir:'DESC', page:1, pageSize:Auth.pageSize('shuls') };
 let selected = new Set();
 if (new URLSearchParams(location.search).get('dup') === '1') showDuplicates();
 
@@ -92,7 +92,9 @@ const SHUL_COLUMNS = [
   { key: 'gabai_email', label: 'Gabai Email', render: s => esc(s.gabai_email||'') },
   { key: 'status', label: 'Status', sort: 'status', render: statusCell },
   { key: 'slots_allocated', label: 'Slots', sort: 'slots_allocated', render: s => s.slots_allocated ?? 0 },
-  { key: 'applicant_count', label: 'Applicants', render: s => s.applicant_count },
+  { key: 'applicant_count', label: 'Approved Applicants', render: s => s.applicant_count },
+  { key: 'applicants_pending', label: 'Pending Applicants', render: s => s.applicants_pending },
+  { key: 'applicants_rejected', label: 'Rejected Applicants', render: s => s.applicants_rejected },
   { key: 'created_at', label: 'Submitted', sort: 'created_at', render: s => fmtDate(s.created_at) },
   // Internal, admin-only, and specific to this season (see src/db.js) —
   // editable right here so a quick note doesn't require opening the detail
@@ -103,7 +105,7 @@ const SHUL_COLUMNS = [
   // saves immediately on toggle, no separate Save step.
   { key: 'follow_up', label: 'Follow Up?', render: s => `<input type="checkbox" ${s.needs_follow_up_call ? 'checked' : ''} onclick="event.stopPropagation()" onchange="saveShulFollowUp('${s.id}', this.checked)">` },
 ];
-const DEFAULT_SHUL_COLUMNS = ['name','state_city','rav','gabai','status','slots_allocated','applicant_count','comments','follow_up','created_at'];
+const DEFAULT_SHUL_COLUMNS = ['name','state_city','rav','gabai','status','slots_allocated','applicant_count','applicants_pending','applicants_rejected','comments','follow_up','created_at'];
 let activeColumns = DEFAULT_SHUL_COLUMNS;
 
 function renderThead() {
@@ -191,7 +193,7 @@ qs('#f-status').addEventListener('change', () => { state.status = qs('#f-status'
 qs('#f-paused').addEventListener('change', () => { state.paused = qs('#f-paused').value; state.page = 1; load(); });
 qs('#f-season').addEventListener('change', () => { state.season_id = qs('#f-season').value; state.page = 1; load(); });
 qs('#f-pagesize').value = state.pageSize;
-qs('#f-pagesize').addEventListener('change', () => { state.pageSize = +qs('#f-pagesize').value; state.page = 1; load(); });
+qs('#f-pagesize').addEventListener('change', () => { state.pageSize = +qs('#f-pagesize').value; state.page = 1; Auth.savePageSize('shuls', state.pageSize); load(); });
 function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
 
 qs('#btn-template').addEventListener('click', () => downloadAuthed('/shuls/import/template', 'shul_import_template.xlsx'));
@@ -326,10 +328,14 @@ qs('#btn-mass-apply').addEventListener('click', async () => {
 async function openShul(id) {
   try {
     const { shul, notes, contract, applicants, flags } = await api(`/shuls/${id}`);
-    // Match the list route's applicant_count (GET /shuls) — 'incomplete'
-    // (carried forward, not yet re-enrolled this season) isn't a real
-    // submission and shouldn't inflate the count shown on the row.
-    patchShulRow({ ...shul, applicant_count: applicants.filter(a => a.approval_status !== 'incomplete').length });
+    // Match the list route's approved/pending/rejected tallies (GET /shuls)
+    // so the row doesn't fall out of sync after an edit made inside this modal.
+    patchShulRow({
+      ...shul,
+      applicant_count: applicants.filter(a => a.approval_status === 'approved').length,
+      applicants_pending: applicants.filter(a => a.approval_status === 'pending').length,
+      applicants_rejected: applicants.filter(a => a.approval_status === 'rejected').length,
+    });
     const body = `
       <div class="tabs" id="stabs">
         <button class="active" data-t="info">Info</button><button data-t="notes">Notes (${notes.length})</button>

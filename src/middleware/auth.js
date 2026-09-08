@@ -17,6 +17,17 @@ export function signToken(user) {
   return jwt.sign({ userId: user.id, tokenVersion: user.token_version || 0 }, JWT_SECRET, { expiresIn: '30d' });
 }
 
+// The shape sent to the client for a `user` object, everywhere one is sent
+// (login, /me, accept-invite, impersonate redeem) — strips password_hash
+// and parses page_size_prefs (stored as a raw JSON string column) into a
+// real object so the frontend never has to JSON.parse it itself.
+export function safeUser(user) {
+  const { password_hash, page_size_prefs, ...rest } = user;
+  let prefs = {};
+  try { prefs = page_size_prefs ? JSON.parse(page_size_prefs) : {}; } catch { prefs = {}; }
+  return { ...rest, page_size_prefs: prefs };
+}
+
 export function auth(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;

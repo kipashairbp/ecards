@@ -267,13 +267,26 @@ router.get('/', (req, res) => {
   const total = db.prepare(`SELECT COUNT(*) c FROM shuls ${where}`).get(...params).c;
   const offset = (Math.max(1, +page) - 1) * +pageSize;
   const rows = db.prepare(`SELECT * FROM shuls ${where} ORDER BY ${sortCol} ${sortDir} LIMIT ? OFFSET ?`).all(...params, +pageSize, offset);
+  // Per-shul applicant counts by status — one grouped query across this
+  // page's shuls rather than N+1 per-row queries (same pattern as the
+  // /export route's applicants_approved/pending/rejected below). The old
+  // single "Applicants" tally lumped every non-incomplete status together,
+  // which conflated approved/pending/rejected into one number; broken out
+  // here into the three an admin actually cares about at a glance — draft
+  // and soft_rejected stay uncounted, same as everywhere else this
+  // approved/pending/rejected breakdown is used.
+  const counts = {};
+  if (rows.length) {
+    const ids = rows.map(r => r.id);
+    const placeholders = ids.map(() => '?').join(',');
+    db.prepare(`SELECT shul_id, approval_status, COUNT(*) c FROM applicants WHERE shul_id IN (${placeholders}) AND approval_status IN ('approved','pending','rejected') GROUP BY shul_id, approval_status`)
+      .all(...ids).forEach(r => { (counts[r.shul_id] ||= {})[r.approval_status] = r.c; });
+  }
   const withCounts = rows.map(s => ({
     ...s,
-    // 'incomplete' (carried forward from last season, not yet re-enrolled)
-    // isn't a real submission for this season and shouldn't inflate this
-    // shul's applicant count — every other status (including 'draft',
-    // uploaded-but-not-yet-submitted) still counts.
-    applicant_count: db.prepare(`SELECT COUNT(*) c FROM applicants WHERE shul_id = ? AND approval_status != 'incomplete'`).get(s.id).c,
+    applicant_count: counts[s.id]?.approved || 0,
+    applicants_pending: counts[s.id]?.pending || 0,
+    applicants_rejected: counts[s.id]?.rejected || 0,
   }));
   res.json({ shuls: redact(withCounts, req.permission.hidden_fields), total, page: +page, pageSize: +pageSize });
 });
@@ -1120,9 +1133,10 @@ router.get('/duplicates/open', requireAdmin, (req, res) => {
 router.post('/duplicates/:flagId/resolve', requirePermission('shuls', 'can_edit'), (req, res) => {
   const { action } = req.body || {}; // 'bypass' | 'resolve'
   try {
-    const flag = resolveFlag(req.params.flagId, req.user.id, action);
-    if (!flag) return res.status(404).json({ error: 'Not found' });
-    logAudit(req.user.org_id, req.user.id, 'resolve_duplicate', 'duplicate_flag', flag.id, null, flag, req.ip);
+    const result = resolveFlag(req.params.flagId, req.user.id, action);
+    if (!result) return res.status(404).json({ error: 'Not found' });
+    const { flag, undoSnapshot } = result;
+    logAudit(req.user.org_id, req.user.id, 'resolve_duplicate', 'shul', flag.entity_id, undoSnapshot, flag, req.ip);
     res.json({ flag });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
@@ -1152,7 +1166,8 @@ router.post('/duplicates/:flagId/merge', requirePermission('shuls', 'can_edit'),
   const { primaryId, values, memberIds } = req.body || {};
   try {
     const result = mergeShuls(req.user.org_id, req.user.id, { primaryId, values, memberIds });
-    logAudit(req.user.org_id, req.user.id, 'merge', 'shul', primaryId, null, result, req.ip);
+    const { undoSnapshot, ...after } = result;
+    logAudit(req.user.org_id, req.user.id, 'merge', 'shul', primaryId, undoSnapshot, after, req.ip);
     res.json(result);
   } catch (e) { res.status(400).json({ error: e.message }); }
 });

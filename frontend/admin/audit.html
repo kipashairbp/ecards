@@ -81,6 +81,78 @@ function headline(a) {
   const name = entityName(a);
   return `${verb} ${label}${name ? ' — ' + esc(name) : ''}`;
 }
+// Best-effort display name for a full applicant/shul row snapshot (or a raw
+// id when nothing better is available, e.g. a record already deleted since).
+function dupName(row, fallbackId) {
+  if (!row) return fallbackId ? `#${String(fallbackId).slice(0, 8)}` : '(deleted record)';
+  return row.name_en || `${row.first_name || ''} ${row.last_name || ''}`.trim() || row.email || `#${String(row.id).slice(0, 8)}`;
+}
+// Headline + detail for 'resolve_duplicate' and 'merge' — these never go
+// through headline()/changeList() above, which assume a flat before/after
+// field diff on one record. A resolve/bypass or merge touches several rows
+// at once (see services/duplicates.js), so before/after here are either a
+// full kind-tagged snapshot (new rows — see restoreDuplicateResolve/
+// restoreDuplicateMergeApplicants/restoreDuplicateMergeShuls) or, for
+// actions logged before that snapshot existed, a bare post-action summary
+// with no per-record detail — handled below by showing whatever IS present
+// plus a note that older detail wasn't captured, rather than pretending
+// there's nothing to show at all (which is what happened before this).
+function isDuplicateAction(a) { return a.action === 'resolve_duplicate' || a.action === 'merge'; }
+function duplicateHeadline(a) {
+  const label = ENTITY_LABELS[a.entity_type] || a.entity_type;
+  const snap = (a.before && a.before.kind) ? a.before : null;
+  if (a.action === 'resolve_duplicate') {
+    const after = a.after || {};
+    const verb = after.status === 'bypassed' ? 'Bypassed' : 'Resolved';
+    const aName = snap ? dupName(snap.entityA, after.entity_id) : '';
+    const bName = snap ? dupName(snap.entityB, after.matched_entity_id) : '';
+    const names = aName || bName ? ` — ${esc(aName)} ↔ ${esc(bName)}` : '';
+    return `${verb} a duplicate ${label} flag${names}`;
+  }
+  const after = a.after || {};
+  const memberIds = after.memberIds || [];
+  const primaryName = snap ? dupName(snap.membersBefore.find(m => m.id === (snap.primaryId || a.entity_id)), a.entity_id) : `#${String(a.entity_id).slice(0, 8)}`;
+  const count = snap ? snap.membersBefore.length : memberIds.length;
+  return `Merged ${count || 'multiple'} ${count === 1 ? label : label + 's'} into one — primary ${esc(primaryName)}`;
+}
+function duplicateDetail(a) {
+  const snap = (a.before && a.before.kind) ? a.before : null;
+  const after = a.after || {};
+  let html = '';
+  if (a.action === 'resolve_duplicate') {
+    const bits = [];
+    if (after.reason) bits.push(`Flagged for: ${esc(after.reason)}`);
+    if (after.status) bits.push(`Outcome: ${esc(after.status)}`);
+    html += bits.length ? `<div class="small-muted" style="margin-top:6px">${bits.join(' · ')}</div>` : '';
+    if (snap) {
+      const rows = [snap.entityA, snap.entityB].filter(Boolean);
+      if (rows.length) {
+        html += `<ul style="margin:6px 0 0;padding-left:18px;font-size:13px;color:var(--text-muted)">
+          ${rows.map(r => `<li><strong style="color:var(--text-dark)">${esc(dupName(r))}</strong> — was ${r.is_paused ? 'paused' : 'not paused'}${r.duplicate_status ? `, status "${esc(r.duplicate_status)}"` : ''}, now unpaused</li>`).join('')}
+        </ul>`;
+      }
+    } else {
+      html += `<div class="small-muted" style="margin-top:4px;font-style:italic">Record details weren't recorded for this action — it was logged before this level of detail was added.</div>`;
+    }
+    return html;
+  }
+  // merge
+  if (snap) {
+    html += `<ul style="margin:6px 0 0;padding-left:18px;font-size:13px;color:var(--text-muted)">
+      ${snap.membersBefore.map(m => `<li>${m.id === snap.primaryId ? '<strong style="color:var(--text-dark)">' + esc(dupName(m)) + ' (kept)</strong>' : esc(dupName(m)) + ' (folded in)'}</li>`).join('')}
+    </ul>`;
+  } else if (after.memberIds && after.memberIds.length) {
+    html += `<div class="small-muted" style="margin-top:6px">${after.memberIds.length} records merged (individual names weren't recorded for this older action)</div>`;
+  }
+  if (typeof after.applicantsReassigned === 'number' && after.applicantsReassigned > 0) {
+    html += `<div class="small-muted" style="margin-top:4px">${after.applicantsReassigned} applicant${after.applicantsReassigned === 1 ? '' : 's'} moved onto the surviving shul</div>`;
+  }
+  const conflicts = after.accountConflicts || [];
+  if (conflicts.length) {
+    html += `<div class="small-muted" style="margin-top:4px;color:var(--danger)">${conflicts.map(c => esc(`${c.secondaryName} (disccardpromos #${c.secondaryAccountId}) already had its own account — not auto-linked, needs manual review`)).join('<br>')}</div>`;
+  }
+  return html;
+}
 function changeList(a) {
   if (['create', 'delete', 'login'].includes(a.action)) return '';
   const before = a.before || {}, after = a.after || {};
@@ -184,11 +256,12 @@ async function load() {
   const { actions } = await api(`/audit/recent?hours=${hours}`);
   qs('#actions-list').innerHTML = actions.length ? actions.map(a => {
     const isMass = a.action.startsWith('mass-');
+    const isDup = isDuplicateAction(a);
     return `<div class="card" style="margin-bottom:8px;padding:14px 16px">
       <div class="flex-between">
         <div>
-          <strong>${isMass ? esc(massHeadline(a)) : headline(a)}</strong>${a.undone_at ? ' ' + badge('undone', 'inactive') : ''}
-          ${isMass ? massDetail(a) : changeList(a)}
+          <strong>${isDup ? duplicateHeadline(a) : (isMass ? esc(massHeadline(a)) : headline(a))}</strong>${a.undone_at ? ' ' + badge('undone', 'inactive') : ''}
+          ${isDup ? duplicateDetail(a) : (isMass ? massDetail(a) : changeList(a))}
           <div class="small-muted" style="margin-top:8px">${a.user_id ? esc((a.first_name||'')+' '+(a.last_name||'')).trim() || esc(a.user_email) : 'System'} · ${fmtDateTime(a.created_at)}</div>
         </div>
         ${a.undoable ? `<button class="btn btn-sm btn-outline" onclick="undoAction('${a.id}', false, '${a.action}')">Undo</button>` : ''}
@@ -206,6 +279,10 @@ window.undoAction = async (id, isRedo, action) => {
   // generic "this restores..." wording undersells what's about to happen.
   const message = action === 'mass-import'
     ? 'Undo this import? Every record it CREATED will be permanently deleted, and any records it UPDATED will be restored to their previous values where possible. This cannot be redone afterward.'
+    : action === 'merge'
+    ? (isRedo ? 'Redo this merge? Every record in the group is brought back to its merged state.' : 'Undo this merge? Every record in the group is restored to exactly how it was right before the merge — this un-merges the whole group, not just the primary record.')
+    : action === 'resolve_duplicate'
+    ? (isRedo ? 'Redo this? Both records go back to being paused as an open duplicate flag.' : 'Undo this? Both records return to exactly how they were right before this was resolved — including being paused again as an open duplicate flag.')
     : (isRedo ? 'Redo this action? This brings the change back.' : 'Undo this action? This restores the affected record to how it was right before this change.');
   if (!confirm(message)) return;
   try { await api(`/audit/${id}/undo`, { method: 'POST' }); toast(isRedo ? 'Redone' : 'Undone'); load(); } catch (err) { toast(err.message, true); }

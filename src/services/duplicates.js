@@ -291,25 +291,68 @@ export function applicantsSharePhone(a, b) {
 //    other way, not by merging" (resolve), for the cases where a real merge
 //    (moving one shul's applicants onto the other, one surviving record)
 //    isn't actually what happened.
+// Returns { flag, undoSnapshot } — undoSnapshot is a full pre-resolve
+// capture (the flag's own prior status/resolved_by/resolved_at, both
+// entities' full rows, and — for shuls — the linked portal users' pause
+// state) with a `kind: 'duplicate-resolve'` marker, meant to be passed as
+// the `before` value to logAudit so services/audit.js's undoAuditEntry can
+// put every touched row back exactly as it was via restoreDuplicateResolve
+// below. Rows logged before this snapshot existed carry no such `kind` and
+// so simply aren't undoable — the exact prior state was never recorded for
+// them (see audit.js's SNAPSHOT_ONLY_ACTIONS handling).
 export function resolveFlag(flagId, resolvedByUserId, action) {
   const flag = db.prepare('SELECT * FROM duplicate_flags WHERE id = ?').get(flagId);
   if (!flag) return null;
   if (flag.status !== 'open') throw new Error('This flag was already resolved');
+  const table = flag.entity_type === 'applicant' ? 'applicants' : 'shuls';
+  const entityA = db.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(flag.entity_id);
+  const entityB = db.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(flag.matched_entity_id);
+  const usersBefore = flag.entity_type === 'shul'
+    ? db.prepare(`SELECT id, is_paused FROM users WHERE shul_id IN (?, ?)`).all(flag.entity_id, flag.matched_entity_id)
+    : [];
+  const undoSnapshot = {
+    kind: 'duplicate-resolve',
+    entityType: flag.entity_type,
+    flagId,
+    flagBefore: { status: flag.status, resolved_by: flag.resolved_by, resolved_at: flag.resolved_at },
+    entityA, entityB, usersBefore,
+  };
+
   if (flag.entity_type === 'applicant') {
     if (action !== 'bypass') throw new Error('Applicant duplicates can only be bypassed here — resolving one as the same person is done through the merge action instead');
-    const a = db.prepare('SELECT * FROM applicants WHERE id = ?').get(flag.entity_id);
-    const b = db.prepare('SELECT * FROM applicants WHERE id = ?').get(flag.matched_entity_id);
-    if (a && b && applicantsSharePhone(a, b)) throw new Error('These records share a phone number, so they can\'t be bypassed as different people — resolve this as a merge instead.');
+    if (entityA && entityB && applicantsSharePhone(entityA, entityB)) throw new Error('These records share a phone number, so they can\'t be bypassed as different people — resolve this as a merge instead.');
     db.prepare(`UPDATE duplicate_flags SET status = 'bypassed', resolved_by = ?, resolved_at = datetime('now') WHERE id = ?`).run(resolvedByUserId, flagId);
     db.prepare('UPDATE applicants SET is_paused = 0, duplicate_status = ? WHERE id IN (?, ?)').run('bypassed', flag.entity_id, flag.matched_entity_id);
-    return db.prepare('SELECT * FROM duplicate_flags WHERE id = ?').get(flagId);
+    return { flag: db.prepare('SELECT * FROM duplicate_flags WHERE id = ?').get(flagId), undoSnapshot };
   }
   db.prepare(`UPDATE duplicate_flags SET status = ?, resolved_by = ?, resolved_at = datetime('now') WHERE id = ?`)
     .run(action === 'bypass' ? 'bypassed' : 'resolved', resolvedByUserId, flagId);
   db.prepare('UPDATE shuls SET is_paused = 0, duplicate_status = ? WHERE id IN (?, ?)')
     .run(action === 'bypass' ? 'bypassed' : 'resolved', flag.entity_id, flag.matched_entity_id);
   db.prepare(`UPDATE users SET is_paused = 0 WHERE shul_id IN (?, ?)`).run(flag.entity_id, flag.matched_entity_id);
-  return db.prepare('SELECT * FROM duplicate_flags WHERE id = ?').get(flagId);
+  return { flag: db.prepare('SELECT * FROM duplicate_flags WHERE id = ?').get(flagId), undoSnapshot };
+}
+
+// Restores everything resolveFlag's undoSnapshot captured — the flag back
+// to 'open' (or whatever it was), both entities' is_paused/duplicate_status/
+// duplicate_of_*_id, and (shuls) the linked portal users' pause state. A
+// row that was already deleted since (entityA/entityB null) is skipped
+// rather than erroring — nothing left to restore it onto.
+export function restoreDuplicateResolve(snap) {
+  const { entityType, flagId, flagBefore, entityA, entityB, usersBefore } = snap;
+  const table = entityType === 'applicant' ? 'applicants' : 'shuls';
+  const pauseCol = entityType === 'applicant' ? 'duplicate_of_applicant_id' : 'duplicate_of_shul_id';
+  db.prepare(`UPDATE duplicate_flags SET status = ?, resolved_by = ?, resolved_at = ? WHERE id = ?`)
+    .run(flagBefore.status, flagBefore.resolved_by, flagBefore.resolved_at, flagId);
+  for (const row of [entityA, entityB]) {
+    if (!row) continue;
+    if (!db.prepare(`SELECT 1 FROM ${table} WHERE id = ?`).get(row.id)) continue;
+    db.prepare(`UPDATE ${table} SET is_paused = ?, duplicate_status = ?, ${pauseCol} = ? WHERE id = ?`)
+      .run(row.is_paused, row.duplicate_status, row[pauseCol], row.id);
+  }
+  for (const u of usersBefore) {
+    db.prepare(`UPDATE users SET is_paused = ? WHERE id = ?`).run(u.is_paused, u.id);
+  }
 }
 
 // Finds every applicant that's part of the same real-world-person cluster as
@@ -385,6 +428,19 @@ export function mergeApplicants(orgId, userId, { primaryId, values, memberIds } 
   // exactly this reason, this is just the backend backstop.
   if (!primary.shul_id) throw new Error('This record has no shul — pick the other record as Primary instead.');
 
+  // Full pre-merge capture — every member's complete row, plus the exact
+  // prior state of every flag this merge is about to resolve — so undo can
+  // put back not just the pause/merge-group bookkeeping but the composite
+  // values written onto the primary and any provider_account_id linking
+  // reconcileAccountsForGroup below does. See restoreDuplicateMergeApplicants.
+  const membersBefore = members.map(m => ({ ...m }));
+  const flagsBeforeRows = db.prepare(`SELECT * FROM duplicate_flags WHERE org_id = ? AND entity_type='applicant' AND status='open'
+      AND entity_id IN (${placeholders}) AND matched_entity_id IN (${placeholders})`).all(orgId, ...groupIds, ...groupIds);
+  const undoSnapshot = {
+    kind: 'duplicate-merge-applicant', primaryId, membersBefore,
+    flagsBefore: flagsBeforeRows.map(f => ({ id: f.id, status: f.status, resolved_by: f.resolved_by, resolved_at: f.resolved_at })),
+  };
+
   const sets = Object.keys(values || {}).filter(k => MERGE_FIELDS.includes(k));
   const setSql = sets.length ? `, ${sets.map(k => `${k} = ?`).join(', ')}` : '';
   db.prepare(`UPDATE applicants SET merge_group_id = ?, duplicate_status = 'merged', is_paused = 0, updated_at = datetime('now')${setSql} WHERE id = ?`)
@@ -400,8 +456,7 @@ export function mergeApplicants(orgId, userId, { primaryId, values, memberIds } 
     const loserStatus = m.approval_status === 'soft_rejected' ? `, approval_status = 'rejected'` : '';
     db.prepare(`UPDATE applicants SET merge_group_id = ?, duplicate_status = 'merged', is_paused = 0, updated_at = datetime('now')${loserStatus} WHERE id = ?`).run(primaryId, m.id);
   }
-  const flagIds = db.prepare(`SELECT id FROM duplicate_flags WHERE org_id = ? AND entity_type='applicant' AND status='open'
-      AND entity_id IN (${placeholders}) AND matched_entity_id IN (${placeholders})`).all(orgId, ...groupIds, ...groupIds).map(r => r.id);
+  const flagIds = flagsBeforeRows.map(f => f.id);
   if (flagIds.length) {
     const fp = flagIds.map(() => '?').join(',');
     db.prepare(`UPDATE duplicate_flags SET status='resolved', resolved_by=?, resolved_at=datetime('now') WHERE id IN (${fp})`).run(userId, ...flagIds);
@@ -410,7 +465,25 @@ export function mergeApplicants(orgId, userId, { primaryId, values, memberIds } 
   // before it was ever recognized as a duplicate) is never touched here —
   // see reconcileAccountsForGroup below for why that's deliberate.
   const accountConflicts = reconcileAccountsForGroup(primaryId);
-  return { primaryId, memberIds: groupIds, accountConflicts };
+  return { primaryId, memberIds: groupIds, accountConflicts, undoSnapshot };
+}
+
+// Restores everything mergeApplicants' undoSnapshot captured: every
+// member's full row (merge_group_id, duplicate_status, is_paused, the
+// composite values written onto the primary, any provider_account_id
+// reconcileAccountsForGroup linked, the soft_rejected->rejected flip) back
+// to its exact pre-merge value, and every flag the merge resolved back to
+// open. A member deleted since the merge is skipped, not recreated — this
+// undoes the merge's field changes, it isn't a delete-cascade restore.
+export function restoreDuplicateMergeApplicants(snap) {
+  for (const row of snap.membersBefore) {
+    if (!db.prepare('SELECT 1 FROM applicants WHERE id = ?').get(row.id)) continue;
+    const keys = Object.keys(row).filter(k => k !== 'id');
+    db.prepare(`UPDATE applicants SET ${keys.map(k => `${k} = ?`).join(', ')} WHERE id = ?`).run(...keys.map(k => row[k]), row.id);
+  }
+  for (const f of snap.flagsBefore) {
+    db.prepare(`UPDATE duplicate_flags SET status = ?, resolved_by = ?, resolved_at = ? WHERE id = ?`).run(f.status, f.resolved_by, f.resolved_at, f.id);
+  }
 }
 
 // A merged secondary is only ever supposed to hold the SAME disccardpromos
@@ -547,6 +620,27 @@ export function mergeShuls(orgId, userId, { primaryId, values, memberIds } = {})
   const primary = members.find(m => m.id === primaryId);
   if (!primary) throw new Error('Primary record not found in this group');
 
+  // Full pre-merge capture, same idea as mergeApplicants above: every
+  // member's complete row, every user's pause state, every flag this merge
+  // is about to resolve, AND (unlike applicants) exactly which applicants
+  // are about to have their shul_id reassigned — captured BEFORE the
+  // reassignment below so undo can put each one back on its original shul.
+  const membersBefore = members.map(m => ({ ...m }));
+  const usersBefore = db.prepare(`SELECT id, is_paused FROM users WHERE shul_id IN (${placeholders})`).all(...groupIds);
+  const flagsBeforeRows = db.prepare(`SELECT * FROM duplicate_flags WHERE org_id = ? AND entity_type='shul' AND status='open'
+      AND entity_id IN (${placeholders}) AND matched_entity_id IN (${placeholders})`).all(orgId, ...groupIds, ...groupIds);
+  const applicantReassignments = [];
+  for (const m of members) {
+    if (m.id === primaryId) continue;
+    for (const a of db.prepare(`SELECT id, shul_id FROM applicants WHERE shul_id = ? AND season_id = ?`).all(m.id, primary.season_id)) {
+      applicantReassignments.push(a);
+    }
+  }
+  const undoSnapshot = {
+    kind: 'duplicate-merge-shul', primaryId, membersBefore, usersBefore, applicantReassignments,
+    flagsBefore: flagsBeforeRows.map(f => ({ id: f.id, status: f.status, resolved_by: f.resolved_by, resolved_at: f.resolved_at })),
+  };
+
   let applicantsReassigned = 0;
   for (const m of members) {
     if (m.id === primaryId) continue;
@@ -562,11 +656,33 @@ export function mergeShuls(orgId, userId, { primaryId, values, memberIds } = {})
     .run(...sets.map(k => values[k]), primaryId);
   db.prepare(`UPDATE users SET is_paused = 0 WHERE shul_id = ?`).run(primaryId);
 
-  const flagIds = db.prepare(`SELECT id FROM duplicate_flags WHERE org_id = ? AND entity_type='shul' AND status='open'
-      AND entity_id IN (${placeholders}) AND matched_entity_id IN (${placeholders})`).all(orgId, ...groupIds, ...groupIds).map(r => r.id);
+  const flagIds = flagsBeforeRows.map(f => f.id);
   if (flagIds.length) {
     const fp = flagIds.map(() => '?').join(',');
     db.prepare(`UPDATE duplicate_flags SET status='resolved', resolved_by=?, resolved_at=datetime('now') WHERE id IN (${fp})`).run(userId, ...flagIds);
   }
-  return { primaryId, memberIds: groupIds, applicantsReassigned };
+  return { primaryId, memberIds: groupIds, applicantsReassigned, undoSnapshot };
+}
+
+// Restores everything mergeShuls' undoSnapshot captured: every member's
+// full row, every reassigned applicant back onto its original shul, every
+// linked user's pause state, and every flag the merge resolved back to
+// open. Same "skip what's been deleted since, don't recreate it" rule as
+// restoreDuplicateMergeApplicants.
+export function restoreDuplicateMergeShuls(snap) {
+  for (const row of snap.membersBefore) {
+    if (!db.prepare('SELECT 1 FROM shuls WHERE id = ?').get(row.id)) continue;
+    const keys = Object.keys(row).filter(k => k !== 'id');
+    db.prepare(`UPDATE shuls SET ${keys.map(k => `${k} = ?`).join(', ')} WHERE id = ?`).run(...keys.map(k => row[k]), row.id);
+  }
+  for (const a of snap.applicantReassignments) {
+    if (!db.prepare('SELECT 1 FROM applicants WHERE id = ?').get(a.id)) continue;
+    db.prepare(`UPDATE applicants SET shul_id = ? WHERE id = ?`).run(a.shul_id, a.id);
+  }
+  for (const u of snap.usersBefore) {
+    db.prepare(`UPDATE users SET is_paused = ? WHERE id = ?`).run(u.is_paused, u.id);
+  }
+  for (const f of snap.flagsBefore) {
+    db.prepare(`UPDATE duplicate_flags SET status = ?, resolved_by = ?, resolved_at = ? WHERE id = ?`).run(f.status, f.resolved_by, f.resolved_at, f.id);
+  }
 }

@@ -98,6 +98,21 @@ const Auth = {
   canAny(resources, action = 'can_view') {
     return resources.some(r => this.can(r, action));
   },
+  // pageKey is whatever a list page calls itself in its saved preference
+  // (e.g. 'applicants', 'shuls', 'sms_inbox') — kept as a free-form string
+  // key into one JSON blob (see PUT /auth/preferences) rather than a column
+  // per page, so a new list page adopting this never needs its own migration.
+  pageSize(pageKey, fallback = 25) { return this.user()?.page_size_prefs?.[pageKey] ?? fallback; },
+  // Updates the LOCAL cached user immediately (so the choice sticks across
+  // a refresh even if the save request is still in flight or fails) and
+  // fires the save in the background — a page-size preference isn't worth
+  // blocking the list reload the user is already waiting on.
+  async savePageSize(pageKey, size) {
+    const u = this.user(); if (!u) return;
+    const prefs = { ...(u.page_size_prefs || {}), [pageKey]: +size };
+    this._store().setItem('ec_user', JSON.stringify({ ...u, page_size_prefs: prefs }));
+    try { await api('/auth/preferences', { method: 'PUT', body: { page: pageKey, pageSize: +size } }); } catch {}
+  },
 };
 
 async function api(path, { method = 'GET', body, isForm = false } = {}) {

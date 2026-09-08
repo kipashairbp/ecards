@@ -80,9 +80,24 @@ router.get('/stats', (req, res) => {
     FROM card_transactions t JOIN cards c2 ON c2.id = t.card_id WHERE c2.org_id = ?${storeSeasonClause}`).get(orgId, ...seasonParams).s;
   const funds = { loaded, spent, remaining: Math.round((loaded - spent) * 100) / 100 };
 
+  // Season-scoped same as everything else above — stores DO have their own
+  // season_id (carry-forward works the same way as shuls), contrary to an
+  // earlier assumption that they didn't.
+  const storesByStatus = db.prepare(`SELECT setup_status, COUNT(*) c FROM stores WHERE org_id = ?${seasonClause} GROUP BY setup_status`).all(orgId, ...seasonParams);
+  const storeStatusCount = (s) => storesByStatus.find(r => r.setup_status === s)?.c || 0;
+  const stores = {
+    total: storesByStatus.reduce((sum, r) => sum + r.c, 0),
+    active: storeStatusCount('active'),
+    // pending + in_progress merged into one "onboarding" slice — both mean
+    // "not live yet, still being set up," same reasoning as applicants.other.
+    onboarding: storeStatusCount('pending') + storeStatusCount('in_progress'),
+    inactive: storeStatusCount('inactive'),
+    rejected: storeStatusCount('rejected'),
+  };
+
   const duplicatesOpen = db.prepare(`SELECT COUNT(*) c FROM duplicate_flags WHERE org_id = ? AND status = 'open'`).get(orgId).c;
 
-  res.json({ applicants, shuls, cards, funds, duplicatesOpen });
+  res.json({ applicants, shuls, cards, stores, funds, duplicatesOpen });
 });
 
 router.get('/daily', (req, res) => {
