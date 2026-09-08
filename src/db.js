@@ -8,7 +8,7 @@ import { generateApplicantExternalId } from './utils/externalId.js';
 
 export const DATA_DIR = process.env.DATA_DIR || join(process.cwd(), 'data');
 if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-for (const sub of ['contracts', 'uploads', 'signatures', 'logos', 'updates', 'forms', 'store-bills', 'homepage']) {
+for (const sub of ['contracts', 'uploads', 'signatures', 'logos', 'updates', 'forms', 'store-bills', 'homepage', 'library-documents']) {
   const p = join(DATA_DIR, sub);
   if (!existsSync(p)) mkdirSync(p, { recursive: true });
 }
@@ -1008,6 +1008,53 @@ db.exec(`CREATE TABLE IF NOT EXISTS impersonation_tokens (
 // join." skip_reason is required by the route, never by the schema, so a
 // pre-existing NULL from before this feature never breaks anything.
 safeAlter(`ALTER TABLE shuls ADD COLUMN skip_reason TEXT`);
+
+// ===================== Library =====================
+// Two unrelated things share one admin page (frontend/admin/library.html):
+// (1) Google Docs/Sheets pasted in by an admin from the org's ONE linked
+// Google account (see services/googleDrive.js) — single-org platform, so
+// the OAuth refresh token/connected email live in `settings` (org_id+key),
+// the same place every other singleton external-integration credential
+// lives (see services/mail.js/giftcard.js and db.js's note above about per-
+// org credential tables being explicitly reverted). (2) plain uploaded
+// files (PDF/Word/etc.) divided by season, unrelated to Google entirely.
+db.exec(`CREATE TABLE IF NOT EXISTS library_google_docs (
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  google_file_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  mime_type TEXT NOT NULL,
+  url TEXT NOT NULL,
+  owner_email TEXT,
+  added_by TEXT REFERENCES users(id),
+  created_at TEXT DEFAULT (datetime('now'))
+)`);
+
+// One row per platform user granted access to one library_google_docs row.
+// google_permission_id is Drive's own id for that grant (returned by
+// permissions.create) — kept so a later revoke can target the exact
+// permission to delete on Drive's side, not just forget it locally.
+db.exec(`CREATE TABLE IF NOT EXISTS library_google_doc_shares (
+  id TEXT PRIMARY KEY,
+  doc_id TEXT NOT NULL REFERENCES library_google_docs(id),
+  user_id TEXT NOT NULL REFERENCES users(id),
+  role TEXT NOT NULL DEFAULT 'writer',
+  google_permission_id TEXT,
+  granted_by TEXT REFERENCES users(id),
+  granted_at TEXT DEFAULT (datetime('now'))
+)`);
+
+db.exec(`CREATE TABLE IF NOT EXISTS library_documents (
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  season_id TEXT REFERENCES seasons(id),
+  title TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  mime_type TEXT,
+  file_size INTEGER,
+  uploaded_by TEXT REFERENCES users(id),
+  created_at TEXT DEFAULT (datetime('now'))
+)`);
 
 export const DEFAULT_ORG_ID = defaultOrgId;
 export function uuid() { return randomUUID(); }

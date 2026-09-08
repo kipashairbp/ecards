@@ -280,6 +280,7 @@ const NAV_ITEMS = [
   { href: '/admin/sms', label: 'SMS Center', icon: '&#9670;', resource: 'sms' },
   { href: '/admin/updates', label: 'Updates', icon: '&#9670;', resource: 'updates' },
   { href: '/admin/esignatures', label: 'E-Signatures', icon: '&#9670;', resource: 'documents' },
+  { href: '/admin/library', label: 'Library', icon: '&#9670;', resource: 'library' },
   { href: '/admin/users', label: 'Users & Permissions', icon: '&#9670;', resource: 'users' },
   // Its own standalone page/nav item, not a Settings tab — a single link
   // shared between two independently-gated resources meant blocking just

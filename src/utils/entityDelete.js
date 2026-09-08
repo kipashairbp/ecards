@@ -7,6 +7,7 @@
 // might still try to render. entityType is 'shul' | 'applicant' | 'store',
 // matching the values those tables were actually written with.
 import { db } from '../db.js';
+import { getDuplicatePartnerIds, unpauseIfNoLongerFlagged } from '../services/duplicates.js';
 
 export function deletePolymorphicRefs(entityType, entityId) {
   db.prepare(`DELETE FROM documents WHERE entity_type = ? AND entity_id = ?`).run(entityType, entityId);
@@ -25,6 +26,14 @@ export function deletePolymorphicRefs(entityType, entityId) {
 // column update, but locking a disccardpromos card is a network call and
 // stays the caller's responsibility, same as before this was extracted.
 export function hardDeleteShul(shul) {
+  // Captured BEFORE deletePolymorphicRefs removes this shul's own
+  // duplicate_flags rows below — otherwise there's nothing left to look up
+  // afterward to know who else was paused because of THIS shul. See
+  // services/duplicates.js's getDuplicatePartnerIds/unpauseIfNoLongerFlagged
+  // for why this two-step split exists: deleting a flagged shul used to
+  // leave its duplicate partner paused forever, with no open flag left
+  // pointing at it for any later recheck to even notice.
+  const duplicatePartnerIds = getDuplicatePartnerIds('shul', shul.id);
   db.prepare('UPDATE applicants SET shul_id = NULL WHERE shul_id = ?').run(shul.id);
   db.prepare('UPDATE shuls SET duplicate_of_shul_id = NULL WHERE duplicate_of_shul_id = ?').run(shul.id);
   db.prepare('DELETE FROM contracts WHERE shul_id = ?').run(shul.id);
@@ -32,18 +41,21 @@ export function hardDeleteShul(shul) {
   if (shul.portal_user_id) db.prepare('UPDATE users SET is_active = 0, token_version = token_version + 1 WHERE id = ?').run(shul.portal_user_id);
   deletePolymorphicRefs('shul', shul.id);
   db.prepare('DELETE FROM shuls WHERE id = ?').run(shul.id);
+  unpauseIfNoLongerFlagged('shul', duplicatePartnerIds);
 }
 
 // Same as hardDeleteShul but for an applicant — card locking (a
 // disccardpromos network call) is likewise left to the caller; this is
 // DB-only.
 export function hardDeleteApplicant(applicant) {
+  const duplicatePartnerIds = getDuplicatePartnerIds('applicant', applicant.id);
   db.prepare('DELETE FROM card_transactions WHERE card_id IN (SELECT id FROM cards WHERE applicant_id = ?)').run(applicant.id);
   db.prepare('DELETE FROM cards WHERE applicant_id = ?').run(applicant.id);
   db.prepare('DELETE FROM applicant_notes WHERE applicant_id = ?').run(applicant.id);
   db.prepare('UPDATE applicants SET duplicate_of_applicant_id = NULL WHERE duplicate_of_applicant_id = ?').run(applicant.id);
   deletePolymorphicRefs('applicant', applicant.id);
   db.prepare('DELETE FROM applicants WHERE id = ?').run(applicant.id);
+  unpauseIfNoLongerFlagged('applicant', duplicatePartnerIds);
 }
 
 // Same idea for a store — card_transactions keep their history but are

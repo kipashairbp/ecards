@@ -168,6 +168,33 @@ export function detectAndFlag(orgId, entityType, entity, excludeIds = [], previo
   return db.prepare('SELECT * FROM duplicate_flags WHERE id = ?').get(id);
 }
 
+// Called by utils/entityDelete.js's hardDeleteApplicant/hardDeleteShul
+// BEFORE the entity's own duplicate_flags rows get deleted (part of that
+// same delete cascade) — captures who else was paused because of THIS
+// entity, so unpauseIfNoLongerFlagged below can be called AFTER the
+// cascade to decide, from what's actually left, whether each of them
+// still has a real reason to stay paused. Without this two-step split, a
+// deleted applicant's own flag against its duplicate partner just vanishes
+// with the row, and the partner was never the one told to check again —
+// it stays paused forever, with no open flag left pointing at it for any
+// later recheck to even notice.
+export function getDuplicatePartnerIds(entityType, entityId) {
+  const rows = db.prepare(`SELECT entity_id, matched_entity_id FROM duplicate_flags WHERE entity_type = ? AND status = 'open' AND (entity_id = ? OR matched_entity_id = ?)`).all(entityType, entityId, entityId);
+  return [...new Set(rows.map(r => (r.entity_id === entityId ? r.matched_entity_id : r.entity_id)))];
+}
+export function unpauseIfNoLongerFlagged(entityType, ids) {
+  for (const id of ids) {
+    const stillFlagged = db.prepare(`SELECT 1 FROM duplicate_flags WHERE status = 'open' AND entity_type = ? AND (entity_id = ? OR matched_entity_id = ?)`).get(entityType, id, id);
+    if (stillFlagged) continue;
+    if (entityType === 'shul') {
+      db.prepare(`UPDATE shuls SET is_paused = 0, duplicate_status = NULL, duplicate_of_shul_id = NULL WHERE id = ?`).run(id);
+      db.prepare(`UPDATE users SET is_paused = 0 WHERE shul_id = ?`).run(id);
+    } else {
+      db.prepare(`UPDATE applicants SET is_paused = 0, duplicate_status = NULL, duplicate_of_applicant_id = NULL WHERE id = ?`).run(id);
+    }
+  }
+}
+
 // Org-wide sweep, run once after the 'incomplete' fix above landed (and
 // safe to re-run any time). Two passes:
 //  1. Undoes every flag+pause that only exists because of the bug just
@@ -200,6 +227,23 @@ export function recheckAllApplicantDuplicates(orgId, seasonId) {
     cleared++;
   }
 
+  // General safety net, not just the 'incomplete' case above: any applicant
+  // still sitting is_paused=1 with no open flag pointing at it at all (most
+  // commonly its duplicate partner was hard-deleted before
+  // getDuplicatePartnerIds/unpauseIfNoLongerFlagged existed — deleting the
+  // OTHER side of a flag removes the flag row itself, which used to leave
+  // this side stuck paused forever with nothing left for any recheck to
+  // notice) gets unpaused here too. Runs before pass 2 below so a
+  // genuinely still-duplicate row gets correctly re-flagged in the same
+  // pass instead of staying clear on a technicality.
+  const orphanPaused = db.prepare(`SELECT id FROM applicants WHERE org_id = ? AND is_paused = 1
+    AND NOT EXISTS (SELECT 1 FROM duplicate_flags f WHERE f.status = 'open' AND f.entity_type = 'applicant' AND (f.entity_id = applicants.id OR f.matched_entity_id = applicants.id))`).all(orgId);
+  let unpaused = 0;
+  for (const a of orphanPaused) {
+    db.prepare(`UPDATE applicants SET is_paused = 0, duplicate_status = NULL, duplicate_of_applicant_id = NULL WHERE id = ?`).run(a.id);
+    unpaused++;
+  }
+
   const rows = seasonId
     ? db.prepare(`SELECT * FROM applicants WHERE org_id = ? AND season_id = ? AND approval_status NOT IN ('draft', 'incomplete') AND is_paused = 0`).all(orgId, seasonId)
     : db.prepare(`SELECT * FROM applicants WHERE org_id = ? AND approval_status NOT IN ('draft', 'incomplete') AND is_paused = 0`).all(orgId);
@@ -219,7 +263,7 @@ export function recheckAllApplicantDuplicates(orgId, seasonId) {
     pauseAccountsFor('applicant', a.id, match.matchedId);
     flagged++;
   }
-  return { cleared, checked: rows.length, flagged };
+  return { cleared, unpaused, checked: rows.length, flagged };
 }
 
 // Which fields count as "a phone number" for the never-bypass-if-matched

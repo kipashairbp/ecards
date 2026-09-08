@@ -811,7 +811,7 @@ async function recheckAllDuplicates() {
   if (!confirm('Recheck every applicant org-wide? This clears any duplicate flag caused by the incomplete-applicant bug, and freshly checks everyone else for anything that was missed. Safe to re-run.')) return;
   try {
     const r = await api('/applicants/duplicates/recheck-all', { method: 'POST', body: {} });
-    toast(`Checked ${r.checked}. Cleared ${r.cleared} spurious flag(s), found ${r.flagged} new one(s).`);
+    toast(`Checked ${r.checked}. Cleared ${r.cleared} spurious flag(s), unpaused ${r.unpaused} orphaned pause(s), found ${r.flagged} new one(s).`);
     showDuplicates();
   } catch (err) { toast(err.message, true); }
 }

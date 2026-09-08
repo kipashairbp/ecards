@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Library · Kipas Hair BP Platform</title>
+<link rel="stylesheet" href="/css/theme.css">
+<link rel="icon" type="image/png" sizes="32x32" href="/img/favicon-32.png">
+<link rel="apple-touch-icon" href="/img/apple-touch-icon.png">
+<link rel="stylesheet" href="/css/portal-theme.css">
+</head>
+<body>
+<script src="/js/app.js"></script>
+<script>
+Auth.requireAdmin();
+if (!Auth.can('library')) { location.href = '/admin/dashboard'; }
+renderShell('/admin/library', `
+  <h2>Library</h2>
+  <div class="pill-row" style="margin-bottom:14px">
+    <button class="btn btn-sm" id="lib-tab-google">Google Docs &amp; Sheets</button>
+    <button class="btn btn-sm btn-outline" id="lib-tab-docs">Season Documents</button>
+  </div>
+
+  <div id="lib-panel-google">
+    <div id="google-status-box" class="card"><p class="small-muted">Loading…</p></div>
+    <div class="card" id="google-add-box" style="display:none;margin-top:14px">
+      <h4 style="margin:0 0 10px">Add a Google Doc or Sheet</h4>
+      <p class="small-muted" style="margin-top:0">Paste a link from the connected Google account — only documents owned by that account can be added.</p>
+      <div style="display:flex;gap:8px">
+        <input id="google-url-input" placeholder="https://docs.google.com/document/d/…" style="flex:1">
+        <button class="btn btn-primary btn-sm" id="btn-add-google-doc">Add</button>
+      </div>
+    </div>
+    <div class="card" style="margin-top:14px;padding:0;overflow-x:auto">
+      <table><thead><tr><th>Title</th><th>Type</th><th>Owner</th><th>Added By</th><th>Shared With</th><th></th></tr></thead>
+      <tbody id="google-docs-tbody"><tr><td colspan="6" class="empty-state">Loading…</td></tr></tbody></table>
+    </div>
+  </div>
+
+  <div id="lib-panel-docs" style="display:none">
+    <div class="toolbar">
+      <select id="docs-f-season"></select>
+      <button class="btn btn-primary btn-sm" id="btn-upload-doc">+ Upload Document</button>
+    </div>
+    <div class="card" style="padding:0;overflow-x:auto">
+      <table><thead><tr><th>Title</th><th>Season</th><th>Type</th><th>Uploaded By</th><th>Date</th><th></th></tr></thead>
+      <tbody id="docs-tbody"><tr><td colspan="6" class="empty-state">Loading…</td></tr></tbody></table>
+    </div>
+  </div>
+`);
+
+// ============================= tabs ==============================
+function showLibTab(tab) {
+  qs('#lib-panel-google').style.display = tab === 'google' ? 'block' : 'none';
+  qs('#lib-panel-docs').style.display = tab === 'docs' ? 'block' : 'none';
+  qs('#lib-tab-google').className = 'btn btn-sm' + (tab === 'google' ? '' : ' btn-outline');
+  qs('#lib-tab-docs').className = 'btn btn-sm' + (tab === 'docs' ? '' : ' btn-outline');
+}
+qs('#lib-tab-google').addEventListener('click', () => showLibTab('google'));
+qs('#lib-tab-docs').addEventListener('click', () => showLibTab('docs'));
+
+// ============================= Google Docs & Sheets ==============================
+const canManageAccount = ['super_admin', 'org_admin'].includes(Auth.user()?.role);
+let googleStatus = { configured: false, connected: null };
+
+async function loadGoogleStatus() {
+  googleStatus = await api('/library/google/status');
+  const box = qs('#google-status-box');
+  if (!googleStatus.configured) {
+    box.innerHTML = `<p><strong>Google integration is not set up on this server.</strong></p>
+      <p class="small-muted">Whoever manages the deploy needs to create a Google Cloud OAuth client (Client ID + Secret) and set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI as environment variables before an account can be connected here.</p>`;
+  } else if (!googleStatus.connected) {
+    box.innerHTML = `<p>No Google account connected yet.</p>` +
+      (canManageAccount ? `<button class="btn btn-primary btn-sm" id="btn-connect-google">Connect Google Account</button>` : `<p class="small-muted">Ask an org admin to connect one.</p>`);
+    if (canManageAccount) qs('#btn-connect-google').addEventListener('click', connectGoogle);
+  } else {
+    box.innerHTML = `<p><strong>Connected as ${esc(googleStatus.connected.email)}</strong></p>` +
+      (canManageAccount ? `<button class="btn btn-outline btn-sm" id="btn-disconnect-google">Disconnect</button>` : '');
+    if (canManageAccount) qs('#btn-disconnect-google').addEventListener('click', disconnectGoogle);
+  }
+  qs('#google-add-box').style.display = googleStatus.connected ? 'block' : 'none';
+}
+async function connectGoogle() {
+  try { const { url } = await api('/library/google/connect-url', { method: 'POST' }); location.href = url; }
+  catch (err) { toast(err.message, true); }
+}
+async function disconnectGoogle() {
+  if (!confirm('Disconnect the Google account? Docs already added to the Library will stay listed, but new ones can\'t be added until an account is reconnected.')) return;
+  try { await api('/library/google/disconnect', { method: 'POST' }); toast('Disconnected'); loadGoogleStatus(); }
+  catch (err) { toast(err.message, true); }
+}
+
+let shareCandidates = [];
+async function loadGoogleDocs() {
+  const { docs } = await api('/library/google-docs');
+  qs('#google-docs-tbody').innerHTML = docs.length ? docs.map(d => `<tr>
+      <td><a href="${esc(d.url)}" target="_blank" rel="noopener">${esc(d.title)}</a></td>
+      <td>${d.mime_type.includes('spreadsheet') ? 'Sheet' : 'Doc'}</td>
+      <td class="small-muted">${esc(d.owner_email || '')}</td>
+      <td class="small-muted">${esc(d.added_by_name || '')}</td>
+      <td>${d.shares.length ? d.shares.map(s => esc(s.name)).join(', ') : '<span class="small-muted">Nobody yet</span>'}</td>
+      <td style="white-space:nowrap">
+        <button class="btn btn-sm btn-outline" onclick="openShareModal('${d.id}')">Share</button>
+        <button class="btn btn-sm btn-outline" style="color:#b71c1c;border-color:#b71c1c" onclick="removeGoogleDoc('${d.id}','${esc(d.title).replace(/'/g,"\\'")}')">Remove</button>
+      </td>
+    </tr>`).join('') : '<tr><td colspan="6" class="empty-state">No documents added yet.</td></tr>';
+}
+qs('#btn-add-google-doc').addEventListener('click', async () => {
+  const url = qs('#google-url-input').value.trim();
+  if (!url) return;
+  try {
+    await api('/library/google-docs', { method: 'POST', body: { url } });
+    qs('#google-url-input').value = '';
+    toast('Added to the Library');
+    loadGoogleDocs();
+  } catch (err) { toast(err.message, true); }
+});
+window.removeGoogleDoc = async (id, title) => {
+  if (!confirm(`Remove "${title}" from the Library? This also revokes access for everyone it was shared with.`)) return;
+  try { await api(`/library/google-docs/${id}`, { method: 'DELETE' }); toast('Removed'); loadGoogleDocs(); }
+  catch (err) { toast(err.message, true); }
+};
+
+window.openShareModal = async (docId) => {
+  if (!shareCandidates.length) shareCandidates = (await api('/library/share-candidates')).users;
+  const { docs } = await api('/library/google-docs');
+  const doc = docs.find(d => d.id === docId);
+  const sharedIds = new Set(doc.shares.map(s => s.user_id));
+  const body = `
+    <p class="small-muted">Grants view, edit, and share access directly on the real Google file (and emails them the link).</p>
+    <div style="max-height:320px;overflow-y:auto">
+      ${shareCandidates.map(u => `<label class="checkbox-row"><input type="checkbox" class="share-chk" value="${u.id}" ${sharedIds.has(u.id) ? 'checked disabled' : ''}> ${esc(u.first_name)} ${esc(u.last_name)} <span class="small-muted">${esc(u.email)}</span>${sharedIds.has(u.id) ? ' <span class="small-muted">(already shared)</span>' : ''}</label>`).join('')}
+    </div>`;
+  const footer = `<button class="btn btn-primary btn-sm" onclick="submitShare('${docId}')">Grant Access</button>`;
+  openModal(`Share: ${doc.title}`, body, footer);
+};
+window.submitShare = async (docId) => {
+  const user_ids = qsa('.share-chk:not(:disabled):checked').map(c => c.value);
+  if (!user_ids.length) return closeModal();
+  try {
+    const { results } = await api(`/library/google-docs/${docId}/share`, { method: 'POST', body: { user_ids } });
+    const failed = results.filter(r => !r.ok);
+    toast(failed.length ? `Shared, but ${failed.length} failed: ${failed.map(f => f.error).join('; ')}` : 'Access granted', !!failed.length);
+    closeModal();
+    loadGoogleDocs();
+  } catch (err) { toast(err.message, true); }
+};
+
+// ============================= Season Documents ==============================
+async function loadDocs() {
+  const season_id = qs('#docs-f-season').value;
+  const params = season_id ? `?season_id=${encodeURIComponent(season_id)}` : '';
+  const { documents } = await api('/library/documents' + params);
+  qs('#docs-tbody').innerHTML = documents.length ? documents.map(d => `<tr>
+      <td>${esc(d.title)}</td>
+      <td class="small-muted">${esc(d.season_name || '—')}</td>
+      <td class="small-muted">${esc((d.mime_type || '').split('/').pop())}</td>
+      <td class="small-muted">${esc(d.uploaded_by_name || '')}</td>
+      <td class="small-muted">${fmtDate(d.created_at)}</td>
+      <td style="white-space:nowrap">
+        <button class="btn btn-sm btn-outline" onclick="downloadAuthed('/library/documents/${d.id}/download','${esc(d.title).replace(/'/g,"\\'")}')">Open</button>
+        <button class="btn btn-sm btn-outline" style="color:#b71c1c;border-color:#b71c1c" onclick="deleteDoc('${d.id}')">Delete</button>
+      </td>
+    </tr>`).join('') : '<tr><td colspan="6" class="empty-state">No documents for this season yet.</td></tr>';
+}
+qs('#docs-f-season').addEventListener('change', loadDocs);
+window.deleteDoc = async (id) => {
+  if (!confirm('Delete this document?')) return;
+  try { await api(`/library/documents/${id}`, { method: 'DELETE' }); toast('Deleted'); loadDocs(); }
+  catch (err) { toast(err.message, true); }
+};
+qs('#btn-upload-doc').addEventListener('click', async () => {
+  const seasons = (await api('/seasons')).seasons;
+  const currentSeason = qs('#docs-f-season').value;
+  const body = `
+    <div><label>Title</label><input id="u-title" placeholder="e.g. Board Meeting Minutes"></div>
+    <div style="margin-top:10px"><label>Season</label><select id="u-season"><option value="">(none — not season-specific)</option>${seasons.map(s => `<option value="${s.id}" ${s.id === currentSeason ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}</select></div>
+    <div style="margin-top:10px"><label>File</label><input id="u-file" type="file" accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt"></div>`;
+  const footer = `<button class="btn btn-primary btn-sm" id="btn-do-upload">Upload</button>`;
+  openModal('Upload Document', body, footer);
+  qs('#btn-do-upload').addEventListener('click', async () => {
+    const file = qs('#u-file').files[0];
+    if (!file) return toast('Choose a file', true);
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('title', qs('#u-title').value.trim() || file.name);
+    if (qs('#u-season').value) fd.append('season_id', qs('#u-season').value);
+    try {
+      await api('/library/documents', { method: 'POST', body: fd, isForm: true });
+      toast('Uploaded');
+      closeModal();
+      loadDocs();
+    } catch (err) { toast(err.message, true); }
+  });
+});
+
+// ============================= boot ==============================
+(async () => {
+  const params = new URLSearchParams(location.search);
+  if (params.get('google_connected')) toast('Google account connected');
+  if (params.get('google_error')) toast(params.get('google_error'), true);
+  if (params.has('google_connected') || params.has('google_error')) history.replaceState({}, '', '/admin/library');
+
+  await loadGoogleStatus();
+  loadGoogleDocs();
+  await populateSeasonFilter('docs-f-season');
+  loadDocs();
+})();
+</script>
+</body>
+</html>
