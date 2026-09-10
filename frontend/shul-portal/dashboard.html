@@ -310,7 +310,7 @@ function openApplicantReadOnly(a) {
     <p><strong>Home for Yom Tov</strong><br>${a.home_for_yomtov?'Yes':'No'}</p>
     <p><strong>Comments</strong><br>${esc(a.comments||'')||'<span class="small-muted">None</span>'}</p>
     ${'card_amount' in a ? `<div class="divider"></div><p><strong>Card Amount</strong><br>${a.card_amount!=null?fmtMoney(a.card_amount):'Not yet set'}</p>` : ''}
-    ${a.requiresShulContribution ? `<div class="divider"></div><p><strong>Amount Your Shul Gave This Family</strong><br>${a.shul_contribution_amount!=null?fmtMoney(a.shul_contribution_amount):'Not entered'}</p>` : ''}
+    ${a.requiresShulContribution && !a._merged_readonly ? `<div class="divider"></div><p><strong>Amount Your Shul Gave This Family</strong><br>${a.shul_contribution_amount!=null?fmtMoney(a.shul_contribution_amount):'Not entered'}</p>` : ''}
     <p class="small-muted">${a.approval_status === 'rejected' ? 'This applicant was rejected; contact your admin for details.' : a._merged_readonly ? 'This applicant is shared with another shul and is locked; contact your admin for changes.' : 'This applicant has been approved and is locked; contact your admin for changes.'}</p>
   `, '');
 }

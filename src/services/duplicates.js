@@ -409,6 +409,35 @@ export function getMergeGroupIds(orgId, startIds) {
 // shul-blindness survive losing the separate row: that shul's portal keeps
 // reading its own snapshot forever, under its own name, never learning
 // about the merge or the surviving row's (possibly different-shul's) data.
+// Repoints every SMS/email message currently attached to `fromApplicantId`
+// onto `toApplicantId` — used when folding a merged-away member into the
+// surviving record, so that shul's own communication history shows up
+// combined on the one real record's Messages tab instead of disappearing
+// into an undo-only delete snapshot. Must run AFTER captureApplicantSnapshot
+// (so the snapshot still captures the original related_entity_id for a
+// clean undo) and BEFORE hardDeleteApplicant (whose own deletePolymorphicRefs
+// becomes a safe no-op afterward — nothing's left under fromApplicantId's id
+// for it to find). Returns what moved so the caller can record it in the
+// merge's undoSnapshot for restoreRepointedMessages to move back on undo.
+function repointApplicantMessages(fromApplicantId, toApplicantId) {
+  const moved = [];
+  for (const table of ['sms_messages', 'emails_sent']) {
+    const ids = db.prepare(`SELECT id FROM ${table} WHERE related_entity_type='applicant' AND related_entity_id=?`).all(fromApplicantId).map(r => r.id);
+    if (ids.length) {
+      const ph = ids.map(() => '?').join(',');
+      db.prepare(`UPDATE ${table} SET related_entity_id = ? WHERE id IN (${ph})`).run(toApplicantId, ...ids);
+      moved.push({ table, fromApplicantId, ids });
+    }
+  }
+  return moved;
+}
+function restoreRepointedMessages(repointed) {
+  for (const r of repointed || []) {
+    const ph = r.ids.map(() => '?').join(',');
+    db.prepare(`UPDATE ${r.table} SET related_entity_id = ? WHERE id IN (${ph})`).run(r.fromApplicantId, ...r.ids);
+  }
+}
+
 export function mergeApplicants(orgId, userId, { primaryId, values, memberIds } = {}) {
   if (!primaryId) throw new Error('primaryId is required');
   const fullGroupIds = getMergeGroupIds(orgId, [primaryId]);
@@ -534,18 +563,24 @@ export function mergeApplicants(orgId, userId, { primaryId, values, memberIds } 
   // (cards, notes, documents, messages, flags — see captureApplicantSnapshot)
   // so undo can bring the exact row back, then hard-delete it. Its own shul
   // keeps seeing it via the applicant_submissions row just written above,
-  // read through primaryId from here on.
+  // read through primaryId from here on. Its SMS/email history is moved
+  // onto the surviving record first (see repointApplicantMessages) so the
+  // one real record's Messages tab shows the combined history instead of
+  // that shul's own conversations vanishing into an undo-only snapshot.
   const deletedApplicantSnapshots = [];
+  const repointedMessages = [];
   for (const m of membersBefore) {
     if (m.id === primaryId) continue;
     const liveRow = db.prepare('SELECT * FROM applicants WHERE id = ?').get(m.id);
     if (!liveRow) continue; // already gone somehow — nothing left to fold away
     deletedApplicantSnapshots.push(captureApplicantSnapshot(liveRow));
+    repointedMessages.push(...repointApplicantMessages(m.id, primaryId));
     hardDeleteApplicant(liveRow);
   }
 
   undoSnapshot.submissionIds = submissionIds;
   undoSnapshot.repointedSubmissions = repointedSubmissions;
+  undoSnapshot.repointedMessages = repointedMessages;
   undoSnapshot.deletedApplicantSnapshots = deletedApplicantSnapshots;
 
   return { primaryId, memberIds: groupIds, accountConflicts, undoSnapshot };
@@ -576,6 +611,7 @@ export function restoreDuplicateMergeApplicants(snap) {
     const ph = r.ids.map(() => '?').join(',');
     db.prepare(`UPDATE applicant_submissions SET applicant_id = ? WHERE id IN (${ph})`).run(r.fromApplicantId, ...r.ids);
   }
+  restoreRepointedMessages(snap.repointedMessages);
   if (snap.submissionIds?.length) {
     const ph = snap.submissionIds.map(() => '?').join(',');
     db.prepare(`DELETE FROM applicant_submissions WHERE id IN (${ph})`).run(...snap.submissionIds);
@@ -696,15 +732,17 @@ export function collapseAllMergedApplicantGroups(orgId) {
     db.prepare(`UPDATE applicant_submissions SET is_primary = 1 WHERE applicant_id = ? AND shul_id = (SELECT shul_id FROM applicants WHERE id = ?)`).run(primaryId, primaryId);
 
     const deletedApplicantSnapshots = [];
+    const repointedMessages = [];
     for (const m of membersBefore) {
       if (m.id === primaryId) continue;
       deletedApplicantSnapshots.push(captureApplicantSnapshot(m));
+      repointedMessages.push(...repointApplicantMessages(m.id, primaryId));
       hardDeleteApplicant(m);
     }
     collapsed.push({
       primaryId,
       memberIds: membersBefore.map(m => m.id),
-      undoSnapshot: { kind: 'duplicate-merge-applicant', primaryId, membersBefore, flagsBefore: [], submissionIds, repointedSubmissions: [], deletedApplicantSnapshots },
+      undoSnapshot: { kind: 'duplicate-merge-applicant', primaryId, membersBefore, flagsBefore: [], submissionIds, repointedSubmissions: [], repointedMessages, deletedApplicantSnapshots },
     });
   }
   return collapsed;
