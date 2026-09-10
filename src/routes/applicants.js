@@ -365,7 +365,11 @@ router.get('/', (req, res) => {
   let { where, params } = scopeWhere(req);
   if (status) { where += ' AND a.approval_status = ?'; params.push(status); }
   if (paused === '1' || paused === '0') { where += ' AND a.is_paused = ?'; params.push(+paused); }
-  if (shul_id) { where += ' AND a.shul_id = ?'; params.push(shul_id); }
+  // A merged record's shul_id column only names the primary shul — match a
+  // shul filter against every contributing shul (see applicant_submissions)
+  // so a merged applicant still shows up when filtering for a non-primary
+  // contributor, not just the one whose row survived the merge.
+  if (shul_id) { where += ' AND (a.shul_id = ? OR a.id IN (SELECT applicant_id FROM applicant_submissions WHERE shul_id = ?))'; params.push(shul_id, shul_id); }
   if (season_id) { where += ' AND a.season_id = ?'; params.push(season_id); }
   if (marital_status) { where += ' AND a.marital_status = ?'; params.push(marital_status); }
   if (home_for_yomtov !== undefined && home_for_yomtov !== '') { where += ' AND a.home_for_yomtov = ?'; params.push(home_for_yomtov === 'true' || home_for_yomtov === '1' ? 1 : 0); }
@@ -425,7 +429,7 @@ router.get('/export', requirePermission('applicants', 'can_export'), (req, res) 
   let { where, params } = scopeWhere(req);
   if (status) { where += ' AND a.approval_status = ?'; params.push(status); }
   if (paused === '1' || paused === '0') { where += ' AND a.is_paused = ?'; params.push(+paused); }
-  if (shul_id) { where += ' AND a.shul_id = ?'; params.push(shul_id); }
+  if (shul_id) { where += ' AND (a.shul_id = ? OR a.id IN (SELECT applicant_id FROM applicant_submissions WHERE shul_id = ?))'; params.push(shul_id, shul_id); }
   if (season_id) { where += ' AND a.season_id = ?'; params.push(season_id); }
   if (marital_status) { where += ' AND a.marital_status = ?'; params.push(marital_status); }
   if (home_for_yomtov !== undefined && home_for_yomtov !== '') { where += ' AND a.home_for_yomtov = ?'; params.push(home_for_yomtov === 'true' || home_for_yomtov === '1' ? 1 : 0); }
