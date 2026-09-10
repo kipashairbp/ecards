@@ -13,6 +13,7 @@
 
 import { db, uuid, DEFAULT_ORG_ID } from '../db.js';
 import { findAccountByPhone } from '../utils/contactLookup.js';
+import { logApiCall } from './apiCallLog.js';
 
 // A shul/applicant is a fresh row every season, so a message tied to one of
 // those directly (meta.relatedEntityType/Id, set by whichever profile page
@@ -64,7 +65,12 @@ export async function sendSmsChecked(orgId, to, body, meta = {}) {
     status = 'mock';
     error = 'SMS provider not configured (SMS_API_BASE/SMS_API_KEY missing). No message was actually sent.';
     console.log(`[sms:MOCK org=${orgId || 'platform'}] To: ${to}\n${body}`);
+    logApiCall(orgId, 'sms', {
+      method: 'POST', endpoint: '/v1/messages/send', requestSummary: { to }, success: false, errorMessage: error,
+      relatedEntityType: meta.relatedEntityType, relatedEntityId: meta.relatedEntityId, userId: meta.sentBy,
+    });
   } else {
+    const startedAt = Date.now();
     try {
       const res = await fetch(`${CONFIG.apiBase}/v1/messages/send`, {
         method: 'POST',
@@ -72,6 +78,7 @@ export async function sendSmsChecked(orgId, to, body, meta = {}) {
         body: JSON.stringify({ to: String(to).replace(/\D/g, ''), message: body }),
       });
       const resBody = await res.json().catch(() => ({}));
+      const durationMs = Date.now() - startedAt;
       // A 2xx response is treated as success by default — SimpleSender's
       // documented success-status wording ("queued") isn't the only value
       // seen in practice, and requiring an exact allowlist match previously
@@ -82,8 +89,17 @@ export async function sendSmsChecked(orgId, to, body, meta = {}) {
       if (!res.ok || resBody?.status === 'failed' || resBody?.success === false || resBody?.error) {
         status = 'failed'; error = resBody?.error || resBody?.message || `SMS send failed (${res.status})`;
       }
+      logApiCall(orgId, 'sms', {
+        method: 'POST', endpoint: '/v1/messages/send', requestSummary: { to }, statusCode: res.status,
+        success: status !== 'failed', responseSummary: resBody, errorMessage: error, durationMs,
+        relatedEntityType: meta.relatedEntityType, relatedEntityId: meta.relatedEntityId, userId: meta.sentBy,
+      });
     } catch (e) {
       status = 'failed'; error = e.message;
+      logApiCall(orgId, 'sms', {
+        method: 'POST', endpoint: '/v1/messages/send', requestSummary: { to }, success: false, errorMessage: error,
+        durationMs: Date.now() - startedAt, relatedEntityType: meta.relatedEntityType, relatedEntityId: meta.relatedEntityId, userId: meta.sentBy,
+      });
     }
   }
   try {
@@ -152,9 +168,15 @@ function classifyDirection(m, ownNumberDigits) {
 export async function syncInboundSms(orgId, ownNumber) {
   if (isSmsMockMode()) return { imported: 0, skipped: 0, total: 0 };
   const ownNumberDigits = digitsOnly(ownNumber);
+  const startedAt = Date.now();
   const res = await fetch(`${CONFIG.apiBase}/v1/messages`, { headers: { Authorization: `Bearer ${CONFIG.apiKey}` } });
-  if (!res.ok) throw new Error(`SimpleSender /v1/messages failed (${res.status})`);
+  const durationMs = Date.now() - startedAt;
+  if (!res.ok) {
+    logApiCall(orgId, 'sms', { method: 'GET', endpoint: '/v1/messages', statusCode: res.status, success: false, errorMessage: `SimpleSender /v1/messages failed (${res.status})`, durationMs });
+    throw new Error(`SimpleSender /v1/messages failed (${res.status})`);
+  }
   const data = await res.json().catch(() => ({}));
+  logApiCall(orgId, 'sms', { method: 'GET', endpoint: '/v1/messages', statusCode: res.status, success: true, responseSummary: { total: data.total, count: Array.isArray(data.messages) ? data.messages.length : 0 }, durationMs });
   const messages = Array.isArray(data.messages) ? data.messages : [];
 
   let imported = 0, skipped = 0, classified = 0;

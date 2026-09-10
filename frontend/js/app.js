@@ -310,7 +310,7 @@ const NAV_ITEMS = [
   // in middleware/permissions.js) — it's denied by default for everyone but
   // super_admin until an admin explicitly grants it to a specific user via
   // Users & Permissions, so no hardcoded role check is needed here anymore.
-  { href: '/admin/audit', label: 'Recent Actions', icon: '&#9670;', resource: 'audit' },
+  { href: '/admin/audit', label: 'Logs', icon: '&#9670;', roles: ['super_admin'] },
 ];
 const SHUL_NAV = [
   { href: '/shul-portal/dashboard', label: 'My Applicants' },
@@ -464,6 +464,18 @@ window.submitSetPassword = async (userId) => {
 // wide:true widens the modal (e.g. a table with a lot of columns, like the
 // Form Builder responses view) instead of the default 900px cap.
 function openModal(title, bodyHtml, footerHtml = '', { wide = false } = {}) {
+  // Defensive: a caller that re-renders a modal in place by calling
+  // openModal() again without closeModal() first (any multi-step flow that
+  // just wants to redraw the same dialog with new content — e.g. the
+  // duplicate-merge compare screens) would otherwise stack a second
+  // #ec-modal on top of the first instead of replacing it, since nothing
+  // here ever removed the old one. Two stacked backdrops means every query
+  // by #ec-modal id (getElementById, querySelector) finds the OLDEST one —
+  // frozen with stale content — while the newest one is what's actually
+  // visible on screen, so clicks land on invisible dead elements. Closing
+  // any existing modal first makes every re-render-in-place call site safe
+  // without each of them having to remember to do this themselves.
+  document.getElementById('ec-modal')?.remove();
   const el = document.createElement('div');
   el.className = 'modal-backdrop';
   el.id = 'ec-modal';

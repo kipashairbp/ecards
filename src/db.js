@@ -514,6 +514,36 @@ CREATE TABLE IF NOT EXISTS audit_log (
   created_at TEXT DEFAULT (datetime('now'))
 );
 
+-- Every outbound request this platform makes to a third-party API — SMS
+-- (SimpleSender), email (Brevo), disccardpromos — logged at the one
+-- low-level call function each service already funnels through (see
+-- services/giftcard.js's call(), services/mail.js's sendMail(),
+-- services/sms.js's sendSmsChecked()/syncInboundSms()). Distinct from
+-- audit_log: that's internal record changes an admin can undo; this is a
+-- raw technical trace of what actually went out over the wire and what
+-- came back — useful for "why does disccardpromos say a different number
+-- than we do" style debugging, not for undoing anything.
+CREATE TABLE IF NOT EXISTS api_call_log (
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL,
+  provider TEXT NOT NULL,        -- email | sms | disccardpromos
+  method TEXT NOT NULL,
+  endpoint TEXT NOT NULL,
+  request_summary TEXT,          -- short, secret-free description of what was sent
+  status_code INTEGER,
+  success INTEGER NOT NULL DEFAULT 0,
+  response_summary TEXT,
+  error_message TEXT,
+  duration_ms INTEGER,
+  related_entity_type TEXT,
+  related_entity_id TEXT,
+  user_id TEXT,
+  season_id TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_api_call_log_org ON api_call_log(org_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_api_call_log_provider ON api_call_log(org_id, provider, created_at);
+
 CREATE TABLE IF NOT EXISTS settings (
   org_id TEXT NOT NULL,
   key TEXT NOT NULL,

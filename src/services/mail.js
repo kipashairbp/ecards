@@ -1,4 +1,5 @@
 import { db, uuid, DEFAULT_ORG_ID } from '../db.js';
+import { logApiCall } from './apiCallLog.js';
 
 // ---------------------------------------------------------------------------
 // Email — Brevo (https://api.brevo.com) transactional email API.
@@ -81,8 +82,13 @@ export async function sendMail(orgId, to, subject, bodyHtml, replyTo) {
   const effectiveReplyTo = replyTo || defaultReplyTo(orgId);
   if (!cfg.apiKey) {
     console.log(`[mail:DRY-RUN org=${orgId || 'platform'}] To: ${to} | Subject: ${subject}\n${bodyHtml.replace(/<[^>]+>/g, ' ')}`);
+    logApiCall(orgId, 'email', {
+      method: 'POST', endpoint: '/v3/smtp/email', requestSummary: { to, subject }, success: false,
+      errorMessage: 'Email provider not configured (BREVO_API_KEY missing) — dry run, nothing sent.',
+    });
     return { dryRun: true };
   }
+  const startedAt = Date.now();
   const res = await fetch('https://api.brevo.com/v3/smtp/email', {
     method: 'POST',
     headers: { 'api-key': cfg.apiKey, 'Content-Type': 'application/json', 'Accept': 'application/json' },
@@ -94,12 +100,23 @@ export async function sendMail(orgId, to, subject, bodyHtml, replyTo) {
       ...(effectiveReplyTo ? { replyTo: { email: effectiveReplyTo } } : {}),
     }),
   });
+  const durationMs = Date.now() - startedAt;
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     console.error('[mail] Brevo send failed', res.status, body);
-    throw new Error(body?.message || `Email send failed (${res.status})`);
+    const errorMessage = body?.message || `Email send failed (${res.status})`;
+    logApiCall(orgId, 'email', {
+      method: 'POST', endpoint: '/v3/smtp/email', requestSummary: { to, subject }, statusCode: res.status,
+      success: false, responseSummary: body, errorMessage, durationMs,
+    });
+    throw new Error(errorMessage);
   }
-  return res.json();
+  const result = await res.json();
+  logApiCall(orgId, 'email', {
+    method: 'POST', endpoint: '/v3/smtp/email', requestSummary: { to, subject }, statusCode: res.status,
+    success: true, responseSummary: result, durationMs,
+  });
+  return result;
 }
 
 // Wraps sendMail() so every call site gets a single, consistent emailError

@@ -832,9 +832,20 @@ function renderDupListOnly() {
 }
 
 // The merge group can be more than a pair — the same family can get
-// submitted by three, four, five different shuls in one season, so this
-// always fetches the FULL connected group for the flag, not just its two
-// original entities (see GET /applicants/duplicates/:flagId/group).
+// submitted by three, four, five different shuls in one season. Rather than
+// comparing all N side by side in one wide table (unreadable past 3-4, and
+// "Dismiss" never actually resolved anything — a dismissed member's flag
+// just sat open and the whole group kept reappearing forever), a group of
+// 3+ is worked through two records at a time: pick exactly 2, compare and
+// resolve THAT pair for real (merge or bypass — both are permanent, real
+// backend actions), and the result rejoins the pool to be compared against
+// whichever member is still unresolved next. Always fetches the FULL
+// connected group fresh (see GET /applicants/duplicates/:flagId/group),
+// including every open flag between any two of its members — needed to
+// know, for whichever pair gets picked, what they were actually flagged
+// for and whether bypass is even possible (only a DIRECT flag between the
+// two chosen members can be bypassed; two that are only transitively
+// related through a third member have no flag to close).
 let mergeGroupCache = null;
 // Set only when opened from an applicant's own profile (see openApplicant's
 // "View & Resolve" button) rather than the Duplicates list, so the compare
@@ -842,9 +853,12 @@ let mergeGroupCache = null;
 // landing on the full list — the whole point of surfacing this from the
 // profile in the first place.
 let mergeViewReturnToApplicant = null;
+// The up-to-2 member ids currently picked for a pairwise compare. Reset on
+// every fresh group open and after every resolved pair.
+let mergePairSelection = [];
 window.openMergeView = async (flagId, fromApplicantId) => {
   mergeViewReturnToApplicant = fromApplicantId || null;
-  dismissedMemberIds = new Set();
+  mergePairSelection = [];
   try {
     const group = await api(`/applicants/duplicates/${flagId}/group`);
     mergeGroupCache = group;
@@ -862,20 +876,69 @@ window.openMergeView = async (flagId, fromApplicantId) => {
     renderMergeView();
   } catch (err) { toast(err.message, true); }
 };
-// Which of this group's members are excluded from the CURRENT merge pass —
-// reset every time a new group is opened (see openMergeView), scoped only
-// to this session/view. Dismissing a member never touches its duplicate
-// flag or status on the backend at all; it just leaves that record out of
-// the merge this compare view submits, same as if it had never been shown.
-// A group can legitimately be 3, 4, 5+ records once flags chain together,
-// and not every pair in it is necessarily the same person just because
-// they're all transitively connected — this is what lets an admin merge
-// the ones that really are the same person while leaving a genuinely-
-// unrelated-looking member's own flag open to sort out separately later.
-let dismissedMemberIds = new Set();
+// A member already folded into someone else (via a merge earlier in THIS
+// pairwise flow, or an older one) drops out — its primary stands in for it
+// from here on. merge_group_id === own id means "still its own primary"
+// (either never merged, or IS the primary); anything else means "already
+// resolved into that id."
+function activeMergeMembers() {
+  return mergeGroupCache.members.filter(m => !m.merge_group_id || m.merge_group_id === m.id);
+}
+// Dispatches to whichever screen the current group state calls for: fully
+// resolved, a plain pair (no picker needed — same as the original 2-record
+// flow), a pair already picked mid-flow, or the picker itself.
 function renderMergeView() {
-  const { flag, members: allMembers, sharesPhone } = mergeGroupCache;
-  const members = allMembers.filter(m => !dismissedMemberIds.has(m.id));
+  const active = activeMergeMembers();
+  // "Done" isn't just "down to 1 person" — it's also reached the moment
+  // nothing among whoever's left is still an open question. Two survivors
+  // that were already directly bypassed against each other (or were never
+  // flagged against each other at all) have nothing left to compare, even
+  // though both are still technically "active" individuals.
+  const stillConnected = mergeGroupCache.flags.some(f => active.some(m => m.id === f.entity_id) && active.some(m => m.id === f.matched_entity_id));
+  if (active.length <= 1 || !stillConnected) return renderMergeDone();
+  if (active.length === 2) { mergePairSelection = [active[0].id, active[1].id]; return renderPairCompare(); }
+  if (mergePairSelection.length === 2 && mergePairSelection.every(id => active.some(m => m.id === id))) return renderPairCompare();
+  return renderPairPicker();
+}
+function mergeExitBtn() {
+  return mergeViewReturnToApplicant
+    ? `<button class="btn btn-outline btn-sm" onclick="closeModal();openApplicant('${mergeViewReturnToApplicant}')">Back to Applicant</button>`
+    : `<button class="btn btn-outline btn-sm" onclick="closeModal();showDuplicates()">Back to List</button>`;
+}
+function renderMergeDone() {
+  openModal('Compare & Merge Records', `<p>This duplicate group is fully resolved — nothing left to compare.</p>`, mergeExitBtn().replace('btn-outline', 'btn-primary'));
+}
+function renderPairPicker() {
+  const active = activeMergeMembers();
+  const body = `
+    <p class="small-muted">This is a group of ${active.length} records still needing review. Pick exactly <strong>2</strong> to compare at a time — once that pair is resolved, the result rejoins the group so you can compare it against whoever's next.</p>
+    <div>${active.map(m => {
+      const checked = mergePairSelection.includes(m.id);
+      const disabled = !checked && mergePairSelection.length >= 2;
+      return `<label class="checkbox-row card" style="display:flex;align-items:center;gap:10px;margin-bottom:6px;padding:10px 12px;${disabled ? 'opacity:.5' : ''}">
+        <input type="checkbox" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''} onchange="togglePairPick('${esc(m.id)}', this.checked)">
+        <span><strong>${esc(m.first_name)} ${esc(m.last_name)}</strong> — ${esc(m.shul_name || (m.previous_shul_name ? `previously ${m.previous_shul_name}` : 'no shul'))} ${badge(m.approval_status, m.approval_status)}</span>
+      </label>`;
+    }).join('')}</div>
+  `;
+  const footer = `${mergeExitBtn()}<button class="btn btn-primary btn-sm" ${mergePairSelection.length === 2 ? '' : 'disabled'} onclick="renderPairCompare()">Compare Selected &rarr;</button>`;
+  openModal('Compare & Merge Records', body, footer);
+}
+window.togglePairPick = (id, checked) => {
+  if (checked) { if (mergePairSelection.length < 2) mergePairSelection.push(id); }
+  else { mergePairSelection = mergePairSelection.filter(x => x !== id); }
+  renderPairPicker();
+};
+function renderPairCompare() {
+  const active = activeMergeMembers();
+  const [idA, idB] = mergePairSelection;
+  const a = active.find(m => m.id === idA), b = active.find(m => m.id === idB);
+  if (!a || !b) { mergePairSelection = []; return renderMergeView(); } // stale selection safety net
+  const members = [a, b];
+  // Only a DIRECT flag between exactly these two can be bypassed — two
+  // members only linked transitively through a third have nothing open to
+  // close (see the mergeGroupCache comment above).
+  const pairFlag = mergeGroupCache.flags.find(f => (f.entity_id === idA && f.matched_entity_id === idB) || (f.entity_id === idB && f.matched_entity_id === idA));
   // A soft-rejected member (no current shul) can't be picked as Primary —
   // the backend rejects it (see mergeApplicants's shul_id guard) since
   // there'd be no shul left to actually hold the resulting card. Default
@@ -883,12 +946,11 @@ function renderMergeView() {
   // index 0, so opening this view doesn't start on a choice that would
   // just get rejected on submit.
   const defaultPrimaryIdx = Math.max(0, members.findIndex(m => m.shul_id));
-  const cols = members.map((m, i) => `<th style="min-width:180px">
+  const cols = members.map((m, i) => `<th style="min-width:200px">
       <div class="checkbox-row" style="margin-bottom:4px"><input type="radio" name="merge-primary" value="${esc(m.id)}" id="mp-${i}" ${i===defaultPrimaryIdx?'checked':''} ${m.shul_id?'':'disabled'}>
         <label for="mp-${i}" style="margin:0"><strong>${esc(m.first_name)} ${esc(m.last_name)}</strong></label></div>
       <span class="small-muted">${esc(m.shul_name || (m.previous_shul_name ? `previously ${m.previous_shul_name}` : 'no shul'))}</span><br>
       ${badge(m.approval_status, m.approval_status)}
-      ${members.length > 2 ? `<div style="margin-top:4px"><button type="button" class="btn btn-sm btn-outline" onclick="dismissMergeMember('${m.id}')" title="Leave this one out of this merge — still stays flagged as a duplicate for later">Dismiss</button></div>` : ''}
     </th>`).join('');
   const rows = APPLICANT_MERGE_FIELDS.map(([key, label]) => {
     const cells = members.map((m, i) => {
@@ -898,39 +960,47 @@ function renderMergeView() {
     }).join('');
     return `<tr><td class="small-muted" style="white-space:nowrap">${esc(label)}</td>${cells}</tr>`;
   }).join('');
-  const dismissedCount = allMembers.length - members.length;
   const body = `
-    <p class="small-muted">Reason flagged: ${esc(flag.reason)}. ${allMembers.length > 2 ? `This is a group of ${allMembers.length} records.` : ''}
-    Pick which record is <strong>Primary</strong> (that's the one that keeps going forward as the real card-holder), then pick which value to keep for each field — you can mix and match from any record.</p>
-    ${dismissedCount ? `<p class="small-muted">${dismissedCount} record${dismissedCount>1?'s':''} left out of this merge — still flagged as a duplicate, unchanged. <button type="button" class="btn btn-sm btn-outline" onclick="dismissedMemberIds.clear();renderMergeView()">Show all again</button></p>` : ''}
-    ${sharesPhone ? '<p style="color:var(--danger)"><strong>These records share a phone number</strong> — they can only be resolved as a merge, not bypassed as coincidentally-similar different people.</p>' : ''}
+    <p class="small-muted">${pairFlag ? `Flagged for: ${esc(pairFlag.reason)}.` : 'These two are only linked through another record in this group — no direct match reason between them.'}
+    Pick which record is <strong>Primary</strong> (that's the one that keeps going forward as the real card-holder), then pick which value to keep for each field — you can mix and match.</p>
     <div style="overflow-x:auto"><table><thead><tr><th></th>${cols}</tr></thead><tbody>${rows}</tbody></table></div>
   `;
-  const backBtn = mergeViewReturnToApplicant
-    ? `<button class="btn btn-outline btn-sm" onclick="closeModal();openApplicant('${mergeViewReturnToApplicant}')">Back to Applicant</button>`
-    : `<button class="btn btn-outline btn-sm" onclick="closeModal();showDuplicates()">Back to List</button>`;
+  // "Back to Group" only makes sense once a picker step actually happened
+  // (an original group of 3+) — a plain 2-record group never had one, so it
+  // exits the whole flow directly, same as before this rewrite.
+  const backBtn = mergeGroupCache.members.length > 2
+    ? `<button class="btn btn-outline btn-sm" onclick="mergePairSelection=[];renderMergeView()">Back to Group</button>`
+    : mergeExitBtn();
+  const isFinalPair = active.length === 2;
   const footer = `${backBtn}
-    ${sharesPhone ? '' : `<button class="btn btn-outline btn-sm" onclick="bypassDup('${flag.id}')">Bypass (not the same person)</button>`}
-    <button class="btn btn-primary btn-sm" onclick="submitMerge('${flag.id}')">Merge &amp; Resolve${dismissedCount ? ` (${members.length} of ${allMembers.length})` : ''}</button>`;
+    ${pairFlag ? `<button class="btn btn-outline btn-sm" onclick="bypassPair('${pairFlag.id}')">Bypass (not the same person)</button>` : ''}
+    <button class="btn btn-primary btn-sm" onclick="submitPairMerge('${mergeGroupCache.flag.id}')">Merge &amp; ${isFinalPair ? 'Resolve' : 'Continue'}</button>`;
   openModal('Compare & Merge Records', body, footer);
 }
-window.dismissMergeMember = (id) => {
-  dismissedMemberIds.add(id);
+// After either action: re-fetch the SAME working set of ids this view
+// opened with (see ?ids= on GET .../group) — not a fresh transitive-closure
+// re-derivation, which would reseed from just the original flag's two
+// entities and can silently drop members still connected to each other but
+// no longer to that original pair once its own connecting flags close one
+// by one. Nobody this view already showed the admin should ever quietly
+// disappear mid-review.
+async function refreshMergeGroupAndContinue() {
+  mergePairSelection = [];
+  const ids = mergeGroupCache.members.map(m => m.id);
+  try {
+    mergeGroupCache = await api(`/applicants/duplicates/${mergeGroupCache.flag.id}/group?ids=${ids.join(',')}`);
+  } catch (err) { toast(err.message, true); }
   renderMergeView();
-};
-// Lands back wherever this compare view was opened from — the applicant's
-// own profile if that's how it was reached, otherwise the full Duplicates
-// list, same as before.
-function afterDuplicateResolved() {
-  closeModal();
-  if (mergeViewReturnToApplicant) openApplicant(mergeViewReturnToApplicant); else showDuplicates();
   load();
 }
-window.bypassDup = async (id) => {
-  try { await api(`/applicants/duplicates/${id}/resolve`, { method: 'POST', body: { action: 'bypass' } }); afterDuplicateResolved(); }
-  catch (err) { toast(err.message, true); }
+window.bypassPair = async (flagId) => {
+  try {
+    await api(`/applicants/duplicates/${flagId}/resolve`, { method: 'POST', body: { action: 'bypass' } });
+    toast('Marked as different people');
+    await refreshMergeGroupAndContinue();
+  } catch (err) { toast(err.message, true); }
 };
-window.submitMerge = async (flagId) => {
+window.submitPairMerge = async (flagId) => {
   const primaryId = qs('input[name="merge-primary"]:checked')?.value;
   if (!primaryId) return toast('Pick a primary record', true);
   const values = {};
@@ -940,12 +1010,10 @@ window.submitMerge = async (flagId) => {
       : key === 'home_for_yomtov' ? (el.value === '1' || el.value === 'true' ? 1 : 0)
       : el.value;
   }
-  // Only the members still shown (not Dismissed) go into this merge — the
-  // backend leaves everyone else, and their flags, exactly as they are.
-  const memberIds = mergeGroupCache.members.filter(m => !dismissedMemberIds.has(m.id)).map(m => m.id);
   try {
-    await api(`/applicants/duplicates/${flagId}/merge`, { method: 'POST', body: { primaryId, values, memberIds } });
-    toast('Merged'); afterDuplicateResolved();
+    await api(`/applicants/duplicates/${flagId}/merge`, { method: 'POST', body: { primaryId, values, memberIds: mergePairSelection } });
+    toast('Merged');
+    await refreshMergeGroupAndContinue();
   } catch (err) { toast(err.message, true); }
 };
 

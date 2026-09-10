@@ -2,33 +2,145 @@
 <html lang="en">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Recent Actions · Kipas Hair BP Platform</title>
+<title>Logs · Kipas Hair BP Platform</title>
 <link rel="stylesheet" href="/css/theme.css">
 <link rel="icon" type="image/png" sizes="32x32" href="/img/favicon-32.png">
 <link rel="apple-touch-icon" href="/img/apple-touch-icon.png">
 <link rel="stylesheet" href="/css/portal-theme.css">
+<style>
+  /* Dark, console-style theme for THIS page's content area only (the shared
+     header/nav above it stays the normal site theme — every other admin
+     page still looks like the rest of the app). Overrides generic
+     input/select/.card/.btn rules scoped under #content so nothing here
+     leaks onto any other page, which reuses the same class names on the
+     normal light background. */
+  body { background: #0b0d12; }
+  #content { background: #0b0d12; min-height: calc(100vh - 70px); margin: -24px; padding: 28px; color: #dfe3ea; }
+  #content h2 { color: #f4f6f9; }
+  #content .small-muted { color: #8892a3; }
+  #content .card { background: #151922; border: 1px solid #262c39; box-shadow: none; }
+  #content input, #content select { background: #10131a; border: 1.5px solid #2a3040; color: #e6e9ef; }
+  #content input::placeholder { color: #5c6376; }
+  #content input:focus, #content select:focus { border-color: #c9a76a; box-shadow: 0 0 0 3px rgba(201,167,106,.18); }
+  #content .btn-outline { border-color: #3a4256; color: #dfe3ea; background: transparent; }
+  #content .btn-outline:hover { background: #1c2130; }
+  #content .btn-primary { background: #c9a76a; color: #1a1508; border-color: #c9a76a; }
+  #content table { color: #dfe3ea; }
+  #content th { color: #8892a3; text-transform: uppercase; font-size: 11px; letter-spacing: .04em; border-bottom: 1px solid #262c39; text-align: left; padding: 8px 10px; cursor: pointer; user-select: none; white-space: nowrap; }
+  #content th:hover { color: #dfe3ea; }
+  #content th.sorted { color: #c9a76a; }
+  #content td { border-bottom: 1px solid #1c2130; padding: 9px 10px; vertical-align: top; }
+  #content tr.log-row:hover { background: #171b26; cursor: pointer; }
+  #content .badge { border: 1px solid transparent; }
+  #content .badge-success, #content .badge-active, #content .badge-approved { background: rgba(52,211,153,.15); color: #4ade80; border-color: rgba(74,222,128,.3); }
+  #content .badge-failed, #content .badge-danger, #content .badge-rejected { background: rgba(248,113,113,.15); color: #f87171; border-color: rgba(248,113,113,.3); }
+  #content .badge-pending, #content .badge-mock, #content .badge-inactive { background: rgba(201,167,106,.15); color: #d9b979; border-color: rgba(201,167,106,.3); }
+  #content .tabs-dark { display: flex; gap: 4px; border-bottom: 1px solid #262c39; margin-bottom: 16px; }
+  #content .tabs-dark button { background: none; border: none; color: #8892a3; font-weight: 600; font-size: 14px; padding: 10px 16px; cursor: pointer; border-bottom: 2px solid transparent; }
+  #content .tabs-dark button.active { color: #f4f6f9; border-bottom-color: #c9a76a; }
+  #content .tabs-dark button:hover:not(.active) { color: #dfe3ea; }
+  #content .filter-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; align-items: center; }
+  #content .filter-row input, #content .filter-row select { width: auto; min-width: 130px; }
+  #content .filter-row input#f-search, #content .filter-row input#log-search { min-width: 220px; flex: 1; }
+  #content .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+  #content .log-detail { background: #0b0d12; border: 1px solid #262c39; border-radius: 6px; padding: 10px 12px; margin-top: 4px; white-space: pre-wrap; word-break: break-word; }
+  #content .empty-state { color: #6b7280; text-align: center; padding: 40px 0; }
+</style>
 </head>
 <body>
 <script src="/js/app.js"></script>
 <script>
-Auth.requireAdmin();
-// 'audit' is denied by default for everyone but super_admin (see
-// RESOURCE_DEFAULT_OVERRIDES in middleware/permissions.js) unless an admin
-// explicitly grants it via Users & Permissions — same real check the nav's
-// hide-if-blocked relies on, so someone without it can't reach this page
-// directly by URL either.
-if (!Auth.can('audit')) { location.href = '/admin/dashboard'; }
+// Hardcoded to super_admin only — not a grantable permission (see
+// routes/audit.js and middleware/permissions.js) — so this is a real role
+// check, not a can() lookup that would fail open once 'audit' stopped being
+// a permission key at all.
+Auth.requireRole('super_admin');
 renderShell('/admin/audit', `
-  <div class="flex-between">
-    <h2>Recent Actions</h2>
-    <select id="f-hours">
-      <option value="24">Last 24 hours</option>
-      <option value="48" selected>Last 48 hours</option>
-      <option value="168">Last 7 days</option>
-    </select>
+  <h2 style="margin:0 0 14px">Logs</h2>
+  <div class="tabs-dark">
+    <button id="tab-actions" class="active">Recent Actions</button>
+    <button id="tab-logs">Logs</button>
   </div>
-  <p class="small-muted">Every create/update/approve/reject across the system, who did it, and what changed. Undoing restores exactly the fields that action changed; an undone action shows a Redo button to bring it back.</p>
-  <div id="actions-list">Loading…</div>
+
+  <div id="pane-actions">
+    <p class="small-muted" style="margin-top:0">Every create/update/approve/reject across the system, who did it, and what changed. Undoing restores exactly the fields that action changed; an undone action shows a Redo button to bring it back.</p>
+    <div class="filter-row">
+      <input id="f-search" placeholder="Search actions, names, users…">
+      <select id="f-entity">
+        <option value="">All record types</option>
+        <option value="shul">Shuls</option>
+        <option value="applicant">Applicants</option>
+        <option value="store">Stores</option>
+        <option value="card">Cards</option>
+        <option value="season">Seasons</option>
+        <option value="task">Tasks</option>
+        <option value="user">Users</option>
+        <option value="mass">Mass actions</option>
+      </select>
+      <select id="f-hours">
+        <option value="24">Last 24 hours</option>
+        <option value="48" selected>Last 48 hours</option>
+        <option value="168">Last 7 days</option>
+      </select>
+      <select id="f-sort">
+        <option value="desc" selected>Newest first</option>
+        <option value="asc">Oldest first</option>
+      </select>
+    </div>
+    <div id="actions-list">Loading…</div>
+  </div>
+
+  <div id="pane-logs" hidden>
+    <p class="small-muted" style="margin-top:0">Every outbound request this platform made to a third-party API — SMS, email, disccardpromos — with what was sent, what came back, and whether it succeeded. Click a row for the full detail.</p>
+    <div class="filter-row">
+      <input id="log-search" placeholder="Search endpoint, request, response, error…">
+      <select id="log-f-provider">
+        <option value="">All providers</option>
+        <option value="email">Email</option>
+        <option value="sms">SMS</option>
+        <option value="disccardpromos">disccardpromos</option>
+      </select>
+      <select id="log-f-success">
+        <option value="">Success or failed</option>
+        <option value="1">Success only</option>
+        <option value="0">Failed only</option>
+      </select>
+      <select id="log-f-hours">
+        <option value="24">Last 24 hours</option>
+        <option value="48" selected>Last 48 hours</option>
+        <option value="168">Last 7 days</option>
+        <option value="720">Last 30 days</option>
+        <option value="">All time</option>
+      </select>
+      <select id="log-f-pagesize">
+        <option value="25">25 / page</option>
+        <option value="50" selected>50 / page</option>
+        <option value="100">100 / page</option>
+      </select>
+    </div>
+    <div style="overflow-x:auto">
+    <table>
+      <thead><tr>
+        <th data-sort="created_at">Time</th>
+        <th data-sort="provider">Provider</th>
+        <th data-sort="method">Method</th>
+        <th data-sort="endpoint">Endpoint</th>
+        <th data-sort="status_code">Status</th>
+        <th data-sort="duration_ms">Duration</th>
+        <th>Related</th>
+        <th>User</th>
+      </tr></thead>
+      <tbody id="logs-tbody"><tr><td colspan="8" class="empty-state">Loading…</td></tr></tbody>
+    </table>
+    </div>
+    <div class="flex-between" style="margin-top:12px">
+      <span class="small-muted" id="logs-count"></span>
+      <div style="display:flex;gap:8px">
+        <button class="btn btn-sm btn-outline" id="logs-prev">Prev</button>
+        <button class="btn btn-sm btn-outline" id="logs-next">Next</button>
+      </div>
+    </div>
+  </div>
 `);
 
 const ENTITY_LABELS = { shul: 'shul', applicant: 'applicant', store: 'store', season: 'season', task: 'task', user: 'user', card: 'card' };
@@ -128,7 +240,7 @@ function duplicateDetail(a) {
       const rows = [snap.entityA, snap.entityB].filter(Boolean);
       if (rows.length) {
         html += `<ul style="margin:6px 0 0;padding-left:18px;font-size:13px;color:var(--text-muted)">
-          ${rows.map(r => `<li><strong style="color:var(--text-dark)">${esc(dupName(r))}</strong> — was ${r.is_paused ? 'paused' : 'not paused'}${r.duplicate_status ? `, status "${esc(r.duplicate_status)}"` : ''}, now unpaused</li>`).join('')}
+          ${rows.map(r => `<li><strong style="color:#dfe3ea">${esc(dupName(r))}</strong> — was ${r.is_paused ? 'paused' : 'not paused'}${r.duplicate_status ? `, status "${esc(r.duplicate_status)}"` : ''}, now unpaused</li>`).join('')}
         </ul>`;
       }
     } else {
@@ -139,7 +251,7 @@ function duplicateDetail(a) {
   // merge
   if (snap) {
     html += `<ul style="margin:6px 0 0;padding-left:18px;font-size:13px;color:var(--text-muted)">
-      ${snap.membersBefore.map(m => `<li>${m.id === snap.primaryId ? '<strong style="color:var(--text-dark)">' + esc(dupName(m)) + ' (kept)</strong>' : esc(dupName(m)) + ' (folded in)'}</li>`).join('')}
+      ${snap.membersBefore.map(m => `<li>${m.id === snap.primaryId ? '<strong style="color:#dfe3ea">' + esc(dupName(m)) + ' (kept)</strong>' : esc(dupName(m)) + ' (folded in)'}</li>`).join('')}
     </ul>`;
   } else if (after.memberIds && after.memberIds.length) {
     html += `<div class="small-muted" style="margin-top:6px">${after.memberIds.length} records merged (individual names weren't recorded for this older action)</div>`;
@@ -149,7 +261,7 @@ function duplicateDetail(a) {
   }
   const conflicts = after.accountConflicts || [];
   if (conflicts.length) {
-    html += `<div class="small-muted" style="margin-top:4px;color:var(--danger)">${conflicts.map(c => esc(`${c.secondaryName} (disccardpromos #${c.secondaryAccountId}) already had its own account — not auto-linked, needs manual review`)).join('<br>')}</div>`;
+    html += `<div class="small-muted" style="margin-top:4px;color:#f87171">${conflicts.map(c => esc(`${c.secondaryName} (disccardpromos #${c.secondaryAccountId}) already had its own account — not auto-linked, needs manual review`)).join('<br>')}</div>`;
   }
   return html;
 }
@@ -159,7 +271,7 @@ function changeList(a) {
   const keys = [...new Set([...Object.keys(before), ...Object.keys(after)])].filter(k => JSON.stringify(before[k]) !== JSON.stringify(after[k]));
   if (!keys.length) return '';
   return `<ul style="margin:8px 0 0;padding-left:18px;font-size:13px;color:var(--text-muted)">
-    ${keys.map(k => `<li><strong style="color:var(--text-dark)">${esc(fieldLabel(k))}:</strong> ${esc(fmtVal(k, before[k]))} <span style="color:var(--brand-gold-dark)">→</span> ${esc(fmtVal(k, after[k]))}</li>`).join('')}
+    ${keys.map(k => `<li><strong style="color:#dfe3ea">${esc(fieldLabel(k))}:</strong> ${esc(fmtVal(k, before[k]))} <span style="color:#c9a76a">→</span> ${esc(fmtVal(k, after[k]))}</li>`).join('')}
   </ul>`;
 }
 
@@ -223,7 +335,7 @@ function massDetail(a) {
   // genuine disccardpromos rejection).
   const providerErrorDetails = (after.providerErrorDetails || []).filter(Boolean);
   if (providerErrorDetails.length) {
-    html += `<div class="small-muted" style="margin-top:4px;color:var(--danger)">${providerErrorDetails.map(d => esc(d)).join('<br>')}</div>`;
+    html += `<div class="small-muted" style="margin-top:4px;color:#f87171">${providerErrorDetails.map(d => esc(d)).join('<br>')}</div>`;
   }
   // Merge groups where a secondary already had its own disccardpromos
   // account before it was ever recognized as a duplicate — see
@@ -231,13 +343,13 @@ function massDetail(a) {
   // these are surfaced instead of silently overwritten.
   const conflictDetails = (after.conflictDetails || []).filter(Boolean);
   if (conflictDetails.length) {
-    html += `<div class="small-muted" style="margin-top:4px;color:var(--danger)">${conflictDetails.map(d => esc(d)).join('<br>')}</div>`;
+    html += `<div class="small-muted" style="margin-top:4px;color:#f87171">${conflictDetails.map(d => esc(d)).join('<br>')}</div>`;
   }
   // Applicants whose disccardpromos deactivation still failed even on this
   // retry — see routes/applicants.js's POST /retry-deactivation.
   const failureDetails = (after.failureDetails || []).filter(Boolean);
   if (failureDetails.length) {
-    html += `<div class="small-muted" style="margin-top:4px;color:var(--danger)">${failureDetails.map(d => esc(d)).join('<br>')}</div>`;
+    html += `<div class="small-muted" style="margin-top:4px;color:#f87171">${failureDetails.map(d => esc(d)).join('<br>')}</div>`;
   }
   const notes = (after.notes || []).filter(Boolean);
   if (notes.length) {
@@ -251,10 +363,40 @@ function massDetail(a) {
   return html;
 }
 
-async function load() {
+// ---------------------------------------------------------------------------
+// Tab 1: Recent Actions — same data/rendering as before, plus client-side
+// search/entity-type filter/sort (the whole time window is already fetched
+// in one call, so filtering in place is simpler than round-tripping and
+// plenty fast at this scale).
+// ---------------------------------------------------------------------------
+let actionsCache = [];
+async function loadActions() {
   const hours = qs('#f-hours').value;
+  qs('#actions-list').innerHTML = '<p class="small-muted">Loading…</p>';
   const { actions } = await api(`/audit/recent?hours=${hours}`);
-  qs('#actions-list').innerHTML = actions.length ? actions.map(a => {
+  actionsCache = actions;
+  renderActionsList();
+}
+function renderActionsList() {
+  const term = qs('#f-search').value.trim().toLowerCase();
+  const entityFilter = qs('#f-entity').value;
+  const sortDir = qs('#f-sort').value;
+  let rows = actionsCache.filter(a => {
+    if (entityFilter === 'mass' && !a.action.startsWith('mass-')) return false;
+    if (entityFilter && entityFilter !== 'mass' && a.entity_type !== entityFilter) return false;
+    if (!term) return true;
+    // Matches the RENDERED headline text too (e.g. "Merged", "Bypassed a
+    // duplicate…"), not just raw field values — those are generated from
+    // the row, not stored on it, so a search for what the admin actually
+    // sees on screen wouldn't otherwise match anything.
+    const isMass = a.action.startsWith('mass-'), isDup = isDuplicateAction(a);
+    const renderedHeadline = isDup ? duplicateHeadline(a) : (isMass ? massHeadline(a) : headline(a));
+    const hay = [a.action, a.entity_type, a.first_name, a.last_name, a.user_email, entityName(a), renderedHeadline]
+      .filter(Boolean).join(' ').replace(/<[^>]+>/g, ' ').toLowerCase();
+    return hay.includes(term);
+  });
+  if (sortDir === 'asc') rows = [...rows].reverse();
+  qs('#actions-list').innerHTML = rows.length ? rows.map(a => {
     const isMass = a.action.startsWith('mass-');
     const isDup = isDuplicateAction(a);
     return `<div class="card" style="margin-bottom:8px;padding:14px 16px">
@@ -268,7 +410,7 @@ async function load() {
         ${a.redoable ? `<button class="btn btn-sm btn-outline" onclick="undoAction('${a.undo_entry_id}', true)">Redo</button>` : ''}
       </div>
     </div>`;
-  }).join('') : '<p class="small-muted">No actions in this window.</p>';
+  }).join('') : '<p class="empty-state">No actions match.</p>';
 }
 window.undoAction = async (id, isRedo, action) => {
   // Undoing a mass import is more consequential than a normal single-entity
@@ -285,10 +427,95 @@ window.undoAction = async (id, isRedo, action) => {
     ? (isRedo ? 'Redo this? Both records go back to being paused as an open duplicate flag.' : 'Undo this? Both records return to exactly how they were right before this was resolved — including being paused again as an open duplicate flag.')
     : (isRedo ? 'Redo this action? This brings the change back.' : 'Undo this action? This restores the affected record to how it was right before this change.');
   if (!confirm(message)) return;
-  try { await api(`/audit/${id}/undo`, { method: 'POST' }); toast(isRedo ? 'Redone' : 'Undone'); load(); } catch (err) { toast(err.message, true); }
+  try { await api(`/audit/${id}/undo`, { method: 'POST' }); toast(isRedo ? 'Redone' : 'Undone'); loadActions(); } catch (err) { toast(err.message, true); }
 };
-qs('#f-hours').addEventListener('change', load);
-load();
+qs('#f-hours').addEventListener('change', loadActions);
+qs('#f-entity').addEventListener('change', renderActionsList);
+qs('#f-sort').addEventListener('change', renderActionsList);
+qs('#f-search').addEventListener('input', debounce(renderActionsList, 200));
+
+// ---------------------------------------------------------------------------
+// Tab 2: Logs — every outbound call to a third-party API (SMS/email/
+// disccardpromos), server-side filtered/sorted/paginated (see GET
+// /audit/api-logs and services/apiCallLog.js) since this table can grow much
+// larger than Recent Actions' 48h-window default.
+// ---------------------------------------------------------------------------
+const logsState = { page: 1, sort: 'created_at', dir: 'DESC', expanded: null };
+function providerBadgeCls(p) { return p === 'email' ? 'pending' : p === 'sms' ? 'active' : 'mock'; }
+async function loadLogs() {
+  qs('#logs-tbody').innerHTML = '<tr><td colspan="8" class="empty-state">Loading…</td></tr>';
+  const params = new URLSearchParams({
+    page: logsState.page, pageSize: qs('#log-f-pagesize').value, sort: logsState.sort, dir: logsState.dir,
+  });
+  const provider = qs('#log-f-provider').value; if (provider) params.set('provider', provider);
+  const success = qs('#log-f-success').value; if (success !== '') params.set('success', success);
+  const hours = qs('#log-f-hours').value; if (hours) params.set('hours', hours);
+  const search = qs('#log-search').value.trim(); if (search) params.set('search', search);
+  const { rows, total, pageSize } = await api(`/audit/api-logs?${params}`);
+  renderLogsTable(rows);
+  const start = total === 0 ? 0 : (logsState.page - 1) * pageSize + 1;
+  const end = Math.min(total, logsState.page * pageSize);
+  qs('#logs-count').textContent = total ? `${start}–${end} of ${total}` : 'No calls logged in this window.';
+  qs('#logs-prev').disabled = logsState.page <= 1;
+  qs('#logs-next').disabled = end >= total;
+  qsa('#pane-logs th[data-sort]').forEach(th => th.classList.toggle('sorted', th.dataset.sort === logsState.sort));
+}
+function renderLogsTable(rows) {
+  if (!rows.length) { qs('#logs-tbody').innerHTML = '<tr><td colspan="8" class="empty-state">No calls match.</td></tr>'; return; }
+  qs('#logs-tbody').innerHTML = rows.map(r => `
+    <tr class="log-row" onclick="toggleLogDetail('${r.id}')">
+      <td class="mono">${fmtDateTime(r.created_at)}</td>
+      <td>${badge(r.provider, providerBadgeCls(r.provider))}</td>
+      <td class="mono">${esc(r.method)}</td>
+      <td class="mono">${esc(r.endpoint)}</td>
+      <td>${r.success ? badge('success', 'success') : badge('failed', 'failed')}${r.status_code ? ` <span class="small-muted">${r.status_code}</span>` : ''}</td>
+      <td class="mono">${r.duration_ms != null ? r.duration_ms + 'ms' : '—'}</td>
+      <td class="small-muted">${r.related_entity_type ? esc(r.related_entity_type) + ' ' + esc(String(r.related_entity_id || '').slice(0, 8)) : '—'}</td>
+      <td class="small-muted">${r.userName ? esc(r.userName) : '—'}</td>
+    </tr>
+    <tr id="detail-${r.id}" hidden><td colspan="8">
+      <div class="log-detail mono">${[
+        r.request_summary ? `Request: ${esc(r.request_summary)}` : null,
+        r.response_summary ? `Response: ${esc(r.response_summary)}` : null,
+        r.error_message ? `Error: ${esc(r.error_message)}` : null,
+      ].filter(Boolean).join('\n\n') || 'No further detail recorded.'}</div>
+    </td></tr>
+  `).join('');
+}
+window.toggleLogDetail = (id) => {
+  const row = qs(`#detail-${id}`);
+  if (!row) return;
+  row.hidden = !row.hidden;
+};
+qs('#log-f-provider').addEventListener('change', () => { logsState.page = 1; loadLogs(); });
+qs('#log-f-success').addEventListener('change', () => { logsState.page = 1; loadLogs(); });
+qs('#log-f-hours').addEventListener('change', () => { logsState.page = 1; loadLogs(); });
+qs('#log-f-pagesize').addEventListener('change', () => { logsState.page = 1; loadLogs(); });
+qs('#log-search').addEventListener('input', debounce(() => { logsState.page = 1; loadLogs(); }, 300));
+qs('#logs-prev').addEventListener('click', () => { if (logsState.page > 1) { logsState.page--; loadLogs(); } });
+qs('#logs-next').addEventListener('click', () => { logsState.page++; loadLogs(); });
+qsa('#pane-logs th[data-sort]').forEach(th => th.addEventListener('click', () => {
+  const col = th.dataset.sort;
+  if (logsState.sort === col) logsState.dir = logsState.dir === 'ASC' ? 'DESC' : 'ASC';
+  else { logsState.sort = col; logsState.dir = 'DESC'; }
+  loadLogs();
+}));
+
+// ---------------------------------------------------------------------------
+// Tab switching
+// ---------------------------------------------------------------------------
+let logsLoadedOnce = false;
+function switchTab(tab) {
+  qs('#tab-actions').classList.toggle('active', tab === 'actions');
+  qs('#tab-logs').classList.toggle('active', tab === 'logs');
+  qs('#pane-actions').hidden = tab !== 'actions';
+  qs('#pane-logs').hidden = tab !== 'logs';
+  if (tab === 'logs' && !logsLoadedOnce) { logsLoadedOnce = true; loadLogs(); }
+}
+qs('#tab-actions').addEventListener('click', () => switchTab('actions'));
+qs('#tab-logs').addEventListener('click', () => switchTab('logs'));
+
+loadActions();
 </script>
 </body>
 </html>

@@ -2047,12 +2047,34 @@ router.post('/duplicates/:flagId/resolve', requirePermission('applicants', 'can_
 router.get('/duplicates/:flagId/group', requireAdmin, (req, res) => {
   const flag = db.prepare(`SELECT * FROM duplicate_flags WHERE id = ? AND org_id = ? AND entity_type='applicant'`).get(req.params.flagId, req.user.org_id);
   if (!flag) return res.status(404).json({ error: 'Not found' });
-  const ids = getMergeGroupIds(req.user.org_id, [flag.entity_id, flag.matched_entity_id]);
+  // ?ids= lets a caller re-fetch the CURRENT state of an already-established
+  // working set instead of re-deriving the transitive closure from scratch
+  // (getMergeGroupIds always reseeds from this flag's own two original
+  // entities — once THEIR connecting flags close, one-by-one, during a
+  // multi-step pairwise merge, re-deriving from scratch can silently lose
+  // members still connected to each other but no longer to the original
+  // seed pair). The frontend's pairwise compare-and-merge flow captures the
+  // full group once on first open and passes it back on every refresh so
+  // nobody it already surfaced ever quietly disappears mid-review. Always
+  // re-scoped to this org regardless of what the client sends.
+  const explicitIds = typeof req.query.ids === 'string' ? req.query.ids.split(',').filter(Boolean) : null;
+  const ids = explicitIds && explicitIds.length ? explicitIds : getMergeGroupIds(req.user.org_id, [flag.entity_id, flag.matched_entity_id]);
+  const placeholders0 = ids.map(() => '?').join(',');
   const members = db.prepare(`SELECT a.*, s.name_en as shul_name, ps.name_en as previous_shul_name FROM applicants a
     LEFT JOIN shuls s ON s.id = a.shul_id LEFT JOIN shuls ps ON ps.id = a.previous_shul_id
-    WHERE a.id IN (${ids.map(() => '?').join(',')})`).all(...ids);
+    WHERE a.id IN (${placeholders0}) AND a.org_id = ?`).all(...ids, req.user.org_id);
   const e = members.find(m => m.id === flag.entity_id), m = members.find(m => m.id === flag.matched_entity_id);
-  res.json({ flag, members, sharesPhone: !!(e && m && applicantsSharePhone(e, m)) });
+  // Every open flag connecting any two members of this group (not just the
+  // single flag this view was opened from) — the pairwise compare-and-merge
+  // UI needs this to know, for whichever two members the admin picks, which
+  // reason they were actually flagged for and whether a real flag even
+  // exists between them (only a direct one can be bypassed; two members
+  // that are only transitively related through a third have nothing to
+  // bypass — see mergeApplicants/getMergeGroupIds in services/duplicates.js).
+  const placeholders = ids.map(() => '?').join(',');
+  const flags = db.prepare(`SELECT * FROM duplicate_flags WHERE org_id = ? AND entity_type='applicant' AND status='open'
+    AND entity_id IN (${placeholders}) AND matched_entity_id IN (${placeholders})`).all(req.user.org_id, ...ids, ...ids);
+  res.json({ flag, members, flags, sharesPhone: !!(e && m && applicantsSharePhone(e, m)) });
 });
 
 // Forces this flag's whole merge group to be resolved as one confirmed

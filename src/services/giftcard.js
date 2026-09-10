@@ -44,6 +44,7 @@
 
 import { randomUUID } from 'crypto';
 import { db } from '../db.js';
+import { logApiCall } from './apiCallLog.js';
 
 // Strips a trailing slash on a base URL (a very easy copy-paste mistake,
 // e.g. 'https://api.disccardpromos.com/') so `${apiBase}${path}` (path
@@ -112,26 +113,46 @@ function logStartupStatus() {
 }
 logStartupStatus();
 
+// Single choke point for every real (non-mock) disccardpromos request in
+// the app — every exported function below either short-circuits in mock
+// mode before ever reaching here, or ends up here. That makes this the one
+// place to log the full outbound trail (see services/apiCallLog.js) for
+// the Logs page's API-calls tab, rather than instrumenting ~20 call sites
+// individually. Logs both the success and failure paths, plus a genuine
+// network-level failure (fetch itself throwing, e.g. DNS/timeout) that
+// never reaches a response at all.
 async function call(seasonId, path, opts = {}) {
   const cfg = resolveConfig(seasonId);
   if (!cfg.apiBase || !cfg.apiKey) throw new Error('disccardpromos not configured (running in mock mode; this should not be reached)');
-  const res = await fetch(`${cfg.apiBase}${path}`, {
-    ...opts,
-    headers: {
-      'Authorization': `Token ${cfg.apiKey}`,
-      'Content-Type': 'application/json',
-      ...(opts.headers || {}),
-    },
-  });
-  // A failure response isn't guaranteed to be JSON at all — a 500 from a
-  // Django-style backend with DEBUG off is typically a plain-text/HTML error
-  // page, which res.json() can't parse. Read the raw text first so that case
-  // still surfaces SOMETHING instead of silently collapsing to {}.
-  const rawText = await res.text();
+  const method = opts.method || 'GET';
+  const startedAt = Date.now();
+  let res, rawText;
+  try {
+    res = await fetch(`${cfg.apiBase}${path}`, {
+      ...opts,
+      headers: {
+        'Authorization': `Token ${cfg.apiKey}`,
+        'Content-Type': 'application/json',
+        ...(opts.headers || {}),
+      },
+    });
+    // A failure response isn't guaranteed to be JSON at all — a 500 from a
+    // Django-style backend with DEBUG off is typically a plain-text/HTML error
+    // page, which res.json() can't parse. Read the raw text first so that case
+    // still surfaces SOMETHING instead of silently collapsing to {}.
+    rawText = await res.text();
+  } catch (networkErr) {
+    logApiCall(null, 'disccardpromos', {
+      method, endpoint: path, requestSummary: opts.body, success: false,
+      errorMessage: networkErr.message, durationMs: Date.now() - startedAt, seasonId,
+    });
+    throw networkErr;
+  }
+  const durationMs = Date.now() - startedAt;
   let body;
   try { body = rawText ? JSON.parse(rawText) : {}; } catch { body = {}; }
   if (!res.ok) {
-    console.error(`[giftcard] ${opts.method || 'GET'} ${path} -> ${res.status}: ${rawText.slice(0, 2000)}`);
+    console.error(`[giftcard] ${method} ${path} -> ${res.status}: ${rawText.slice(0, 2000)}`);
     // body.message covers their simple-error shape; a DRF-style validation
     // error instead comes back as {field: ["reason", ...]} with no top-level
     // message, which previously collapsed to an opaque "API error 500" with
@@ -145,8 +166,16 @@ async function call(seasonId, path, opts = {}) {
       || (rawText ? rawText.replace(/\s+/g, ' ').trim().slice(0, 300) : null);
     const err = new Error(detail ? `disccardpromos API error ${res.status}: ${detail}` : `disccardpromos API error ${res.status}`);
     err.status = res.status; err.body = body; err.rawText = rawText;
+    logApiCall(null, 'disccardpromos', {
+      method, endpoint: path, requestSummary: opts.body, statusCode: res.status, success: false,
+      responseSummary: rawText, errorMessage: err.message, durationMs, seasonId,
+    });
     throw err;
   }
+  logApiCall(null, 'disccardpromos', {
+    method, endpoint: path, requestSummary: opts.body, statusCode: res.status, success: true,
+    responseSummary: rawText, durationMs, seasonId,
+  });
   return body;
 }
 
