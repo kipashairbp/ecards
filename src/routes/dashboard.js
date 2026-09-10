@@ -39,6 +39,21 @@ router.get('/pending-counts', (req, res) => {
   if (getPermission(req.user, 'stores').can_view) {
     counts.stores = db.prepare(`SELECT COUNT(*) c FROM stores WHERE org_id = ? AND setup_status = 'pending'`).get(orgId).c;
   }
+  // Open duplicate-applicant flags for the active season — these only ever
+  // surface today when an admin happens to click the Duplicates button, so
+  // a fresh flag from an overnight import/carry-forward could sit unseen
+  // indefinitely. Scoped the same way as counts.applicants above.
+  if (getPermission(req.user, 'applicants').can_view) {
+    counts.duplicates = db.prepare(`SELECT COUNT(*) c FROM duplicate_flags df JOIN applicants a ON a.id = df.entity_id
+      WHERE df.org_id = ? AND df.entity_type = 'applicant' AND df.status = 'open' AND a.season_id = ?`).get(orgId, seasonId).c;
+  }
+  // Open rejection appeals — a shul asked why, and nobody's answered yet
+  // (see applicant_rejection_appeals). Not season-scoped like the other
+  // counts here: an appeal on an old-season rejection is still a real,
+  // unanswered question from a shul, not something to let go stale.
+  if (getPermission(req.user, 'applicants').can_view) {
+    counts.appeals = db.prepare(`SELECT COUNT(*) c FROM applicant_rejection_appeals WHERE org_id = ? AND status = 'open'`).get(orgId).c;
+  }
   res.json({ counts });
 });
 

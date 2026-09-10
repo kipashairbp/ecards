@@ -238,6 +238,32 @@ router.get('/all-list', (req, res) => {
   res.json({ shuls: rows });
 });
 
+// Per-shul approved/pending/rejected applicant counts for the given shul
+// ids — counts a merged applicant (see applicant_submissions /
+// services/duplicates.js's mergeApplicants) against EVERY shul that
+// contributed a submission, not just whichever shul's data happens to back
+// the one real record. There's only ever one real card/account, but each
+// shul's own slot allocation still reflects that they submitted this
+// person, same as before a merge collapsed the separate rows. The `AND
+// s.shul_id != a.shul_id` on the submissions branch avoids double-counting
+// the shul that IS the real shul_id owner — that one's already covered by
+// the plain applicants branch.
+function shulApplicantCounts(shulIds) {
+  const counts = {};
+  if (!shulIds.length) return counts;
+  const placeholders = shulIds.map(() => '?').join(',');
+  const rows = db.prepare(`
+    SELECT shul_id, approval_status, COUNT(*) c FROM (
+      SELECT shul_id, approval_status FROM applicants WHERE shul_id IN (${placeholders}) AND approval_status IN ('approved','pending','rejected')
+      UNION ALL
+      SELECT s.shul_id, a.approval_status FROM applicant_submissions s JOIN applicants a ON a.id = s.applicant_id
+        WHERE s.shul_id IN (${placeholders}) AND s.shul_id != a.shul_id AND a.approval_status IN ('approved','pending','rejected')
+    ) GROUP BY shul_id, approval_status
+  `).all(...shulIds, ...shulIds);
+  for (const r of rows) (counts[r.shul_id] ||= {})[r.approval_status] = r.c;
+  return counts;
+}
+
 router.get('/', (req, res) => {
   const { search, status, paused, season_id, sort = 'created_at', dir = 'DESC', page = 1, pageSize = 50 } = req.query;
   // Locked system shuls (e.g. "Ezras Habayis") are excluded from the normal
@@ -275,13 +301,7 @@ router.get('/', (req, res) => {
   // here into the three an admin actually cares about at a glance — draft
   // and soft_rejected stay uncounted, same as everywhere else this
   // approved/pending/rejected breakdown is used.
-  const counts = {};
-  if (rows.length) {
-    const ids = rows.map(r => r.id);
-    const placeholders = ids.map(() => '?').join(',');
-    db.prepare(`SELECT shul_id, approval_status, COUNT(*) c FROM applicants WHERE shul_id IN (${placeholders}) AND approval_status IN ('approved','pending','rejected') GROUP BY shul_id, approval_status`)
-      .all(...ids).forEach(r => { (counts[r.shul_id] ||= {})[r.approval_status] = r.c; });
-  }
+  const counts = shulApplicantCounts(rows.map(r => r.id));
   const withCounts = rows.map(s => ({
     ...s,
     applicant_count: counts[s.id]?.approved || 0,
@@ -315,13 +335,7 @@ router.get('/export', requirePermission('shuls', 'can_export'), (req, res) => {
   // glance in the export); anything else (draft, soft_rejected, incomplete)
   // isn't a real submission yet and stays uncounted here, same as the
   // "Accepted So Far" season stat elsewhere in this app.
-  const counts = {};
-  if (rows.length) {
-    const ids = rows.map(r => r.id);
-    const placeholders = ids.map(() => '?').join(',');
-    db.prepare(`SELECT shul_id, approval_status, COUNT(*) c FROM applicants WHERE shul_id IN (${placeholders}) AND approval_status IN ('approved','pending','rejected') GROUP BY shul_id, approval_status`)
-      .all(...ids).forEach(r => { (counts[r.shul_id] ||= {})[r.approval_status] = r.c; });
-  }
+  const counts = shulApplicantCounts(rows.map(r => r.id));
   const withCounts = rows.map(r => ({
     ...r,
     applicants_approved: counts[r.id]?.approved || 0,
@@ -338,7 +352,19 @@ router.get('/:id', (req, res) => {
   else { checkScope(req, res, shul.id); if (res.headersSent) return; }
   const notes = db.prepare('SELECT n.*, u.first_name, u.last_name FROM shul_notes n LEFT JOIN users u ON u.id = n.user_id WHERE n.shul_id = ? ORDER BY n.created_at DESC').all(shul.id);
   const contract = db.prepare('SELECT * FROM contracts WHERE shul_id = ? ORDER BY created_at DESC LIMIT 1').get(shul.id);
-  const applicants = db.prepare('SELECT id, first_name, last_name, approval_status FROM applicants WHERE shul_id = ?').all(shul.id);
+  // Own applicants PLUS anything merged into another shul's real record
+  // where this shul is a contributing submission (see applicant_submissions)
+  // — shown with THIS shul's own submitted name, and counted here so this
+  // shul's own stats/tallies (both the admin's Applicants tab and this
+  // shul's own portal dashboard, which both read this same array) still
+  // reflect that they submitted this person, matching shulApplicantCounts
+  // above.
+  const applicants = db.prepare(`
+    SELECT id, first_name, last_name, approval_status FROM applicants WHERE shul_id = ?
+    UNION ALL
+    SELECT a.id, s.first_name, s.last_name, a.approval_status FROM applicant_submissions s JOIN applicants a ON a.id = s.applicant_id
+      WHERE s.shul_id = ? AND s.shul_id != a.shul_id
+  `).all(shul.id, shul.id);
   const flags = db.prepare(`SELECT * FROM duplicate_flags WHERE entity_type='shul' AND (entity_id = ? OR matched_entity_id = ?) AND status='open'`).all(shul.id, shul.id);
   const shulOut = redact(shul, req.permission.hidden_fields);
   // Internal-only, not a configurable hidden field — a shul should never

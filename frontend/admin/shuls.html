@@ -57,6 +57,19 @@ renderShell('/admin/shuls', `
 
 let state = { search:'', status:'', paused:'', season_id:'', sort:'created_at', dir:'DESC', page:1, pageSize:Auth.pageSize('shuls') };
 let selected = new Set();
+// Each row's own last-loaded data, keyed by id — see the identical comment
+// in applicants.html. Lets a mass action preview how many of the selection
+// would be skipped (massActionSkipNote in app.js) without a separate fetch.
+let selectedMeta = new Map();
+const MASS_SKIP_PREDICATES = {
+  approve: s => s.status !== 'approved' && !s.is_paused,
+  reject: s => s.status !== 'rejected',
+  'set-pending': s => s.status !== 'pending',
+  pause: s => !s.is_paused,
+  unpause: s => !!s.is_paused,
+  email: s => !!s.gabai_email,
+  sms: s => !!s.gabai_cell,
+};
 if (new URLSearchParams(location.search).get('dup') === '1') showDuplicates();
 
 // Every field a column can show, plus how to render it. Which of these
@@ -129,6 +142,7 @@ async function load() {
   const params = new URLSearchParams({ search: state.search, status: state.status, paused: state.paused, season_id: state.season_id, sort: state.sort, dir: state.dir, page: state.page, pageSize: state.pageSize });
   try {
     const { shuls, total } = await api('/shuls?' + params);
+    for (const s of shuls) selectedMeta.set(s.id, s);
     const cols = activeColumns.map(k => SHUL_COLUMNS.find(c => c.key === k)).filter(Boolean);
     if (!shuls.length) { qs('#tbody').innerHTML = `<tr><td colspan="${cols.length+2}" class="empty-state">No shuls found.</td></tr>`; }
     else qs('#tbody').innerHTML = shuls.map(s => rowHtml(s, cols)).join('');
@@ -313,9 +327,12 @@ function openMassCarryForwardModal(ids) {
   });
 }
 qs('#btn-mass-apply').addEventListener('click', async () => {
-  const action = MASS_ACTIONS[qs('#mass-action').value];
+  const actionKey = qs('#mass-action').value;
+  const action = MASS_ACTIONS[actionKey];
   const ids = Array.from(selected);
-  if (action.confirm && !confirm(action.confirm(ids.length))) return;
+  const skipNote = massActionSkipNote(ids.map(id => selectedMeta.get(id)), MASS_SKIP_PREDICATES[actionKey]);
+  const confirmMsg = [action.confirm ? action.confirm(ids.length) : null, skipNote].filter(Boolean).join('\n\n');
+  if (confirmMsg && !confirm(confirmMsg)) return;
   try {
     const r = await action.run(ids);
     if (!r) return;
@@ -413,6 +430,7 @@ async function openShul(id) {
       </div>
     `;
     const footer = `
+      <button class="btn btn-outline btn-sm" onclick="location.href='/admin/applicants?shul_id=${id}'">View Applicants</button>
       <button class="btn btn-outline btn-sm" onclick="showOtherSeasons('Shul', '/shuls/${id}/other-seasons', 'openShul')">View Other Seasons</button>
       <button class="btn btn-outline btn-sm" onclick="openCarryForwardModal()">Carry Forward to Season…</button>
       <button class="btn btn-outline btn-sm" onclick="openQuickTaskModal('shul','${id}','${esc(shul.name_en).replace(/'/g,"\\'")}')">+ Add Task</button>

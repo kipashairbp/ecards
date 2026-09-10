@@ -48,27 +48,41 @@ export function findAccountByPhone(orgId, rawPhone) {
 
 // Forward lookup — the other direction from findAccountByEmail/
 // findAccountByPhone above: given a list of record ids for one known entity
-// type, resolve each one's own contact info (same field mapping/COALESCE
-// order as those reverse lookups and the SMS group-send in routes/sms.js).
-// Powers the mass Email/SMS actions on the Shuls/Applicants/Stores list
-// pages — recipients are resolved server-side from just the checked ids,
-// not trusted from whatever the client already has cached. Silently drops
-// any id with no contact info on file rather than erroring.
-export function resolveEmailsForIds(orgId, entityType, ids) {
+// type, resolve each one's own contact info AND its own {{variable}}
+// values (same field mapping/COALESCE order as those reverse lookups and
+// the SMS group-send in routes/sms.js). Powers the mass Email/SMS actions
+// on the Shuls/Applicants/Stores list pages — recipients are resolved
+// server-side from just the checked ids, not trusted from whatever the
+// client already has cached. Returns one row per id that actually has that
+// channel's contact info on file (silently drops the rest rather than
+// erroring). Per-recipient vars matter here: a mass send used to only be
+// able to substitute ONE shared `variables` object across the whole batch
+// (same {{first_name}} for everyone, or none at all) — this gives each
+// recipient their own. Field names match ENTITY_TEMPLATE_VARS in
+// frontend/js/app.js (varsHintHtml) — keep the two in sync.
+export function resolveRecipientsForIds(orgId, entityType, ids, channel) {
   if (!ids || !ids.length) return [];
   const placeholders = ids.map(() => '?').join(',');
-  if (entityType === 'shul') return db.prepare(`SELECT gabai_email AS contact FROM shuls WHERE org_id = ? AND id IN (${placeholders})`).all(orgId, ...ids).map(r => r.contact).filter(Boolean);
-  if (entityType === 'store') return db.prepare(`SELECT COALESCE(NULLIF(manager_email,''), owner_email) AS contact FROM stores WHERE org_id = ? AND id IN (${placeholders})`).all(orgId, ...ids).map(r => r.contact).filter(Boolean);
-  if (entityType === 'applicant') return db.prepare(`SELECT email AS contact FROM applicants WHERE org_id = ? AND id IN (${placeholders})`).all(orgId, ...ids).map(r => r.contact).filter(Boolean);
-  throw new Error(`Unsupported entity type: ${entityType}`);
-}
-export function resolvePhonesForIds(orgId, entityType, ids) {
-  if (!ids || !ids.length) return [];
-  const placeholders = ids.map(() => '?').join(',');
-  if (entityType === 'shul') return db.prepare(`SELECT gabai_cell AS contact FROM shuls WHERE org_id = ? AND id IN (${placeholders})`).all(orgId, ...ids).map(r => r.contact).filter(Boolean);
-  if (entityType === 'store') return db.prepare(`SELECT COALESCE(NULLIF(manager_phone,''), owner_phone) AS contact FROM stores WHERE org_id = ? AND id IN (${placeholders})`).all(orgId, ...ids).map(r => r.contact).filter(Boolean);
-  if (entityType === 'applicant') return db.prepare(`SELECT COALESCE(NULLIF(husband_cell,''), NULLIF(wife_cell,''), home_phone) AS contact FROM applicants WHERE org_id = ? AND id IN (${placeholders})`).all(orgId, ...ids).map(r => r.contact).filter(Boolean);
-  throw new Error(`Unsupported entity type: ${entityType}`);
+  let rows;
+  if (entityType === 'shul') {
+    const contactCol = channel === 'email' ? 'gabai_email' : 'gabai_cell';
+    rows = db.prepare(`SELECT id, ${contactCol} AS contact, name_en, ruv_first_name, ruv_last_name, gabai_first_name, gabai_last_name, gabai_email
+      FROM shuls WHERE org_id = ? AND id IN (${placeholders})`).all(orgId, ...ids)
+      .map(r => ({ id: r.id, contact: r.contact, vars: { name: r.name_en || '', rav_first_name: r.ruv_first_name || '', rav_last_name: r.ruv_last_name || '', gabai_first_name: r.gabai_first_name || '', gabai_last_name: r.gabai_last_name || '', email: r.gabai_email || '' } }));
+  } else if (entityType === 'applicant') {
+    const contactCol = channel === 'email' ? 'a.email' : `COALESCE(NULLIF(a.husband_cell,''), NULLIF(a.wife_cell,''), a.home_phone)`;
+    rows = db.prepare(`SELECT a.id, ${contactCol} AS contact, a.first_name, a.last_name, a.external_id, a.email, s.name_en AS shul_name
+      FROM applicants a LEFT JOIN shuls s ON s.id = a.shul_id WHERE a.org_id = ? AND a.id IN (${placeholders})`).all(orgId, ...ids)
+      .map(r => ({ id: r.id, contact: r.contact, vars: { first_name: r.first_name || '', last_name: r.last_name || '', shul_name: r.shul_name || '', external_id: r.external_id || '', email: r.email || '' } }));
+  } else if (entityType === 'store') {
+    const contactCol = channel === 'email' ? `COALESCE(NULLIF(manager_email,''), owner_email)` : `COALESCE(NULLIF(manager_phone,''), owner_phone)`;
+    rows = db.prepare(`SELECT id, ${contactCol} AS contact, name, manager_name, owner_name
+      FROM stores WHERE org_id = ? AND id IN (${placeholders})`).all(orgId, ...ids)
+      .map(r => ({ id: r.id, contact: r.contact, vars: { name: r.name || '', manager_name: r.manager_name || '', owner_name: r.owner_name || '' } }));
+  } else {
+    throw new Error(`Unsupported entity type: ${entityType}`);
+  }
+  return rows.filter(r => r.contact);
 }
 
 export function findAccountByEmail(orgId, rawEmail) {

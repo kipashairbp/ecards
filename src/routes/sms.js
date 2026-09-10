@@ -4,7 +4,7 @@ import { auth } from '../middleware/auth.js';
 import { requirePermission } from '../middleware/permissions.js';
 import { sendSmsChecked, logInboundSms, isSmsMockMode, syncInboundSms, getOwnSmsNumber } from '../services/sms.js';
 import { sendXlsx } from '../services/xlsx.js';
-import { findAccountByPhone, resolvePhonesForIds } from '../utils/contactLookup.js';
+import { findAccountByPhone, resolveRecipientsForIds } from '../utils/contactLookup.js';
 import { getActiveSeasonId } from '../utils/formSchedule.js';
 
 const router = Router();
@@ -178,7 +178,7 @@ router.get('/groups/:group', (req, res) => {
 router.post('/send', requirePermission('sms', 'can_edit'), async (req, res) => {
   const { to, group, entity_type, ids, body, variables, season_id } = req.body || {};
   if (!body) return res.status(400).json({ error: 'body is required' });
-  const substitute = (text) => String(text).replace(/\{\{(\w+)\}\}/g, (m, key) => (variables && variables[key] != null ? variables[key] : m));
+  const substitute = (text, vars) => String(text).replace(/\{\{(\w+)\}\}/g, (m, key) => (vars && vars[key] != null ? vars[key] : m));
 
   if (group) {
     let recipients = [];
@@ -208,18 +208,19 @@ router.post('/send', requirePermission('sms', 'can_edit'), async (req, res) => {
 
   // Mass "SMS" action on the Shuls/Applicants/Stores list pages — sends to
   // exactly the checked rows' own phone numbers, resolved server-side (same
-  // COALESCE order as the group blast above), rather than the whole group.
+  // COALESCE order as the group blast above). Each recipient gets its OWN
+  // {{variable}} values substituted (see resolveRecipientsForIds) rather
+  // than one shared `variables` object applied identically to everyone.
   if (entity_type) {
     if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids is required with entity_type' });
-    const phones = [...new Set(resolvePhonesForIds(req.user.org_id, entity_type, ids))];
-    if (!phones.length) return res.status(400).json({ error: 'None of the selected records have a phone number on file' });
-    const finalBody = substitute(body);
+    const recipients = resolveRecipientsForIds(req.user.org_id, entity_type, ids, 'phone');
+    if (!recipients.length) return res.status(400).json({ error: 'None of the selected records have a phone number on file' });
     let sent = 0, failed = 0;
-    for (const phone of phones) {
-      const { emailError } = await sendSmsChecked(req.user.org_id, phone, finalBody, { sentBy: req.user.id });
+    for (const r of recipients) {
+      const { emailError } = await sendSmsChecked(req.user.org_id, r.contact, substitute(body, r.vars), { sentBy: req.user.id });
       if (emailError) failed++; else sent++;
     }
-    return res.json({ ok: true, sent, failed, total: phones.length });
+    return res.json({ ok: true, sent, failed, total: recipients.length });
   }
 
   if (!to) return res.status(400).json({ error: 'to, group, or entity_type + ids is required' });
@@ -228,7 +229,7 @@ router.post('/send', requirePermission('sms', 'can_edit'), async (req, res) => {
   // the unscoped group blast above) message to each.
   const recipients = [...new Set(String(to).split(',').map(s => s.trim()).filter(Boolean))];
   if (!recipients.length) return res.status(400).json({ error: 'At least one recipient is required' });
-  const finalBody = substitute(body);
+  const finalBody = substitute(body, variables);
   const results = [];
   for (const recipient of recipients) {
     const { emailError } = await sendSmsChecked(req.user.org_id, recipient, finalBody, { sentBy: req.user.id });

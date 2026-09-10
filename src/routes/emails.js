@@ -4,7 +4,7 @@ import { auth } from '../middleware/auth.js';
 import { requirePermission } from '../middleware/permissions.js';
 import { sendMailChecked } from '../services/mail.js';
 import { sendXlsx } from '../services/xlsx.js';
-import { findAccountByEmail, resolveEmailsForIds } from '../utils/contactLookup.js';
+import { findAccountByEmail, resolveRecipientsForIds } from '../utils/contactLookup.js';
 
 const router = Router();
 router.use(auth, requirePermission('emails')); // internal team feature — staff/org_admin/super_admin only
@@ -133,25 +133,31 @@ router.get('/recipients/search', (req, res) => {
 router.post('/send', requirePermission('emails', 'can_edit'), async (req, res) => {
   const { to, entity_type, ids, subject, body_html, variables } = req.body || {};
   if (!subject || !body_html) return res.status(400).json({ error: 'subject and body_html are required' });
-  let recipients;
+  const substitute = (text, vars) => String(text).replace(/\{\{(\w+)\}\}/g, (m, key) => (vars && vars[key] != null ? vars[key] : m));
+  const results = [];
   if (entity_type) {
     if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids is required with entity_type' });
-    recipients = [...new Set(resolveEmailsForIds(req.user.org_id, entity_type, ids))];
+    // Per-recipient vars (each record's own name/shul/etc.), not one shared
+    // `variables` object applied identically to everyone — see
+    // resolveRecipientsForIds in utils/contactLookup.js.
+    const recipients = resolveRecipientsForIds(req.user.org_id, entity_type, ids, 'email');
     if (!recipients.length) return res.status(400).json({ error: 'None of the selected records have an email address on file' });
+    for (const r of recipients) {
+      const { emailError } = await sendMailChecked(req.user.org_id, r.contact, substitute(subject, r.vars), substitute(body_html, r.vars), { sentBy: req.user.id });
+      results.push({ to: r.contact, emailError });
+    }
   } else {
     if (!to) return res.status(400).json({ error: 'to, or entity_type + ids, is required' });
-    recipients = [...new Set(String(to).split(',').map(s => s.trim()).filter(Boolean))];
+    const recipients = [...new Set(String(to).split(',').map(s => s.trim()).filter(Boolean))];
     if (!recipients.length) return res.status(400).json({ error: 'At least one recipient is required' });
     const invalid = recipients.filter(r => !EMAIL_RE.test(r));
     if (invalid.length) return res.status(400).json({ error: `Not a valid email address: ${invalid.join(', ')}` });
-  }
-  const substitute = (text) => String(text).replace(/\{\{(\w+)\}\}/g, (m, key) => (variables && variables[key] != null ? variables[key] : m));
-  const finalSubject = substitute(subject);
-  const finalBody = substitute(body_html);
-  const results = [];
-  for (const recipient of recipients) {
-    const { emailError } = await sendMailChecked(req.user.org_id, recipient, finalSubject, finalBody, { sentBy: req.user.id });
-    results.push({ to: recipient, emailError });
+    const finalSubject = substitute(subject, variables);
+    const finalBody = substitute(body_html, variables);
+    for (const recipient of recipients) {
+      const { emailError } = await sendMailChecked(req.user.org_id, recipient, finalSubject, finalBody, { sentBy: req.user.id });
+      results.push({ to: recipient, emailError });
+    }
   }
   const failed = results.filter(r => r.emailError);
   res.json({ ok: !failed.length, sent: results.length - failed.length, failed: failed.length, results });

@@ -47,6 +47,7 @@ import preferencesRoutes from './routes/preferences.js';
 import contactRoutes from './routes/contact.js';
 import analyticsRoutes from './routes/analytics.js';
 import migrationRoutes from './routes/migration.js';
+import searchRoutes from './routes/search.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -157,6 +158,7 @@ app.use('/api/preferences', preferencesRoutes);
 app.use('/api/contact', contactRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/migration', migrationRoutes);
+app.use('/api/search', searchRoutes);
 
 // Signed/generated PDFs, uploaded logos, and update attachments.
 app.use('/uploads/contracts', express.static(join(process.env.DATA_DIR || join(process.cwd(), 'data'), 'contracts')));

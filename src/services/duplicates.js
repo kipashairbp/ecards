@@ -1,4 +1,5 @@
 import { db, uuid } from '../db.js';
+import { captureApplicantSnapshot, hardDeleteApplicant, restoreApplicantSnapshot } from '../utils/entityDelete.js';
 
 const norm = (s) => (s || '').toString().trim().toLowerCase().replace(/[^a-z0-9]/g, '');
 
@@ -398,6 +399,16 @@ export function getMergeGroupIds(orgId, startIds) {
 // the primary's id (== how a "is this the primary" check works elsewhere),
 // duplicate_status='merged', and unpaused. Every open flag connecting two
 // members of the resolved group is marked resolved.
+//
+// Genuinely ONE real `applicants` row survives a merge — one status, one
+// card, one disccardpromos account — not N rows quietly sharing an account
+// behind the scenes. Every OTHER member's own submitted data (name/contact/
+// demographics, exactly as THEIR shul entered it) is snapshotted into
+// applicant_submissions before that member's row is hard-deleted (full
+// cascade, fully undoable — see utils/entityDelete.js), which is what makes
+// shul-blindness survive losing the separate row: that shul's portal keeps
+// reading its own snapshot forever, under its own name, never learning
+// about the merge or the surviving row's (possibly different-shul's) data.
 export function mergeApplicants(orgId, userId, { primaryId, values, memberIds } = {}) {
   if (!primaryId) throw new Error('primaryId is required');
   const fullGroupIds = getMergeGroupIds(orgId, [primaryId]);
@@ -463,19 +474,96 @@ export function mergeApplicants(orgId, userId, { primaryId, values, memberIds } 
   }
   // A member that already carries its own disccardpromos account (from
   // before it was ever recognized as a duplicate) is never touched here —
-  // see reconcileAccountsForGroup below for why that's deliberate.
+  // see reconcileAccountsForGroup below for why that's deliberate. Runs
+  // while every member row still exists, so it can find and adopt a loser's
+  // already-real account onto the primary before those rows are folded away
+  // below.
   const accountConflicts = reconcileAccountsForGroup(primaryId);
+
+  // Snapshot every member's ORIGINAL submitted data (membersBefore, captured
+  // before any of the updates above ran) into applicant_submissions — one
+  // row per shul, including the primary's own shul, so "who submitted this"
+  // survives independent of whose data won as the composite. A member with
+  // no shul_id (a soft-rejected loser) has nothing for its own shul to read
+  // back later, so it's skipped here — it's still fully preserved in that
+  // member's own hard-delete snapshot below for undo.
+  const submissionIds = [];
+  // A member being folded away now might itself already be a PRIOR merge's
+  // survivor (a chained pairwise merge — see applicants.html's pairwise
+  // compare flow), already holding applicant_submissions rows from that
+  // earlier step. Those have to move with it onto the new primary instead
+  // of being orphaned when this member's own row is deleted below —
+  // captured here (before the repoint) so undo can move them back.
+  const repointedSubmissions = [];
+  for (const m of membersBefore) {
+    if (m.id === primaryId) continue;
+    const existing = db.prepare('SELECT id FROM applicant_submissions WHERE applicant_id = ?').all(m.id).map(r => r.id);
+    if (existing.length) {
+      repointedSubmissions.push({ fromApplicantId: m.id, ids: existing });
+      const ph = existing.map(() => '?').join(',');
+      db.prepare(`UPDATE applicant_submissions SET applicant_id = ? WHERE id IN (${ph})`).run(primaryId, ...existing);
+    }
+  }
+  for (const m of membersBefore) {
+    if (!m.shul_id) continue; // no shul to attribute a submission to (soft-rejected loser)
+    // Already has a submission under the surviving record for this exact
+    // shul — either the primary's own prior submission from an earlier
+    // merge step, or one the repoint above just moved here for this same
+    // shul_id. Either way, inserting again would duplicate it.
+    if (db.prepare('SELECT 1 FROM applicant_submissions WHERE applicant_id = ? AND shul_id = ?').get(primaryId, m.shul_id)) continue;
+    const subId = uuid();
+    db.prepare(`INSERT INTO applicant_submissions (id, org_id, applicant_id, shul_id, is_primary,
+        first_name, last_name, marital_status, home_phone, husband_cell, wife_cell, email,
+        address, city, state, zip, preferred_contact_method, preferred_number,
+        num_children, home_for_yomtov, comments, approval_status)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(subId, orgId, primaryId, m.shul_id, m.id === primaryId ? 1 : 0,
+        m.first_name, m.last_name, m.marital_status, m.home_phone, m.husband_cell, m.wife_cell, m.email,
+        m.address, m.city, m.state, m.zip, m.preferred_contact_method, m.preferred_number,
+        m.num_children, m.home_for_yomtov, m.comments, m.approval_status);
+    submissionIds.push(subId);
+  }
+  // Exactly one submission counts as "primary" per applicant — whichever
+  // shul_id the surviving row currently carries. Recomputed fresh each
+  // merge step rather than trusted from the loop above, since a chained
+  // merge can change which shul that is without touching every row.
+  db.prepare('UPDATE applicant_submissions SET is_primary = 0 WHERE applicant_id = ?').run(primaryId);
+  db.prepare(`UPDATE applicant_submissions SET is_primary = 1 WHERE applicant_id = ? AND shul_id = (SELECT shul_id FROM applicants WHERE id = ?)`).run(primaryId, primaryId);
+
+  // Fold every non-primary member away for real — full cascade capture
+  // (cards, notes, documents, messages, flags — see captureApplicantSnapshot)
+  // so undo can bring the exact row back, then hard-delete it. Its own shul
+  // keeps seeing it via the applicant_submissions row just written above,
+  // read through primaryId from here on.
+  const deletedApplicantSnapshots = [];
+  for (const m of membersBefore) {
+    if (m.id === primaryId) continue;
+    const liveRow = db.prepare('SELECT * FROM applicants WHERE id = ?').get(m.id);
+    if (!liveRow) continue; // already gone somehow — nothing left to fold away
+    deletedApplicantSnapshots.push(captureApplicantSnapshot(liveRow));
+    hardDeleteApplicant(liveRow);
+  }
+
+  undoSnapshot.submissionIds = submissionIds;
+  undoSnapshot.repointedSubmissions = repointedSubmissions;
+  undoSnapshot.deletedApplicantSnapshots = deletedApplicantSnapshots;
+
   return { primaryId, memberIds: groupIds, accountConflicts, undoSnapshot };
 }
 
 // Restores everything mergeApplicants' undoSnapshot captured: every
-// member's full row (merge_group_id, duplicate_status, is_paused, the
-// composite values written onto the primary, any provider_account_id
-// reconcileAccountsForGroup linked, the soft_rejected->rejected flip) back
-// to its exact pre-merge value, and every flag the merge resolved back to
-// open. A member deleted since the merge is skipped, not recreated — this
-// undoes the merge's field changes, it isn't a delete-cascade restore.
+// non-primary member's row (hard-deleted by the merge — see
+// deletedApplicantSnapshots) is fully recreated FIRST via
+// restoreApplicantSnapshot, so the field-level restore below has a row to
+// update again; then every member's full row (merge_group_id,
+// duplicate_status, is_paused, the composite values written onto the
+// primary, any provider_account_id reconcileAccountsForGroup linked, the
+// soft_rejected->rejected flip) goes back to its exact pre-merge value, and
+// every flag the merge resolved back to open. Finally, this merge's own
+// applicant_submissions rows are removed, and any it repointed from a
+// chained prior merge move back to where they came from.
 export function restoreDuplicateMergeApplicants(snap) {
+  for (const s of snap.deletedApplicantSnapshots || []) restoreApplicantSnapshot(s);
   for (const row of snap.membersBefore) {
     if (!db.prepare('SELECT 1 FROM applicants WHERE id = ?').get(row.id)) continue;
     const keys = Object.keys(row).filter(k => k !== 'id');
@@ -483,6 +571,14 @@ export function restoreDuplicateMergeApplicants(snap) {
   }
   for (const f of snap.flagsBefore) {
     db.prepare(`UPDATE duplicate_flags SET status = ?, resolved_by = ?, resolved_at = ? WHERE id = ?`).run(f.status, f.resolved_by, f.resolved_at, f.id);
+  }
+  for (const r of snap.repointedSubmissions || []) {
+    const ph = r.ids.map(() => '?').join(',');
+    db.prepare(`UPDATE applicant_submissions SET applicant_id = ? WHERE id IN (${ph})`).run(r.fromApplicantId, ...r.ids);
+  }
+  if (snap.submissionIds?.length) {
+    const ph = snap.submissionIds.map(() => '?').join(',');
+    db.prepare(`DELETE FROM applicant_submissions WHERE id IN (${ph})`).run(...snap.submissionIds);
   }
 }
 
@@ -557,6 +653,61 @@ export function reconcileAllMergedAccounts(orgId, seasonId) {
     linked += before - nulls();
   }
   return { groupsChecked, linked, conflicts };
+}
+
+// One-time (safely re-runnable) migration for every merge group that
+// predates applicant_submissions existing at all: collapses each into a
+// genuinely single applicants row, the exact same way a fresh
+// mergeApplicants call does from here on — snapshot every member's own
+// submitted data (including the primary's own shul) into
+// applicant_submissions, then hard-delete every non-primary row (full
+// cascade capture first, so it's fully undoable). Returns one
+// mergeApplicants-shaped undoSnapshot per group actually collapsed, so the
+// caller can log each as its own audit_log row — undoable independently
+// from Recent Actions, same as any other merge. A group that already has
+// applicant_submissions rows (already collapsed by an earlier run of this,
+// or merged fresh after this shipped) is skipped, not reprocessed.
+export function collapseAllMergedApplicantGroups(orgId) {
+  const groupRows = db.prepare(`SELECT DISTINCT merge_group_id FROM applicants WHERE org_id = ? AND merge_group_id IS NOT NULL`).all(orgId);
+  const collapsed = [];
+  for (const { merge_group_id: primaryId } of groupRows) {
+    const primary = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(primaryId, orgId);
+    if (!primary) continue; // primary itself already gone somehow
+    const membersBefore = db.prepare('SELECT * FROM applicants WHERE merge_group_id = ? AND org_id = ?').all(primaryId, orgId);
+    if (membersBefore.length < 2) continue; // nothing left to collapse
+    if (db.prepare('SELECT 1 FROM applicant_submissions WHERE applicant_id = ?').get(primaryId)) continue; // already collapsed
+
+    const submissionIds = [];
+    for (const m of membersBefore) {
+      if (!m.shul_id) continue; // no shul to attribute a submission to (soft-rejected loser)
+      const subId = uuid();
+      db.prepare(`INSERT INTO applicant_submissions (id, org_id, applicant_id, shul_id, is_primary,
+          first_name, last_name, marital_status, home_phone, husband_cell, wife_cell, email,
+          address, city, state, zip, preferred_contact_method, preferred_number,
+          num_children, home_for_yomtov, comments, approval_status)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(subId, orgId, primaryId, m.shul_id, m.id === primaryId ? 1 : 0,
+          m.first_name, m.last_name, m.marital_status, m.home_phone, m.husband_cell, m.wife_cell, m.email,
+          m.address, m.city, m.state, m.zip, m.preferred_contact_method, m.preferred_number,
+          m.num_children, m.home_for_yomtov, m.comments, m.approval_status);
+      submissionIds.push(subId);
+    }
+    db.prepare('UPDATE applicant_submissions SET is_primary = 0 WHERE applicant_id = ?').run(primaryId);
+    db.prepare(`UPDATE applicant_submissions SET is_primary = 1 WHERE applicant_id = ? AND shul_id = (SELECT shul_id FROM applicants WHERE id = ?)`).run(primaryId, primaryId);
+
+    const deletedApplicantSnapshots = [];
+    for (const m of membersBefore) {
+      if (m.id === primaryId) continue;
+      deletedApplicantSnapshots.push(captureApplicantSnapshot(m));
+      hardDeleteApplicant(m);
+    }
+    collapsed.push({
+      primaryId,
+      memberIds: membersBefore.map(m => m.id),
+      undoSnapshot: { kind: 'duplicate-merge-applicant', primaryId, membersBefore, flagsBefore: [], submissionIds, repointedSubmissions: [], deletedApplicantSnapshots },
+    });
+  }
+  return collapsed;
 }
 
 // Same idea as getMergeGroupIds above, but for shuls: chains through open

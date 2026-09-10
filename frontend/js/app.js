@@ -189,6 +189,27 @@ function toast(msg, isError = false) {
   el._t = setTimeout(() => el.classList.remove('show'), 3500);
 }
 
+// Before a mass action (Approve/Reject/Set Pending/Pause/Unpause/Email/SMS)
+// actually runs, tell the admin up front how many of the selected rows are
+// already in that action's target state (or missing what it needs) and
+// would just be silently skipped server-side — instead of finding out only
+// after the fact, with no way to know which ones didn't apply. `rows` is
+// each selected id's own cached record data (see selectedMeta in
+// applicants.html/shuls.html, populated as rows are rendered); a row with
+// no cached data — shouldn't normally happen, since checking a box requires
+// having seen the row rendered at least once — counts as eligible rather
+// than blocking the preview on a guess. `predicate` is looked up per action
+// key by the caller; an action with no known eligibility rule (invite,
+// send-contract, carry-forward, delete) passes `predicate` as null and gets
+// no note at all, same as before this existed.
+function massActionSkipNote(rows, predicate) {
+  if (!predicate) return null;
+  let skip = 0;
+  for (const row of rows) { if (row && !predicate(row)) skip++; }
+  if (!skip) return null;
+  return `${skip} of ${rows.length} selected already meet this and will be skipped — proceeding with the other ${rows.length - skip}.`;
+}
+
 // Display label for a role — "staff" shows as "Admin" everywhere in the UI
 // (the org's preferred term for that tier); the underlying value and every
 // permission check stay exactly "staff" — nothing about what a staff
@@ -348,6 +369,10 @@ function renderShell(activeHref, contentHtml) {
         <div class="brand"><img src="/img/org-logo.png" alt="Organization logo"><div class="brand-name">Kipas Hair BP<span>Platform</span></div></div>
         <button class="header-menu-btn" id="header-menu-btn" aria-label="Toggle menu">&#9776;</button>
         <nav id="header-nav">${navHtml}<div class="nav-more" id="nav-more"><button class="nav-more-btn" id="nav-more-btn" type="button">More &#9662;</button><div class="nav-more-dropdown" id="nav-more-dropdown"></div></div></nav>
+        ${['staff', 'org_admin', 'super_admin'].includes(role) ? `<div class="header-search" id="header-search">
+          <input id="header-search-input" placeholder="Search shuls, applicants, stores…" autocomplete="off">
+          <div class="header-search-results" id="header-search-results" hidden></div>
+        </div>` : ''}
         <div class="header-user">
           <span class="header-user-email">${esc(user?.email || '')}</span>
           <button onclick="Auth.logout()">Sign out</button>
@@ -360,6 +385,7 @@ function renderShell(activeHref, contentHtml) {
   document.addEventListener('click', (e) => { const dd = qs('#nav-more-dropdown'); if (dd && dd.classList.contains('open') && !qs('#nav-more').contains(e.target)) dd.classList.remove('open'); });
   layoutNavOverflow();
   window.addEventListener('resize', debounce(layoutNavOverflow, 150));
+  wireHeaderSearch();
   if (role === 'shul' || role === 'store') {
     api('/updates/inbox/unread-count').then(({ count }) => {
       if (!count) return;
@@ -401,6 +427,36 @@ function renderShell(activeHref, contentHtml) {
       if (changed) layoutNavOverflow();
     }).catch(() => {});
   }
+}
+
+// The header search box (staff/org_admin/super_admin only, see renderShell)
+// — a jump-to lookup across Shuls/Applicants/Stores, GET /search?q= (see
+// routes/search.js), so an admin doesn't need to already know which list a
+// person/record lives in before finding them. Each result's href already
+// carries the ?id= that page's own deep-link auto-open reads (see
+// shuls.html/applicants.html/stores.html) — no separate open-by-id API.
+function wireHeaderSearch() {
+  const input = qs('#header-search-input');
+  if (!input) return; // not rendered for this role
+  const results = qs('#header-search-results');
+  const TYPE_LABEL = { shul: 'Shul', applicant: 'Applicant', store: 'Store' };
+  const render = (items) => {
+    if (!items.length) { results.innerHTML = `<div class="header-search-empty">No matches</div>`; results.hidden = false; return; }
+    results.innerHTML = items.map(r => `<a href="${esc(r.href)}" class="header-search-item">
+        <span class="header-search-type">${TYPE_LABEL[r.type] || r.type}</span>
+        <span><strong>${esc(r.label)}</strong>${r.sublabel ? `<br><span class="small-muted">${esc(r.sublabel)}</span>` : ''}</span>
+      </a>`).join('');
+    results.hidden = false;
+  };
+  const search = debounce(async () => {
+    const q = input.value.trim();
+    if (q.length < 2) { results.hidden = true; return; }
+    try { render((await api('/search?q=' + encodeURIComponent(q))).results); } catch { results.hidden = true; }
+  }, 300);
+  input.addEventListener('input', search);
+  input.addEventListener('focus', () => { if (input.value.trim().length >= 2) search(); });
+  document.addEventListener('click', (e) => { if (!qs('#header-search')?.contains(e.target)) results.hidden = true; });
+  input.addEventListener('keydown', (e) => { if (e.key === 'Escape') { results.hidden = true; input.blur(); } });
 }
 
 // On the wide (non-hamburger) header layout, the nav row hides links that
@@ -975,6 +1031,7 @@ window.viewDocumentPdf = (docId) => viewAuthed(`/documents/${docId}/pdf`);
 const ENTITY_TEMPLATE_VARS = {
   applicant: [['first_name', 'First Name'], ['last_name', 'Last Name'], ['shul_name', 'Shul Name'], ['email', 'Email'], ['external_id', 'Applicant ID']],
   shul: [['name', 'Shul Name'], ['rav_first_name', 'Rav First Name'], ['rav_last_name', 'Rav Last Name'], ['gabai_first_name', 'Gabai First Name'], ['gabai_last_name', 'Gabai Last Name'], ['email', 'Gabai Email']],
+  store: [['name', 'Store Name'], ['manager_name', 'Manager Name'], ['owner_name', 'Owner Name']],
 };
 function buildEntityVariables(entityType, entity) {
   if (!entity) return {};
@@ -1044,7 +1101,7 @@ async function loadMessagesTab(entityType, entityId, containerId, defaultPhone, 
         ${smsTemplates.length ? `<label>Use Template</label><select id="msg-sms-template-${entityId}" onchange="applyQuickSendTemplate('sms','${entityType}','${entityId}')">${smsTemplateOptions}</select>` : ''}
         <label>Message</label><textarea id="msg-sms-body-${entityId}" rows="2" placeholder="Type a message…"></textarea>
         <p class="small-muted" style="margin-top:4px">Available variables: ${varsHintHtml(entityType, vars)}</p>
-        <button class="btn btn-sm btn-primary" style="margin-top:8px" onclick="sendQuickSms('${entityType}','${entityId}','${containerId}','${safePhone}','${safeEmail}')">Send SMS</button>
+        <button class="btn btn-sm btn-primary" id="msg-sms-btn-${entityId}" style="margin-top:8px" onclick="sendQuickSms('${entityType}','${entityId}','${containerId}','${safePhone}','${safeEmail}')">Send SMS</button>
       </div>
       <div style="margin-bottom:16px">${sms.length ? sms.map(m => `<div style="padding:8px 0;border-bottom:1px solid var(--border)">
           <div class="flex-between"><strong>${esc(m.phone)}</strong>${badge(m.status, m.status)}</div>
@@ -1061,7 +1118,7 @@ async function loadMessagesTab(entityType, entityId, containerId, defaultPhone, 
         <label>Subject</label><input id="msg-email-subject-${entityId}" placeholder="Subject">
         <label>Message</label><div id="msg-email-body-${entityId}"></div>
         <p class="small-muted" style="margin-top:4px">Available variables: ${varsHintHtml(entityType, vars)}</p>
-        <button class="btn btn-sm btn-primary" style="margin-top:8px" onclick="sendQuickEmail('${entityType}','${entityId}','${containerId}','${safePhone}','${safeEmail}')">Send Email</button>
+        <button class="btn btn-sm btn-primary" id="msg-email-btn-${entityId}" style="margin-top:8px" onclick="sendQuickEmail('${entityType}','${entityId}','${containerId}','${safePhone}','${safeEmail}')">Send Email</button>
       </div>
       <div>${emails.length ? emails.map(m => `<div style="padding:8px 0;border-bottom:1px solid var(--border)">
           <div class="flex-between"><strong>${esc(m.to_email)}</strong>${badge(m.status, m.status)}</div>
@@ -1086,37 +1143,50 @@ window.applyQuickSendTemplate = (kind, entityType, entityId) => {
   }
 };
 window.sendQuickSms = async (entityType, entityId, containerId, defaultPhone, defaultEmail) => {
+  const btn = qs(`#msg-sms-btn-${entityId}`);
+  if (btn?.disabled) return;
   const to = qs(`#msg-sms-to-${entityId}`).value.trim();
   const body = qs(`#msg-sms-body-${entityId}`).value.trim();
   if (!body) return toast('Enter a message', true);
+  if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
   try {
     const r = await api(`/${entityType}s/${entityId}/send-sms`, { method: 'POST', body: { to, body } });
     toast(r.emailError ? `SMS failed: ${r.emailError}` : 'SMS sent', !!r.emailError);
     loadMessagesTab(entityType, entityId, containerId, defaultPhone, defaultEmail);
-  } catch (err) { toast(err.message, true); }
+  } catch (err) {
+    toast(err.message, true);
+    if (btn) { btn.disabled = false; btn.textContent = 'Send SMS'; }
+  }
 };
 window.sendQuickEmail = async (entityType, entityId, containerId, defaultPhone, defaultEmail) => {
+  const btn = qs(`#msg-email-btn-${entityId}`);
+  if (btn?.disabled) return;
   const to = qs(`#msg-email-to-${entityId}`).value.trim();
   const subject = qs(`#msg-email-subject-${entityId}`).value.trim();
   const body = window.__msgEmailEditors?.[entityId]?.getHtml().trim() || '';
   if (!subject || !body) return toast('Enter a subject and message', true);
+  if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
   try {
     const r = await api(`/${entityType}s/${entityId}/send-email`, { method: 'POST', body: { to, subject, body } });
     toast(r.emailError ? `Email failed: ${r.emailError}` : 'Email sent', !!r.emailError);
     loadMessagesTab(entityType, entityId, containerId, defaultPhone, defaultEmail);
-  } catch (err) { toast(err.message, true); }
+  } catch (err) {
+    toast(err.message, true);
+    if (btn) { btn.disabled = false; btn.textContent = 'Send Email'; }
+  }
 };
 
 // Mass "Email"/"SMS" action — shared by the Shuls/Applicants/Stores list
 // pages' MASS_ACTIONS (entityType is 'shul'/'store'/'applicant', matching
-// resolveEmailsForIds/resolvePhonesForIds' entity_type on the backend).
-// Same shape as openMassCarryForwardModal in shuls.html: returns a Promise
-// resolving to the send result (so the caller's existing summarize()
-// handles the toast), or null if the modal is closed without sending — a
-// MutationObserver is the only way to catch that since openModal/closeModal
-// don't offer an on-close hook. No per-recipient {{variable}} substitution
-// (there's no single set of vars across a mixed batch of records) — same as
-// the SMS group blast this mirrors.
+// resolveRecipientsForIds' entity_type on the backend). Same shape as
+// openMassCarryForwardModal in shuls.html: returns a Promise resolving to
+// the send result (so the caller's existing summarize() handles the toast),
+// or null if the modal is closed without sending — a MutationObserver is
+// the only way to catch that since openModal/closeModal don't offer an
+// on-close hook. {{variable}} placeholders ARE substituted per-recipient
+// (each record's own name/shul/etc., resolved server-side) — the hint below
+// has no resolved values to show since it's a mixed batch of records, but
+// the placeholders themselves still work exactly like the single quick-send.
 function openMassMessageModal(entityType, kind, ids) {
   return new Promise(async (resolve) => {
     let templates = [];
@@ -1124,6 +1194,7 @@ function openMassMessageModal(entityType, kind, ids) {
     const templateOptions = `<option value="">Start from scratch</option>` + templates.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('');
     const body = `
       <p class="small-muted">Sending to ${ids.length} selected record(s), using whichever ${kind === 'email' ? 'email address' : 'phone number'} each has on file — any without one is skipped.</p>
+      <p class="small-muted">Available variables (filled in per-recipient): ${varsHintHtml(entityType, {})}</p>
       ${templates.length ? `<label>Use Template</label><select id="mm-template">${templateOptions}</select>` : ''}
       ${kind === 'email' ? `<label>Subject</label><input id="mm-subject"><label>Message</label><div id="mm-body"></div>` : `<label>Message</label><textarea id="mm-body" rows="5"></textarea>`}
     `;
@@ -1144,9 +1215,12 @@ function openMassMessageModal(entityType, kind, ids) {
     });
     observer.observe(document.body, { childList: true });
     qs('#mm-send').addEventListener('click', async () => {
+      const sendBtn = qs('#mm-send');
+      if (sendBtn.disabled) return;
       const messageBody = kind === 'email' ? editor.getHtml().trim() : qs('#mm-body').value.trim();
       if (!messageBody) return toast('Enter a message', true);
       if (kind === 'email' && !qs('#mm-subject').value.trim()) return toast('Enter a subject', true);
+      sendBtn.disabled = true; sendBtn.textContent = 'Sending…';
       try {
         const r = kind === 'email'
           ? await api('/emails/send', { method: 'POST', body: { entity_type: entityType, ids, subject: qs('#mm-subject').value.trim(), body_html: messageBody } })
@@ -1154,7 +1228,10 @@ function openMassMessageModal(entityType, kind, ids) {
         observer.disconnect();
         closeModal();
         finish(r);
-      } catch (err) { toast(err.message, true); }
+      } catch (err) {
+        toast(err.message, true);
+        sendBtn.disabled = false; sendBtn.textContent = 'Send';
+      }
     });
   });
 }

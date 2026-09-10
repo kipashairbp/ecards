@@ -501,6 +501,64 @@ CREATE TABLE IF NOT EXISTS duplicate_flags (
   created_at TEXT DEFAULT (datetime('now'))
 );
 
+-- Once a duplicate group is merged (see services/duplicates.js's
+-- mergeApplicants), only ONE real applicants row survives — one status,
+-- one card, one disccardpromos account. Every OTHER shul that submitted the
+-- same person has its own row folded away entirely (hard-deleted, fully
+-- undoable — see utils/entityDelete.js), so their exact submitted copy is
+-- snapshotted here first. This is what a non-owning shul's portal reads
+-- from forever after — their own name/contact/etc., never the surviving
+-- row's (possibly different-shul's) values, and never any hint that the
+-- same person is enrolled elsewhere. A never-merged applicant has no row
+-- here at all; its own applicants row already is its one submission.
+CREATE TABLE IF NOT EXISTS applicant_submissions (
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  applicant_id TEXT NOT NULL REFERENCES applicants(id), -- the one surviving real record
+  shul_id TEXT NOT NULL REFERENCES shuls(id),           -- which shul submitted this copy
+  is_primary INTEGER DEFAULT 0, -- this shul's submission is what applicant_id's row currently shows (informational only)
+  first_name TEXT, last_name TEXT, marital_status TEXT,
+  home_phone TEXT, husband_cell TEXT, wife_cell TEXT, email TEXT,
+  address TEXT, city TEXT, state TEXT, zip TEXT,
+  preferred_contact_method TEXT, preferred_number TEXT,
+  num_children INTEGER, home_for_yomtov INTEGER, comments TEXT,
+  approval_status TEXT, -- this shul's own submission's status at merge time (informational only — the real, current status lives on the one applicants row)
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_applicant_submissions_applicant ON applicant_submissions(applicant_id);
+CREATE INDEX IF NOT EXISTS idx_applicant_submissions_shul ON applicant_submissions(shul_id);
+
+-- A shul asking the office why one of their applicants was rejected — one
+-- click from the shul portal (see POST /applicants/:id/appeal), no form.
+-- An admin answers with a reason (POST /applicants/appeals/:id/respond),
+-- which also writes onto applicants.rejection_reason (so it's visible
+-- without joining this table every time a list renders) and sends the shul
+-- an Update with the full applicant info plus the reason.
+CREATE TABLE IF NOT EXISTS applicant_rejection_appeals (
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  applicant_id TEXT NOT NULL REFERENCES applicants(id),
+  shul_id TEXT NOT NULL REFERENCES shuls(id),
+  status TEXT DEFAULT 'open', -- open | answered
+  reason TEXT,
+  responded_by TEXT REFERENCES users(id),
+  responded_at TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_applicant_rejection_appeals_org ON applicant_rejection_appeals(org_id);
+
+-- Reusable rejection-reason text so an admin doesn't retype the same
+-- explanation every time (mirrors sms_templates/email_templates).
+CREATE TABLE IF NOT EXISTS rejection_reason_templates (
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  name TEXT NOT NULL,
+  body TEXT NOT NULL,
+  created_by TEXT REFERENCES users(id),
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_rejection_reason_templates_org ON rejection_reason_templates(org_id);
+
 CREATE TABLE IF NOT EXISTS audit_log (
   id TEXT PRIMARY KEY,
   org_id TEXT,
@@ -771,6 +829,14 @@ safeAlter(`ALTER TABLE documents ADD COLUMN fields_json TEXT`);
 // shul_id (PUT /:id's auto-revert back to 'pending') — only meaningful
 // while the record is actually soft-rejected.
 safeAlter(`ALTER TABLE applicants ADD COLUMN previous_shul_id TEXT REFERENCES shuls(id)`);
+
+// The admin's answer to an appeal (see applicant_rejection_appeals) — kept
+// here too, not just on the appeal row, so a rejected badge can show it
+// inline everywhere without a join. Every display of this is gated on
+// approval_status === 'rejected', so a stale value left over from a past
+// rejection (later approved/re-pended, then rejected again) never shows
+// through — overwritten fresh each time an appeal is answered regardless.
+safeAlter(`ALTER TABLE applicants ADD COLUMN rejection_reason TEXT`);
 
 // Internal-only admin flag, same visibility boundary as permanent_comments
 // — a shul is never shown this or told it exists.

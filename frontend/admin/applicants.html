@@ -13,27 +13,33 @@
 <script>
 Auth.requireAdmin();
 renderShell('/admin/applicants', `
-  <div class="flex-between">
-    <h2>Applicants</h2>
-    <div class="pill-row">
-      <button class="btn btn-outline btn-sm" id="btn-template">Download Import Template</button>
-      <button class="btn btn-outline btn-sm" id="btn-import">Mass Upload</button>
-      <button class="btn btn-outline btn-sm" id="btn-export">Export Excel</button>
-      <button class="btn btn-outline btn-sm" id="f-dupes">Duplicates</button>
-      <button class="btn btn-outline btn-sm" id="btn-provider-sync">Disccardpromos Sync</button>
-      <button class="btn btn-outline btn-sm" id="btn-columns">Customize Columns</button>
-      <button class="btn btn-primary btn-sm" id="btn-new">+ Add Applicant</button>
+  <div class="list-header">
+    <div class="flex-between">
+      <h2>Applicants</h2>
+      <div class="pill-row">
+        <button class="btn btn-outline btn-sm" id="btn-template">Download Import Template</button>
+        <button class="btn btn-outline btn-sm" id="btn-import">Mass Upload</button>
+        <button class="btn btn-outline btn-sm" id="btn-export">Export Excel</button>
+        <button class="btn btn-outline btn-sm" id="f-dupes">Duplicates</button>
+        <button class="btn btn-outline btn-sm" id="btn-appeals">Appeals</button>
+        <button class="btn btn-outline btn-sm" id="btn-provider-sync">Disccardpromos Sync</button>
+        <button class="btn btn-outline btn-sm" id="btn-columns">Customize Columns</button>
+        <button class="btn btn-primary btn-sm" id="btn-new">+ Add Applicant</button>
+      </div>
+    </div>
+    <div class="toolbar">
+      <input id="f-search" placeholder="Search name, phone, email…">
+      <select id="f-status"><option value="">All statuses</option><option value="pending">Pending</option><option value="approved">Approved</option><option value="rejected">Rejected</option><option value="soft_rejected">Soft Reject</option><option value="incomplete">Incomplete</option><option value="draft">Draft</option></select>
+      <select id="f-paused"><option value="">Paused: All</option><option value="1">Paused only</option><option value="0">Not paused</option></select>
+      <select id="f-marital"><option value="">Any marital status</option><option value="single">Single</option><option value="married">Married</option><option value="widowed">Widowed</option><option value="divorced">Divorced</option></select>
+      <select id="f-shul"><option value="">All Shuls</option></select>
+      <select id="f-season"></select>
+      <div class="amount-filter"><input id="f-amount-min" type="number" min="0" step="1" placeholder="Min $"><span class="small-muted">&ndash;</span><input id="f-amount-max" type="number" min="0" step="1" placeholder="Max $"></div>
+      <select id="f-pagesize"><option value="25">25 / page</option><option value="50">50 / page</option><option value="100">100 / page</option><option value="200">200 / page</option></select>
     </div>
   </div>
   <div id="cap-banner"></div>
-  <div class="toolbar">
-    <input id="f-search" placeholder="Search name, phone, email…">
-    <select id="f-status"><option value="">All statuses</option><option value="pending">Pending</option><option value="approved">Approved</option><option value="rejected">Rejected</option><option value="soft_rejected">Soft Reject</option><option value="incomplete">Incomplete</option><option value="draft">Draft</option></select>
-    <select id="f-paused"><option value="">Paused: All</option><option value="1">Paused only</option><option value="0">Not paused</option></select>
-    <select id="f-marital"><option value="">Any marital status</option><option value="single">Single</option><option value="married">Married</option><option value="widowed">Widowed</option><option value="divorced">Divorced</option></select>
-    <select id="f-shul"><option value="">All Shuls</option></select>
-    <select id="f-season"></select>
-    <select id="f-pagesize"><option value="25">25 / page</option><option value="50">50 / page</option><option value="100">100 / page</option><option value="200">200 / page</option></select>
+  <div class="toolbar" style="justify-content:flex-end">
     <select id="mass-action">
       <option value="approve">Approve</option>
       <option value="reject">Reject</option>
@@ -55,8 +61,24 @@ renderShell('/admin/applicants', `
   <div class="paginator" id="pager"></div>
 `);
 
-let state = { search:'', status:'', paused:'', marital_status:'', shul_id:'', season_id:'', provider_sync:'', provider_check:'', sort:'created_at', dir:'DESC', page:1, pageSize:Auth.pageSize('applicants') };
+let state = { search:'', status:'', paused:'', marital_status:'', shul_id:'', season_id:'', provider_sync:'', provider_check:'', amount_min:'', amount_max:'', sort:'created_at', dir:'DESC', page:1, pageSize:Auth.pageSize('applicants') };
 let selected = new Set();
+// Each row's own last-loaded data, keyed by id — kept around (across pages,
+// across reloads) purely so a mass action can tell upfront how many of the
+// current selection would be skipped (see massActionSkipNote in app.js)
+// without a separate fetch. Only ever needs an id that was actually
+// rendered at some point, which checking its box requires anyway.
+let selectedMeta = new Map();
+// Which target-state each mass action checks for, so the skip-count preview
+// can tell an admin "3 of 5 are already approved" before running it instead
+// of only after. No entry (delete) = no skip check, same as before this.
+const MASS_SKIP_PREDICATES = {
+  approve: a => a.approval_status !== 'approved' && !a.is_paused,
+  reject: a => a.approval_status !== 'rejected',
+  'set-pending': a => a.approval_status !== 'pending',
+  email: a => !!a.email,
+  sms: a => !!(a.husband_cell || a.wife_cell || a.home_phone),
+};
 
 // Every field a column can show, plus how to render it — the checkbox
 // (selection) column is always first and never customizable, so it's not
@@ -70,7 +92,9 @@ function contactLine(a) {
 const APPLICANT_COLUMNS = [
   { key: 'external_id', label: 'ID', sort: 'external_id', render: a => `<code>${esc(a.external_id||'')}</code>` },
   { key: 'name', label: 'Name', sort: 'last_name', render: a => `<strong>${esc(a.first_name)} ${esc(a.last_name)}</strong>${a.is_paused ? ' ' + badge('paused','paused') : ''}` },
-  { key: 'shul', label: 'Shul', render: a => esc(a.shul_name || (a.approval_status === 'soft_rejected' && a.previous_shul_name ? `Previously: ${a.previous_shul_name}` : '')) },
+  { key: 'shul', label: 'Shul', render: a => a.contributing_shuls?.length > 1
+    ? `<div class="shul-pill-group">${a.contributing_shuls.map((n, i) => `<span class="shul-pill${i===0?' primary':''}">${esc(n)}</span>`).join('')}</div>`
+    : esc(a.shul_name || (a.approval_status === 'soft_rejected' && a.previous_shul_name ? `Previously: ${a.previous_shul_name}` : '')) },
   { key: 'marital_status', label: 'Marital', render: a => esc(a.marital_status||'') },
   { key: 'contact', label: 'Contact', render: a => contactLine(a) },
   { key: 'email', label: 'Email', render: a => esc(a.email||'') },
@@ -78,9 +102,10 @@ const APPLICANT_COLUMNS = [
   { key: 'husband_cell', label: 'Husband Cell', render: a => esc(a.husband_cell||'') },
   { key: 'wife_cell', label: 'Wife Cell', render: a => esc(a.wife_cell||'') },
   { key: 'address', label: 'Address', render: a => esc([a.address,a.city,a.state,a.zip].filter(Boolean).join(', ')) },
-  { key: 'num_children', label: 'Children', render: a => a.num_children ?? 0 },
+  { key: 'num_children', label: 'Children', sort: 'num_children', render: a => a.num_children ?? 0 },
   { key: 'home_for_yomtov', label: 'Home Yom Tov', render: a => a.home_for_yomtov ? 'Yes' : 'No' },
-  { key: 'approval_status', label: 'Status', sort: 'approval_status', render: a => badge(a.approval_status, a.approval_status) },
+  { key: 'approval_status', label: 'Status', sort: 'approval_status', render: a => badge(a.approval_status, a.approval_status)
+    + (a.approval_status === 'rejected' && a.rejection_reason ? `<div class="rejection-reason" title="${esc(a.rejection_reason)}">${esc(a.rejection_reason)}</div>` : '') },
   { key: 'card_amount', label: 'Card $', sort: 'card_amount', render: a => a.card_amount != null ? fmtMoney(a.card_amount) : '' },
   { key: 'provider_sync', label: 'Disccardpromos', render: a => providerSyncBadge(a.provider_sync) },
   { key: 'provider_check_status', label: 'Disccardpromos Says', render: a => providerCheckBadge(a.provider_check_status) },
@@ -118,6 +143,7 @@ async function load() {
       </div>` : '';
   try {
     const { applicants, total } = await api('/applicants?' + params);
+    for (const a of applicants) selectedMeta.set(a.id, a);
     const cols = activeColumns.map(k => APPLICANT_COLUMNS.find(c => c.key === k)).filter(Boolean);
     qs('#tbody').innerHTML = applicants.length ? applicants.map(a => rowHtml(a, cols)).join('') : `<tr><td colspan="${cols.length+2}" class="empty-state">No applicants found.</td></tr>`;
     const pages = Math.max(1, Math.ceil(total / state.pageSize));
@@ -147,6 +173,8 @@ qs('#f-status').addEventListener('change', () => { state.status = qs('#f-status'
 qs('#f-paused').addEventListener('change', () => { state.paused = qs('#f-paused').value; state.page = 1; load(); });
 qs('#f-marital').addEventListener('change', () => { state.marital_status = qs('#f-marital').value; state.page = 1; load(); });
 qs('#f-shul').addEventListener('change', () => { state.shul_id = qs('#f-shul').value; state.page = 1; load(); });
+qs('#f-amount-min').addEventListener('input', debounce(() => { state.amount_min = qs('#f-amount-min').value; state.page = 1; load(); }, 350));
+qs('#f-amount-max').addEventListener('input', debounce(() => { state.amount_max = qs('#f-amount-max').value; state.page = 1; load(); }, 350));
 qs('#f-season').addEventListener('change', () => {
   state.season_id = qs('#f-season').value; state.page = 1;
   // The shul filter is scoped to the season (a shul is a fresh row every
@@ -165,6 +193,7 @@ qs('#btn-export').addEventListener('click', () => downloadAuthed('/applicants/ex
 qs('#btn-new').addEventListener('click', () => openApplicantForm());
 qs('#btn-import').addEventListener('click', () => openImportModal());
 qs('#f-dupes').addEventListener('click', showDuplicates);
+qs('#btn-appeals').addEventListener('click', showAppeals);
 qs('#btn-provider-sync').addEventListener('click', showProviderSync);
 
 // null = not approved (irrelevant); the three real states an approved
@@ -443,6 +472,20 @@ async function reconcileMergedAccounts() {
     load();
   } catch (err) { toast(err.message, true); }
 }
+// One-time (safely re-runnable) cleanup for every merge group from BEFORE
+// a merge collapsed the group into one real applicants row — those old
+// merges just tagged the losing records with merge_group_id and left them
+// sitting there as separate rows. This snapshots each one's own submitted
+// data (so its shul keeps seeing it) and folds it away for real, same as a
+// fresh merge does now. Fully undoable per group from Recent Actions.
+async function collapseMergedGroups() {
+  if (!confirm('Collapse every existing merge group into one real record per group? Each losing shul\'s own submission is preserved (they\'ll keep seeing it), and their separate applicant row is then removed. This can be undone per-group from Recent Actions. Continue?')) return;
+  try {
+    const r = await api('/applicants/collapse-merged-groups', { method: 'POST', body: {} });
+    toast(r.groupsCollapsed ? `Collapsed ${r.groupsCollapsed} merge group(s) into one record each.` : 'Nothing to collapse — every merge group is already one record.');
+    load();
+  } catch (err) { toast(err.message, true); }
+}
 const MASS_ACTIONS = {
   approve: {
     confirm: null,
@@ -501,9 +544,12 @@ const MASS_ACTIONS = {
   },
 };
 qs('#btn-mass-apply').addEventListener('click', async () => {
-  const action = MASS_ACTIONS[qs('#mass-action').value];
+  const actionKey = qs('#mass-action').value;
+  const action = MASS_ACTIONS[actionKey];
   const ids = Array.from(selected);
-  if (action.confirm && !confirm(action.confirm(ids.length))) return;
+  const skipNote = massActionSkipNote(ids.map(id => selectedMeta.get(id)), MASS_SKIP_PREDICATES[actionKey]);
+  const confirmMsg = [action.confirm ? action.confirm(ids.length) : null, skipNote].filter(Boolean).join('\n\n');
+  if (confirmMsg && !confirm(confirmMsg)) return;
   try {
     const r = await action.run(ids);
     if (!r) return;
@@ -521,12 +567,13 @@ async function openApplicant(id) {
       <div id="atab-info">
         <div class="grid-2">
           <div><strong>Applicant ID</strong><br><code>${esc(a.external_id||'')}</code></div>
-          <div><strong>Status</strong><br>${badge(a.approval_status, a.approval_status)} ${a.is_paused ? badge('paused','paused') : ''}</div>
+          <div><strong>Status</strong><br>${badge(a.approval_status, a.approval_status)} ${a.is_paused ? badge('paused','paused') : ''}
+            ${a.approval_status === 'rejected' && a.rejection_reason ? `<div class="rejection-reason" title="${esc(a.rejection_reason)}">${esc(a.rejection_reason)}</div>` : ''}</div>
         </div>
         ${a.approval_status === 'soft_rejected' && a.previous_shul_name ? `<div class="divider"></div><p class="small-muted">Previously at: <strong>${esc(a.previous_shul_name)}</strong></p>` : ''}
-        ${mergeGroup && mergeGroup.length ? `<div class="divider"></div><div style="color:var(--text-muted);background:#f9efe0;padding:8px 12px;border-radius:6px">
-          <strong>Same person, enrolled through ${mergeGroup.length + 1} record${mergeGroup.length ? 's' : ''}${a.merge_group_id === a.id ? ' (this is the primary record — the only one with a real gift card)' : (a.merge_group_id ? " — the primary record's shul holds the actual gift card" : ' — not yet resolved, see the duplicate flag below')}:</strong>
-          ${mergeGroup.map(m => `${esc(m.first_name)} ${esc(m.last_name)} — ${esc(m.shul_name || (m.previous_shul_name ? `previously ${m.previous_shul_name}` : 'no shul'))} (${badge(m.approval_status, m.approval_status)})`).join(', ')}
+        ${mergeGroup && mergeGroup.length > 1 ? `<div class="divider"></div><div style="color:var(--text-muted);background:#f9efe0;padding:8px 12px;border-radius:6px">
+          <strong>One shared record — submitted by ${mergeGroup.length} shuls:</strong>
+          <div class="shul-pill-group" style="margin-top:6px">${mergeGroup.map(m => `<span class="shul-pill${m.is_primary ? ' primary' : ''}">${esc(m.shul_name)}</span>`).join('')}</div>
         </div>` : ''}
         <div class="divider"></div>
         <div class="grid-2">
@@ -794,7 +841,8 @@ async function showDuplicates() {
 function renderDuplicatesList() {
   const body = `<input id="dup-search" placeholder="Search by name, shul, or reason…" value="${esc(dupSearchTerm)}" style="margin-bottom:12px">
     <div id="dup-list">${renderDupListOnly()}</div>`;
-  const footer = `<button class="btn btn-outline btn-sm" onclick="recheckAllDuplicates()">Recheck All (org-wide)</button>`;
+  const footer = `<button class="btn btn-outline btn-sm" onclick="recheckAllDuplicates()">Recheck All (org-wide)</button>
+    <button class="btn btn-outline btn-sm" onclick="collapseMergedGroups()">Collapse Old Merges Into One Record</button>`;
   openModal('Duplicate Applicant Flags', body, footer);
   qs('#dup-search').addEventListener('input', (e) => { dupSearchTerm = e.target.value; qs('#dup-list').innerHTML = renderDupListOnly(); });
   qs('#dup-search').focus();
@@ -830,6 +878,69 @@ function renderDupListOnly() {
       </div>
     </div>`).join('') : `<p class="small-muted">${dupFlagsCache.length ? 'No flags match your search.' : 'No open duplicate flags.'}</p>`;
 }
+
+// ============================= Rejection Appeals =============================
+// A shul asked "why was this rejected" (one click from their own portal —
+// see applicant_rejection_appeals); this is where an admin answers it, with
+// the same reason-response optionally saved as a reusable template so it
+// doesn't need retyping next time a similar rejection comes up.
+let appealsCache = [];
+async function showAppeals() {
+  try {
+    appealsCache = (await api('/applicants/appeals/open')).appeals;
+    renderAppealsList();
+  } catch (err) { toast(err.message, true); }
+}
+function renderAppealsList() {
+  const body = appealsCache.length ? appealsCache.map(a => `<div class="card" style="margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;gap:10px">
+      <div><strong>${esc(a.first_name)} ${esc(a.last_name)}</strong> <span class="small-muted">(${esc(a.external_id||'')})</span><br>
+        <span class="small-muted">${esc(a.shul_name)} is asking why this was rejected — requested ${fmtDateTime(a.created_at)}</span></div>
+      <button class="btn btn-sm btn-primary" onclick="openRespondAppeal('${a.id}')">Respond</button>
+    </div>`).join('') : `<p class="small-muted">No open appeals.</p>`;
+  openModal('Rejection Appeals', body, '');
+}
+let appealTemplatesCache = [];
+window.openRespondAppeal = async (appealId) => {
+  const a = appealsCache.find(x => x.id === appealId);
+  if (!a) return;
+  try { appealTemplatesCache = (await api('/applicants/rejection-reason-templates')).templates; } catch { appealTemplatesCache = []; }
+  const templateOptions = `<option value="">Write your own</option>` + appealTemplatesCache.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('');
+  const body = `
+    <p class="small-muted"><strong>${esc(a.first_name)} ${esc(a.last_name)}</strong> — ${esc(a.shul_name)} asked why this applicant was rejected.</p>
+    ${appealTemplatesCache.length ? `<label>Use Saved Reason</label><select id="ar-template" onchange="applyAppealTemplate()">${templateOptions}</select>` : ''}
+    <label>Reason</label><textarea id="ar-reason" rows="5" placeholder="Explain why this applicant was rejected…"></textarea>
+    <div class="checkbox-row" style="margin-top:10px"><input type="checkbox" id="ar-save-template"><label style="margin:0">Save this as a reusable reason</label></div>
+    <div id="ar-save-name-wrap" style="display:none;margin-top:8px"><label>Reason Name</label><input id="ar-save-name" placeholder="e.g. Outside service area"></div>
+  `;
+  openModal('Respond to Appeal', body, `<button class="btn btn-primary btn-sm" id="btn-send-appeal-response" onclick="submitAppealResponse('${appealId}')">Send Response</button>`);
+  qs('#ar-save-template').addEventListener('change', (e) => { qs('#ar-save-name-wrap').style.display = e.target.checked ? 'block' : 'none'; });
+};
+window.applyAppealTemplate = () => {
+  const t = appealTemplatesCache.find(x => x.id === qs('#ar-template').value);
+  qs('#ar-reason').value = t ? t.body : '';
+};
+window.submitAppealResponse = async (appealId) => {
+  const btn = qs('#btn-send-appeal-response');
+  if (btn.disabled) return;
+  const reason = qs('#ar-reason').value.trim();
+  if (!reason) return toast('Enter a reason', true);
+  const saveTemplate = qs('#ar-save-template').checked;
+  const templateName = qs('#ar-save-name').value.trim();
+  if (saveTemplate && !templateName) return toast('Enter a name for the saved reason', true);
+  btn.disabled = true; btn.textContent = 'Sending…';
+  try {
+    if (saveTemplate) await api('/applicants/rejection-reason-templates', { method: 'POST', body: { name: templateName, body: reason } });
+    const r = await api(`/applicants/appeals/${appealId}/respond`, { method: 'POST', body: { reason } });
+    toast(r.emailError ? `Sent, but email failed: ${r.emailError}` : 'Response sent');
+    appealsCache = appealsCache.filter(a => a.id !== appealId);
+    if (appealsCache.length) renderAppealsList(); else closeModal();
+    load();
+    refreshHeaderBadges();
+  } catch (err) {
+    toast(err.message, true);
+    btn.disabled = false; btn.textContent = 'Send Response';
+  }
+};
 
 // The merge group can be more than a pair — the same family can get
 // submitted by three, four, five different shuls in one season. Rather than
@@ -1029,7 +1140,21 @@ attachColumnCustomizer('btn-columns', 'columns_applicants', APPLICANT_COLUMNS, D
 // call would flash every shul from every past season into the list for a
 // moment before this one replaced it (same race shape #5 fixed for load()
 // above).
-populateSeasonFilter('f-season').then(activeId => { state.season_id = activeId; populateShulFilter('f-shul', activeId); load(); });
+// Deep link from a shul's profile ("View Applicants" button, ?shul_id=<id>)
+// straight into that shul's already-filtered list. Applied inside
+// populateShulFilter's .then() rather than as a separate top-level
+// statement — that call fills the #f-shul <option> list asynchronously, so
+// setting state.shul_id/the select's value any earlier would leave the
+// dropdown showing "All Shuls" even though the table itself was already
+// correctly filtered underneath.
+const deepLinkShulId = new URLSearchParams(location.search).get('shul_id');
+populateSeasonFilter('f-season').then(activeId => {
+  state.season_id = activeId;
+  populateShulFilter('f-shul', activeId).then(() => {
+    if (deepLinkShulId) { state.shul_id = deepLinkShulId; qs('#f-shul').value = deepLinkShulId; }
+    load();
+  });
+});
 
 // Deep link from the "Notify on Document Signed" admin email (?id=<applicantId>)
 // straight into that applicant's popup.
@@ -1045,6 +1170,20 @@ attachLiveRefresh('live-banner', async () => {
   const { total } = await api('/applicants?' + params);
   return total;
 }, load);
+// Badges the Duplicates and Appeals buttons with their open counts so a new
+// one (e.g. an overnight import's flag, or a shul's appeal) doesn't sit
+// unnoticed until someone happens to click in — mirrors the nav's
+// pending-count dots for shuls/applicants/stores in app.js's renderShell.
+// Re-called after responding to an appeal so the badge updates live.
+function refreshHeaderBadges() {
+  qs('#f-dupes').innerHTML = 'Duplicates';
+  qs('#btn-appeals').innerHTML = 'Appeals';
+  api('/dashboard/pending-counts').then(({ counts }) => {
+    if (counts.duplicates) qs('#f-dupes').insertAdjacentHTML('beforeend', ` ${badge(String(counts.duplicates), 'rejected')}`);
+    if (counts.appeals) qs('#btn-appeals').insertAdjacentHTML('beforeend', ` ${badge(String(counts.appeals), 'rejected')}`);
+  }).catch(() => {});
+}
+refreshHeaderBadges();
 api('/seasons/active').then(({ season }) => {
   if (!season || season.max_accepted_applicants == null) return;
   qs('#cap-banner').innerHTML = `<div class="card" style="margin-bottom:16px;${season.is_full ? 'border-color:var(--danger)' : ''}">

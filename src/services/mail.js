@@ -256,7 +256,7 @@ function fieldLabelFallback(key) {
 // This table is built from raw shul/store submission data (address,
 // comments, names, ...) — escape it before dropping it into an HTML email
 // body, since an applicant could type anything into a free-text field.
-function escapeHtml(s) {
+export function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 export function renderSignupDetails(row) {

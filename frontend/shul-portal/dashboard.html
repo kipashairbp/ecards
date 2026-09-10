@@ -256,7 +256,14 @@ async function openApplicant(id) {
   try {
     const { applicant: a } = await api(`/applicants/${id}`);
     if (a.approval_status === 'incomplete') return openReenrollment(a);
-    if (a.approval_status === 'approved') return openApplicantReadOnly(a);
+    // Approved is locked same as always. Rejected is locked too now that a
+    // shul actually sees "rejected" (used to be masked as "pending" — see
+    // maskForShul in routes/applicants.js) — re-editing and resubmitting a
+    // rejected applicant forever isn't the flow anymore; Appeal (below) is.
+    // A merged applicant (_merged_readonly, see applicant_submissions) is
+    // always locked regardless of status — its own row was folded into
+    // another shul's real record, so there's nothing left here to edit.
+    if (['approved', 'rejected'].includes(a.approval_status) || a._merged_readonly) return openApplicantReadOnly(a);
     return openApplicantEdit(a);
   } catch (err) { toast(err.message, true); }
 }
@@ -266,7 +273,11 @@ function openApplicantReadOnly(a) {
   openModal(`${esc(a.first_name)} ${esc(a.last_name)}`, `
     <div class="grid-2">
       <div><strong>Applicant ID</strong><br><code>${esc(a.external_id||'')}</code></div>
-      <div><strong>Status</strong><br>${badge(a.approval_status,a.approval_status)}</div>
+      <div><strong>Status</strong><br>${badge(a.approval_status,a.approval_status)}
+        ${a.approval_status === 'rejected' ? (a.rejection_reason
+          ? `<div class="rejection-reason" title="${esc(a.rejection_reason)}">${esc(a.rejection_reason)}</div>`
+          : `<button class="btn btn-outline btn-sm" style="margin-top:6px" id="btn-ask-reason" onclick="askRejectionReason('${a.id}')">Ask for Reason</button>`) : ''}
+      </div>
     </div>
     <div class="divider"></div>
     <div class="grid-2">
@@ -300,9 +311,22 @@ function openApplicantReadOnly(a) {
     <p><strong>Comments</strong><br>${esc(a.comments||'')||'<span class="small-muted">None</span>'}</p>
     ${'card_amount' in a ? `<div class="divider"></div><p><strong>Card Amount</strong><br>${a.card_amount!=null?fmtMoney(a.card_amount):'Not yet set'}</p>` : ''}
     ${a.requiresShulContribution ? `<div class="divider"></div><p><strong>Amount Your Shul Gave This Family</strong><br>${a.shul_contribution_amount!=null?fmtMoney(a.shul_contribution_amount):'Not entered'}</p>` : ''}
-    <p class="small-muted">This applicant has been approved and is locked; contact your admin for changes.</p>
+    <p class="small-muted">${a.approval_status === 'rejected' ? 'This applicant was rejected; contact your admin for details.' : a._merged_readonly ? 'This applicant is shared with another shul and is locked; contact your admin for changes.' : 'This applicant has been approved and is locked; contact your admin for changes.'}</p>
   `, '');
 }
+window.askRejectionReason = async (id) => {
+  const btn = qs('#btn-ask-reason');
+  if (btn?.disabled) return;
+  if (btn) { btn.disabled = true; btn.textContent = 'Requesting…'; }
+  try {
+    await api(`/applicants/${id}/appeal`, { method: 'POST' });
+    if (btn) { btn.textContent = 'Reason Requested'; }
+    toast('Sent — the office will get back to you with a reason.');
+  } catch (err) {
+    toast(err.message, true);
+    if (btn) { btn.disabled = false; btn.textContent = 'Ask for Reason'; }
+  }
+};
 // Anything not yet approved (draft/pending/rejected) stays editable by the
 // shul — same schema-driven form the public application and re-enrollment
 // flows use, pre-filled with what's already on file. Saving doesn't require

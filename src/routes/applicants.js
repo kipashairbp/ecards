@@ -3,8 +3,8 @@ import multer from 'multer';
 import { db, uuid, DEFAULT_ORG_ID } from '../db.js';
 import { auth, requireAdmin } from '../middleware/auth.js';
 import { requirePermission, redact } from '../middleware/permissions.js';
-import { detectAndFlag, resolveFlag, getMergeGroupIds, mergeApplicants, applicantsSharePhone, reconcileAccountsForGroup, reconcileAllMergedAccounts, recheckAllApplicantDuplicates } from '../services/duplicates.js';
-import { sendMailChecked, renderSystemTemplate } from '../services/mail.js';
+import { detectAndFlag, resolveFlag, getMergeGroupIds, mergeApplicants, applicantsSharePhone, reconcileAccountsForGroup, reconcileAllMergedAccounts, recheckAllApplicantDuplicates, collapseAllMergedApplicantGroups } from '../services/duplicates.js';
+import { sendMailChecked, renderSystemTemplate, escapeHtml } from '../services/mail.js';
 import { sendSmsChecked } from '../services/sms.js';
 import * as giftcard from '../services/giftcard.js';
 import { parseSpreadsheet, buildXlsxTemplate, APPLICANT_IMPORT_COLUMNS } from '../services/importer.js';
@@ -266,7 +266,7 @@ function maskForShul(records, role, orgId) {
     return seasonReqCache.get(seasonId);
   };
   const mask = (r) => {
-    const rec = { ...r, approval_status: r.approval_status === 'rejected' ? 'pending' : r.approval_status, duplicate_status: null, duplicate_of_applicant_id: null, is_paused: 0 };
+    const rec = { ...r, duplicate_status: null, duplicate_of_applicant_id: null, is_paused: 0 };
     if (!cardVisible) delete rec.card_amount;
     // Internal-only, not a configurable hidden field — a shul should never
     // even know this column exists, same boundary as applicant_notes.
@@ -309,10 +309,50 @@ export function isZipAllowed(orgId, zip) {
 
 // Shul-portal users only ever see/act on their own shul's applicants; regardless
 // of any assignment rows, force shul_id = req.user.shul_id for that role.
+// A shul viewing an applicant merged into another shul's real record (see
+// applicant_submissions / services/duplicates.js's mergeApplicants) must
+// see exactly what IT submitted — never the surviving row's own values
+// (which might be a different shul's data entirely, per whatever the
+// admin's merge chose as the composite), and never any hint that this
+// person is enrolled anywhere else. Overlays each such row's identity/
+// contact/demographic fields with that shul's own submission snapshot in
+// place, and flags it _merged_readonly so the frontend never offers to
+// edit or remove it — there's no shul_id link on the real row for this
+// shul to act on. A no-op for any row this shul is the actual shul_id
+// owner of (the normal, non-merged case).
+const SUBMISSION_OVERLAY_FIELDS = ['first_name', 'last_name', 'marital_status', 'home_phone', 'husband_cell',
+  'wife_cell', 'email', 'address', 'city', 'state', 'zip', 'preferred_contact_method', 'preferred_number',
+  'num_children', 'home_for_yomtov', 'comments'];
+function applySubmissionOverlay(rows, shulId) {
+  const list = Array.isArray(rows) ? rows : [rows];
+  const needOverlay = list.filter(r => r && r.shul_id !== shulId);
+  if (!needOverlay.length) return;
+  const ids = needOverlay.map(r => r.id);
+  const placeholders = ids.map(() => '?').join(',');
+  const subs = db.prepare(`SELECT * FROM applicant_submissions WHERE shul_id = ? AND applicant_id IN (${placeholders})`).all(shulId, ...ids);
+  const byId = new Map(subs.map(s => [s.applicant_id, s]));
+  for (const r of needOverlay) {
+    const s = byId.get(r.id);
+    if (!s) continue;
+    for (const f of SUBMISSION_OVERLAY_FIELDS) r[f] = s[f];
+    r._merged_readonly = true;
+  }
+}
+
 function scopeWhere(req) {
   let where = 'WHERE a.org_id = ?';
   const params = [req.user.org_id];
-  if (req.user.role === 'shul') { where += ' AND a.shul_id = ?'; params.push(req.user.shul_id); }
+  // A shul sees its own applicants (a.shul_id) PLUS any applicant merged
+  // into another shul's real record where this shul is one of the
+  // contributing submissions (see applicant_submissions / mergeApplicants)
+  // — its own row was folded away, but it still needs to see the merged
+  // record (with its own submitted data overlaid on top — see
+  // applySubmissionOverlay below) rather than the applicant just vanishing
+  // from its list.
+  if (req.user.role === 'shul') {
+    where += ' AND (a.shul_id = ? OR a.id IN (SELECT applicant_id FROM applicant_submissions WHERE shul_id = ?))';
+    params.push(req.user.shul_id, req.user.shul_id);
+  }
   else if (req.permission.scope === 'assigned') {
     where += ` AND a.shul_id IN (SELECT entity_id FROM user_assignments WHERE user_id = ? AND entity_type = 'shul')`;
     params.push(req.user.id);
@@ -321,7 +361,7 @@ function scopeWhere(req) {
 }
 
 router.get('/', (req, res) => {
-  const { search, status, shul_id, season_id, home_for_yomtov, marital_status, paused, provider_sync, provider_check, sort = 'created_at', dir = 'DESC', page = 1, pageSize = 50 } = req.query;
+  const { search, status, shul_id, season_id, home_for_yomtov, marital_status, paused, provider_sync, provider_check, amount_min, amount_max, sort = 'created_at', dir = 'DESC', page = 1, pageSize = 50 } = req.query;
   let { where, params } = scopeWhere(req);
   if (status) { where += ' AND a.approval_status = ?'; params.push(status); }
   if (paused === '1' || paused === '0') { where += ' AND a.is_paused = ?'; params.push(+paused); }
@@ -329,6 +369,8 @@ router.get('/', (req, res) => {
   if (season_id) { where += ' AND a.season_id = ?'; params.push(season_id); }
   if (marital_status) { where += ' AND a.marital_status = ?'; params.push(marital_status); }
   if (home_for_yomtov !== undefined && home_for_yomtov !== '') { where += ' AND a.home_for_yomtov = ?'; params.push(home_for_yomtov === 'true' || home_for_yomtov === '1' ? 1 : 0); }
+  if (amount_min !== undefined && amount_min !== '') { where += ' AND a.card_amount >= ?'; params.push(+amount_min); }
+  if (amount_max !== undefined && amount_max !== '') { where += ' AND a.card_amount <= ?'; params.push(+amount_max); }
   // Only 'missing' is offered as a real filter — the actual, unexplained
   // gap between "approved" and "has a disccardpromos account" (see
   // providerSyncStatus above): approved, not deliberately exempt, and
@@ -356,13 +398,30 @@ router.get('/', (req, res) => {
   const offset = (Math.max(1, +page) - 1) * +pageSize;
   const rows = db.prepare(`SELECT a.*, s.name_en as shul_name, ps.name_en as previous_shul_name FROM applicants a LEFT JOIN shuls s ON s.id = a.shul_id LEFT JOIN shuls ps ON ps.id = a.previous_shul_id ${where} ORDER BY ${sortCol} ${sortDir} LIMIT ? OFFSET ?`).all(...params, +pageSize, offset);
   for (const r of rows) r.provider_sync = providerSyncStatus(r);
+  if (req.user.role === 'shul') applySubmissionOverlay(rows, req.user.shul_id);
+  // Every contributing shul for a merged record (see applicant_submissions)
+  // — admin-only, so the list can show "ShulA, ShulB, ShulC" instead of the
+  // one shul_name the surviving row happens to carry. Only rows with more
+  // than one contributor get anything here; a never-merged applicant's own
+  // shul_name column already covers it.
+  if (req.user.role !== 'shul' && rows.length) {
+    const ids = rows.map(r => r.id);
+    const placeholders = ids.map(() => '?').join(',');
+    const subs = db.prepare(`SELECT s.applicant_id, s.is_primary, sh.name_en FROM applicant_submissions s JOIN shuls sh ON sh.id = s.shul_id
+      WHERE s.applicant_id IN (${placeholders}) ORDER BY s.is_primary DESC, sh.name_en`).all(...ids);
+    if (subs.length) {
+      const byId = new Map();
+      for (const s of subs) { if (!byId.has(s.applicant_id)) byId.set(s.applicant_id, []); byId.get(s.applicant_id).push(s.name_en); }
+      for (const r of rows) { const names = byId.get(r.id); if (names && names.length > 1) r.contributing_shuls = names; }
+    }
+  }
   res.json({ applicants: maskForShul(redact(rows, req.permission.hidden_fields), req.user.role, req.user.org_id), total, page: +page, pageSize: +pageSize });
 });
 
 // Full-detail CSV export — every field, no pagination, respects the same
 // filters as the list view. Must be registered before /:id.
 router.get('/export', requirePermission('applicants', 'can_export'), (req, res) => {
-  const { search, status, shul_id, season_id, home_for_yomtov, marital_status, paused } = req.query;
+  const { search, status, shul_id, season_id, home_for_yomtov, marital_status, paused, amount_min, amount_max } = req.query;
   let { where, params } = scopeWhere(req);
   if (status) { where += ' AND a.approval_status = ?'; params.push(status); }
   if (paused === '1' || paused === '0') { where += ' AND a.is_paused = ?'; params.push(+paused); }
@@ -370,6 +429,8 @@ router.get('/export', requirePermission('applicants', 'can_export'), (req, res) 
   if (season_id) { where += ' AND a.season_id = ?'; params.push(season_id); }
   if (marital_status) { where += ' AND a.marital_status = ?'; params.push(marital_status); }
   if (home_for_yomtov !== undefined && home_for_yomtov !== '') { where += ' AND a.home_for_yomtov = ?'; params.push(home_for_yomtov === 'true' || home_for_yomtov === '1' ? 1 : 0); }
+  if (amount_min !== undefined && amount_min !== '') { where += ' AND a.card_amount >= ?'; params.push(+amount_min); }
+  if (amount_max !== undefined && amount_max !== '') { where += ' AND a.card_amount <= ?'; params.push(+amount_max); }
   if (search) {
     where += ` AND (a.first_name LIKE ? OR a.last_name LIKE ? OR a.email LIKE ? OR a.home_phone LIKE ? OR a.husband_cell LIKE ? OR a.wife_cell LIKE ? OR a.external_id LIKE ?
       OR a.address LIKE ? OR a.city LIKE ? OR a.state LIKE ? OR a.zip LIKE ? OR a.comments LIKE ? OR a.permanent_comments LIKE ?)`;
@@ -444,6 +505,20 @@ router.post('/reconcile-merged-accounts', requireAdmin, (req, res) => {
     conflictDetails: result.conflicts.map(c => `${c.secondaryName}: has its own account (${c.secondaryAccountId}) — primary ${c.primaryName} uses ${c.primaryAccountId}`),
   }, req.ip);
   res.json(result);
+});
+
+// One-time (safely re-runnable) migration: collapses every merge group that
+// predates applicant_submissions into a genuinely single applicants row —
+// see collapseAllMergedApplicantGroups. Each group collapsed gets its own
+// 'merge' audit_log row (same undo shape a fresh merge produces), so any
+// one of them can be undone independently from Recent Actions if something
+// looks wrong, without affecting the others.
+router.post('/collapse-merged-groups', requireAdmin, (req, res) => {
+  const collapsed = collapseAllMergedApplicantGroups(req.user.org_id);
+  for (const c of collapsed) {
+    logAudit(req.user.org_id, req.user.id, 'merge', 'applicant', c.primaryId, c.undoSnapshot, { primaryId: c.primaryId, memberIds: c.memberIds }, req.ip);
+  }
+  res.json({ groupsCollapsed: collapsed.length, primaryIds: collapsed.map(c => c.primaryId) });
 });
 
 // Re-attempts the disccardpromos deactivation for every applicant sitting in
@@ -975,35 +1050,63 @@ router.get('/my-export', (req, res) => {
   sendXlsx(res, `my-applicants-${Date.now()}.xlsx`, out, columns);
 });
 
+// Reusable rejection-reason text so an admin doesn't retype the same
+// explanation every time — mirrors sms_templates/email_templates exactly.
+// Must be registered before GET /:id below — a bare single-segment path
+// like this one would otherwise match that route's `:id` param first
+// (same reasoning as /export and /my-export above).
+router.get('/rejection-reason-templates', requireAdmin, (req, res) => {
+  res.json({ templates: db.prepare('SELECT * FROM rejection_reason_templates WHERE org_id = ? ORDER BY name').all(req.user.org_id) });
+});
+router.post('/rejection-reason-templates', requireAdmin, (req, res) => {
+  const { name, body } = req.body || {};
+  if (!name || !body) return res.status(400).json({ error: 'name and body are required' });
+  const id = uuid();
+  db.prepare(`INSERT INTO rejection_reason_templates (id, org_id, name, body, created_by) VALUES (?,?,?,?,?)`).run(id, req.user.org_id, name, body, req.user.id);
+  res.status(201).json({ template: db.prepare('SELECT * FROM rejection_reason_templates WHERE id = ?').get(id) });
+});
+router.delete('/rejection-reason-templates/:id', requireAdmin, (req, res) => {
+  const tmpl = db.prepare('SELECT * FROM rejection_reason_templates WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
+  if (!tmpl) return res.status(404).json({ error: 'Not found' });
+  db.prepare('DELETE FROM rejection_reason_templates WHERE id = ?').run(tmpl.id);
+  res.json({ ok: true });
+});
+
 router.get('/:id', (req, res) => {
   const applicant = db.prepare(`SELECT a.*, s.name_en as shul_name, ps.name_en as previous_shul_name FROM applicants a
       LEFT JOIN shuls s ON s.id=a.shul_id
       LEFT JOIN shuls ps ON ps.id=a.previous_shul_id
       WHERE a.id = ? AND a.org_id = ?`).get(req.params.id, req.user.org_id);
   if (!applicant) return res.status(404).json({ error: 'Not found' });
-  if (req.user.role === 'shul' && applicant.shul_id !== req.user.shul_id) return res.status(403).json({ error: 'Not your applicant' });
+  let ownSubmission = null;
+  if (req.user.role === 'shul' && applicant.shul_id !== req.user.shul_id) {
+    // Not the real shul_id owner — only reachable at all if this shul is
+    // one of the contributing submissions on a merged record (see
+    // applicant_submissions). Anyone else still gets the original 403.
+    ownSubmission = db.prepare('SELECT * FROM applicant_submissions WHERE applicant_id = ? AND shul_id = ?').get(applicant.id, req.user.shul_id);
+    if (!ownSubmission) return res.status(403).json({ error: 'Not your applicant' });
+  }
   // Internal admin notes and duplicate flags may reference rejection/duplicate
   // reasons directly, so a shul-portal viewer gets neither, on top of the
   // approval_status/duplicate_status masking below.
   const notes = req.user.role === 'shul' ? [] : db.prepare('SELECT n.*, u.first_name, u.last_name FROM applicant_notes n LEFT JOIN users u ON u.id=n.user_id WHERE applicant_id = ? ORDER BY n.created_at DESC').all(applicant.id);
   const cards = db.prepare('SELECT * FROM cards WHERE applicant_id = ? ORDER BY created_at DESC').all(applicant.id);
   const flags = req.user.role === 'shul' ? [] : db.prepare(`SELECT * FROM duplicate_flags WHERE entity_type='applicant' AND (entity_id=? OR matched_entity_id=?) AND status='open'`).all(applicant.id, applicant.id);
-  // Every other record that's this same real person — confirmed (already
-  // merged, see services/duplicates.js's mergeApplicants) OR still just an
-  // open, unresolved duplicate flag; getMergeGroupIds chains through both,
-  // so this covers a match the instant it's flagged, not only after an
-  // admin explicitly resolves it. approval_status is included so an admin
-  // can see at a glance which of these are live enrollments vs.
-  // soft-rejected/rejected history. Admin-only, per spec: a shul must never
-  // learn its applicant is enrolled (or was ever) anywhere else.
+  // Every shul that contributed a submission to this real record (see
+  // applicant_submissions / services/duplicates.js's mergeApplicants) —
+  // replaces the old merge_group_id chain, which stopped finding anything
+  // once a merge started hard-deleting the losing rows instead of just
+  // tagging them. Admin-only, per spec: a shul must never learn its
+  // applicant is enrolled (or was ever) anywhere else.
   let mergeGroup = [];
   if (req.user.role !== 'shul') {
-    const groupIds = getMergeGroupIds(req.user.org_id, [applicant.id]).filter(gid => gid !== applicant.id);
-    if (groupIds.length) {
-      mergeGroup = db.prepare(`SELECT a.id, a.first_name, a.last_name, a.approval_status, s.name_en as shul_name, ps.name_en as previous_shul_name FROM applicants a
-          LEFT JOIN shuls s ON s.id = a.shul_id LEFT JOIN shuls ps ON ps.id = a.previous_shul_id
-          WHERE a.id IN (${groupIds.map(() => '?').join(',')})`).all(...groupIds);
-    }
+    mergeGroup = db.prepare(`SELECT s.shul_id AS id, s.first_name, s.last_name, s.approval_status AS own_approval_status, sh.name_en AS shul_name, s.is_primary
+        FROM applicant_submissions s JOIN shuls sh ON sh.id = s.shul_id
+        WHERE s.applicant_id = ? ORDER BY s.is_primary DESC, sh.name_en`).all(applicant.id);
+  }
+  if (ownSubmission) {
+    for (const f of SUBMISSION_OVERLAY_FIELDS) applicant[f] = ownSubmission[f];
+    applicant._merged_readonly = true;
   }
   const requiresShulContribution = !!db.prepare('SELECT require_shul_contribution FROM seasons WHERE id = ?').get(applicant.season_id)?.require_shul_contribution;
   res.json({ applicant: maskForShul(redact(applicant, req.permission.hidden_fields), req.user.role, req.user.org_id), notes, cards, flags, mergeGroup, requiresShulContribution });
@@ -2093,6 +2196,102 @@ router.post('/duplicates/:flagId/merge', requirePermission('applicants', 'can_ed
     logAudit(req.user.org_id, req.user.id, 'merge', 'applicant', primaryId, undoSnapshot, after, req.ip);
     res.json(result);
   } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ============================= Rejection Appeals =============================
+// A shul asking "why was this rejected" — one click, no form (see
+// applicant_rejection_appeals). Available to whichever shul actually
+// submitted it, including a merged applicant's non-owning contributor (see
+// applicant_submissions) — same access rule as GET /:id above.
+router.post('/:id/appeal', (req, res) => {
+  if (req.user.role !== 'shul') return res.status(403).json({ error: 'Not permitted' });
+  const applicant = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
+  if (!applicant) return res.status(404).json({ error: 'Not found' });
+  const isOwner = applicant.shul_id === req.user.shul_id;
+  const hasSubmission = isOwner || db.prepare('SELECT 1 FROM applicant_submissions WHERE applicant_id = ? AND shul_id = ?').get(applicant.id, req.user.shul_id);
+  if (!hasSubmission) return res.status(403).json({ error: 'Not your applicant' });
+  if (applicant.approval_status !== 'rejected') return res.status(400).json({ error: 'This applicant is not currently rejected' });
+  // Idempotent — clicking twice (or a stray double-click, same reasoning as
+  // the double-click guard on the mass Email/SMS buttons) just returns the
+  // existing open appeal rather than creating a second one.
+  const existing = db.prepare(`SELECT * FROM applicant_rejection_appeals WHERE applicant_id = ? AND shul_id = ? AND status = 'open'`).get(applicant.id, req.user.shul_id);
+  if (existing) return res.json({ appeal: existing });
+  const id = uuid();
+  db.prepare(`INSERT INTO applicant_rejection_appeals (id, org_id, applicant_id, shul_id) VALUES (?,?,?,?)`).run(id, req.user.org_id, applicant.id, req.user.shul_id);
+  res.status(201).json({ appeal: db.prepare('SELECT * FROM applicant_rejection_appeals WHERE id = ?').get(id) });
+});
+
+// Open appeals, admin-only — backs the Appeals button's tally badge and its
+// list modal on the Applicants page (same pattern as GET /duplicates/open).
+router.get('/appeals/open', requireAdmin, (req, res) => {
+  const rows = db.prepare(`SELECT ap.*, a.first_name, a.last_name, a.external_id, sh.name_en AS shul_name
+    FROM applicant_rejection_appeals ap
+    JOIN applicants a ON a.id = ap.applicant_id
+    JOIN shuls sh ON sh.id = ap.shul_id
+    WHERE ap.org_id = ? AND ap.status = 'open' ORDER BY ap.created_at`).all(req.user.org_id);
+  res.json({ appeals: rows });
+});
+
+// Only the fields a shul's own read-only view already shows it (see
+// openApplicantReadOnly in shul-portal/dashboard.html) — an explicit
+// allowlist, not the raw applicant row, since that also carries
+// admin-internal columns (permanent_comments, provider_account_id,
+// min_contribution_override, ...) a shul must never see.
+const APPEAL_NOTICE_FIELDS = [
+  ['external_id', 'Applicant ID'], ['first_name', 'First Name'], ['last_name', 'Last Name'],
+  ['marital_status', 'Marital Status'], ['num_children', 'Children'], ['home_phone', 'Home Phone'],
+  ['husband_cell', 'Husband Cell'], ['wife_cell', 'Wife Cell'], ['email', 'Email'],
+  ['address', 'Address'], ['city', 'City'], ['state', 'State'], ['zip', 'Zip'],
+  ['home_for_yomtov', 'Home for Yom Tov'], ['comments', 'Comments'],
+];
+// Admin answers an appeal — saves the reason (also onto the applicant row
+// itself, so it shows without a join wherever the status badge does), marks
+// the appeal answered, and sends the shul an Update (same tables
+// routes/updates.js's own compose-and-send writes to) with the full
+// applicant info plus the reason.
+router.post('/appeals/:appealId/respond', requireAdmin, async (req, res) => {
+  const appeal = db.prepare('SELECT * FROM applicant_rejection_appeals WHERE id = ? AND org_id = ?').get(req.params.appealId, req.user.org_id);
+  if (!appeal) return res.status(404).json({ error: 'Not found' });
+  const { reason } = req.body || {};
+  if (!reason || !reason.trim()) return res.status(400).json({ error: 'A reason is required' });
+  const trimmedReason = reason.trim();
+  const applicant = db.prepare('SELECT * FROM applicants WHERE id = ?').get(appeal.applicant_id);
+  if (!applicant) return res.status(404).json({ error: 'Applicant no longer exists' });
+  const shul = db.prepare('SELECT * FROM shuls WHERE id = ?').get(appeal.shul_id);
+
+  db.prepare(`UPDATE applicant_rejection_appeals SET status='answered', reason=?, responded_by=?, responded_at=datetime('now') WHERE id=?`).run(trimmedReason, req.user.id, appeal.id);
+  db.prepare(`UPDATE applicants SET rejection_reason=? WHERE id=?`).run(trimmedReason, applicant.id);
+
+  // If this appeal came from a merged non-owning contributor (see
+  // applicant_submissions), show THEIR own submitted copy in the notice —
+  // never the surviving row's own (possibly different-shul's) data.
+  let info = applicant;
+  if (appeal.shul_id !== applicant.shul_id) {
+    const ownSubmission = db.prepare('SELECT * FROM applicant_submissions WHERE applicant_id = ? AND shul_id = ?').get(applicant.id, appeal.shul_id);
+    if (ownSubmission) info = { ...applicant, ...Object.fromEntries(SUBMISSION_OVERLAY_FIELDS.map(f => [f, ownSubmission[f]])) };
+  }
+  const detailRows = APPEAL_NOTICE_FIELDS
+    .filter(([k]) => info[k] !== null && info[k] !== undefined && info[k] !== '')
+    .map(([k, label]) => `<tr><td style="padding:3px 12px 3px 0;color:#6b6b6b;white-space:nowrap">${escapeHtml(label)}</td><td style="padding:3px 0">${escapeHtml(k === 'home_for_yomtov' ? (info[k] ? 'Yes' : 'No') : info[k])}</td></tr>`)
+    .join('');
+  const title = `Rejection reason: ${info.first_name} ${info.last_name}`.trim();
+  const bodyHtml = `
+    <p>Here is the reason your applicant was rejected, along with their full submitted information:</p>
+    <p><strong>Reason:</strong><br>${escapeHtml(trimmedReason).replace(/\n/g, '<br>')}</p>
+    ${detailRows ? `<table style="border-collapse:collapse;margin-top:10px">${detailRows}</table>` : ''}
+  `;
+  const updateId = uuid();
+  db.prepare(`INSERT INTO updates (id, org_id, title, body, created_by) VALUES (?,?,?,?,?)`).run(updateId, req.user.org_id, title, bodyHtml, req.user.id);
+  let emailStatus = 'sent', emailError = null;
+  if (shul?.gabai_email) {
+    const result = await sendMailChecked(req.user.org_id, shul.gabai_email, title, bodyHtml, { relatedEntityType: 'shul', relatedEntityId: shul.id, sentBy: req.user.id });
+    if (result.emailError) { emailStatus = 'failed'; emailError = result.emailError; }
+  } else { emailStatus = 'failed'; emailError = 'No email on file'; }
+  db.prepare(`INSERT INTO update_recipients (id, update_id, entity_type, entity_id, email_status, email_error) VALUES (?,?,?,?,?,?)`)
+    .run(uuid(), updateId, 'shul', appeal.shul_id, emailStatus, emailError);
+
+  logAudit(req.user.org_id, req.user.id, 'respond-appeal', 'applicant', applicant.id, { rejection_reason: null }, { rejection_reason: trimmedReason }, req.ip);
+  res.json({ ok: true, emailError });
 });
 
 export default router;
