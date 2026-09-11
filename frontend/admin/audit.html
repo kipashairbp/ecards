@@ -362,6 +362,19 @@ function massDetail(a) {
     const shown = names.slice(0, 15).join(', ');
     html += `<div class="small-muted" style="margin-top:4px">${esc(shown)}${names.length > 15 ? esc(`, +${names.length - 15} more`) : ''}</div>`;
   }
+  // This undo reversed an OLDER mass-approve from before per-record undo
+  // data existed — see undoMassApproveEntry in services/audit.js. Each
+  // record's prior state was reconstructed from its own history rather than
+  // refused outright; say so plainly, and call out how many came back to a
+  // schema default rather than a real recorded value, so an admin knows
+  // which ones are worth double-checking by hand.
+  if (after.reconstructed) {
+    const bits2 = [];
+    if (after.exactCount) bits2.push(`${after.exactCount} matched a value from their own history`);
+    if (after.derivedCount) bits2.push(`${after.derivedCount} derived from contract records`);
+    if (after.defaultedCount) bits2.push(`${after.defaultedCount} had no history at all, so restored to the default pre-approval state — worth double-checking`);
+    html += `<div class="small-muted" style="margin-top:6px;color:#c9a76a">This reverses an older mass approval logged before exact per-record undo data existed — reconstructed as best as possible: ${bits2.join('; ')}.</div>`;
+  }
   return html;
 }
 

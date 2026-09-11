@@ -151,16 +151,17 @@ export function getRecentActions(orgId, hours = 48) {
     // generic fallback for "put every touched row back" the way there is
     // for a plain single-entity update.
     const hasRestorableSnapshot = !!(before && before.kind && CASCADE_RESTORERS[before.kind]);
-    // A mass-approve row is only undoable when it carries the per-record
-    // updatedDiffs snapshot (see routes/{applicants,shuls,stores}.js's
-    // mass-approve + undoMassApproveEntry above) — a row logged before that
-    // snapshot existed has no recorded prior state to restore, so it never
-    // gets an Undo button rather than one that would just error out.
-    const hasMassApproveDiffs = r.action === 'mass-approve' && !!(after && after.updatedDiffs && after.updatedDiffs.length);
+    // A mass-approve row is undoable whenever it has a record of which ids
+    // it touched — either the exact per-record updatedDiffs snapshot (see
+    // routes/{applicants,shuls,stores}.js's mass-approve), or, for an older
+    // row logged before that snapshot existed, just the plain ids list —
+    // undoMassApproveEntry above reconstructs each one's prior state from
+    // its own history rather than needing the snapshot to exist up front.
+    const hasMassApproveTarget = r.action === 'mass-approve' && !!(after && ((after.updatedDiffs && after.updatedDiffs.length) || (after.ids && after.ids.length)));
     const undoable = SNAPSHOT_ONLY_ACTIONS.has(r.action)
       ? hasRestorableSnapshot && !r.undone_at
       : r.action === 'mass-approve'
-        ? hasMassApproveDiffs && !r.undone_at
+        ? hasMassApproveTarget && !r.undone_at
         : (UNDOABLE_ACTIONS.includes(r.action) || r.action === 'mass-import' || r.action === 'mass-delete') && !!ENTITY_TABLES[r.entity_type] && !r.undone_at && !!(r.before_json || r.after_json);
     return {
       ...r, before, after, undoable,
@@ -289,32 +290,104 @@ function undoMassImportEntry(entry, actingUser, ip) {
   return logMassAudit(entry.org_id, actingUser.id, 'mass-import-undo', entry.entity_type, touchedIds.length ? touchedIds : [entry.id], summary, ip);
 }
 
-// Reverses a mass-approve: every record it approved gets the exact columns
-// it overwrote (approval_status/card_amount for applicants, status/
-// slots_allocated/portal_user_id for shuls, setup_status for stores)
-// restored from the per-row before-snapshot captured at approval time (see
-// routes/{applicants,shuls,stores}.js's mass-approve — same updatedDiffs
-// shape as mass-import's). Side effects the approval triggered (disccardpromos
-// account/funds, the "you're approved" email) are never reversed here —
-// exactly like undoing a single /:id/approve already doesn't reverse those
-// either; this only ever puts the local record state back.
+// Best-effort reconstruction of a single record's pre-approval state for a
+// LEGACY mass-approve row (one logged before per-record snapshots existed —
+// see reconstructLegacyBefore below). Walks that record's own audit_log
+// history for the last time the relevant column was explicitly recorded
+// (a reject, set-pending, or the row's own 'create' — every one of those
+// already logs the real value), which is real recorded history, not a
+// guess. Returns { state, tier } — tier is 'exact' when a real prior value
+// was found this way, 'default' when nothing was ever recorded and the
+// record's schema default is used instead (a new applicant/store really
+// does always start out 'pending', so this is usually still correct — it's
+// only ever wrong for the rarer case of a re-approval).
+function reconstructApplicantBefore(id, beforeTs) {
+  // <= not < : audit_log.created_at has only 1-second resolution
+  // (SQLite datetime('now')), so a record created in the same mass-approve
+  // click's second as its own 'create' row would otherwise be excluded by
+  // a strict "before" comparison even though it's the real prior state.
+  const rows = db.prepare(`SELECT after_json FROM audit_log WHERE entity_type = 'applicant' AND entity_id = ? AND created_at <= ? ORDER BY created_at DESC`).all(id, beforeTs);
+  for (const r of rows) {
+    if (!r.after_json) continue;
+    let after; try { after = JSON.parse(r.after_json); } catch { continue; }
+    if (after && Object.prototype.hasOwnProperty.call(after, 'approval_status')) {
+      return { state: { approval_status: after.approval_status, card_amount: Object.prototype.hasOwnProperty.call(after, 'card_amount') ? after.card_amount : null }, tier: 'exact' };
+    }
+  }
+  return { state: { approval_status: 'pending', card_amount: null }, tier: 'default' };
+}
+function reconstructStoreBefore(id, beforeTs) {
+  const rows = db.prepare(`SELECT after_json FROM audit_log WHERE entity_type = 'store' AND entity_id = ? AND created_at <= ? ORDER BY created_at DESC`).all(id, beforeTs);
+  for (const r of rows) {
+    if (!r.after_json) continue;
+    let after; try { after = JSON.parse(r.after_json); } catch { continue; }
+    if (after && Object.prototype.hasOwnProperty.call(after, 'setup_status')) return { state: { setup_status: after.setup_status }, tier: 'exact' };
+  }
+  return { state: { setup_status: 'pending' }, tier: 'default' };
+}
+// Shuls are the one case where the audit trail alone can lie: sending or
+// signing a contract writes shuls.status directly (routes/shuls.js) without
+// ever calling logAudit, so a shul that went submitted -> contract_sent ->
+// contract_signed -> approved would otherwise look, from audit_log alone,
+// like it was still 'submitted' right before approval (only its 'create'
+// row ever mentions status). The contracts table doesn't have that gap —
+// sent_at/signed_at are real columns set at the time — so this compares
+// whichever source (an explicit status-changing audit entry, or the
+// contract's own sent_at/signed_at) is chronologically LATEST before the
+// approval and trusts that one, rather than always preferring one source.
+function reconstructShulBefore(id, beforeTs) {
+  let best = null; // { at, status, tier }
+  // <= throughout this function: audit_log/contracts timestamps only have
+  // 1-second resolution, so a same-second transition (e.g. contract signed
+  // and shul mass-approved within the same click-driven second) would
+  // otherwise be wrongly excluded by a strict "before" comparison.
+  const rows = db.prepare(`SELECT created_at, after_json FROM audit_log WHERE entity_type = 'shul' AND entity_id = ? AND action != 'create' AND created_at <= ? ORDER BY created_at DESC`).all(id, beforeTs);
+  for (const r of rows) {
+    if (!r.after_json) continue;
+    let after; try { after = JSON.parse(r.after_json); } catch { continue; }
+    if (after && Object.prototype.hasOwnProperty.call(after, 'status')) { best = { at: r.created_at, status: after.status, tier: 'exact' }; break; }
+  }
+  const contract = db.prepare(`SELECT signed_at, sent_at FROM contracts WHERE shul_id = ? ORDER BY created_at DESC LIMIT 1`).get(id);
+  if (contract?.signed_at && contract.signed_at <= beforeTs && (!best || contract.signed_at >= best.at)) best = { at: contract.signed_at, status: 'contract_signed', tier: 'derived' };
+  else if (contract?.sent_at && contract.sent_at <= beforeTs && (!best || contract.sent_at >= best.at)) best = { at: contract.sent_at, status: 'contract_sent', tier: 'derived' };
+  if (best) return { state: { status: best.status, slots_allocated: 0, portal_user_id: null }, tier: best.tier };
+  return { state: { status: 'submitted', slots_allocated: 0, portal_user_id: null }, tier: 'default' };
+}
+const LEGACY_MASS_APPROVE_RECONSTRUCTORS = { applicant: reconstructApplicantBefore, shul: reconstructShulBefore, store: reconstructStoreBefore };
+
+// Reverses a mass-approve: every record it approved gets the columns it
+// overwrote (approval_status/card_amount for applicants, status/
+// slots_allocated/portal_user_id for shuls, setup_status for stores) put
+// back. Side effects the approval triggered (disccardpromos account/funds,
+// the "you're approved" email) are never reversed here — exactly like
+// undoing a single /:id/approve already doesn't reverse those either; this
+// only ever puts the local record state back.
 //
-// Rows logged before this snapshot existed carry no updatedDiffs at all, so
-// there's no way to know what each record's approval_status/slots/etc. was
-// before this action touched it (mass-approve doesn't require the prior
-// state to be "pending" — it can legitimately re-approve an already-approved
-// or even a previously-rejected record with a new amount). Refuses rather
-// than guessing, same as the merge/resolve_duplicate legacy-row refusal
-// above.
+// A row logged after routes/{applicants,shuls,stores}.js's mass-approve
+// started capturing a real per-record before-snapshot (updatedDiffs) uses
+// that directly — exact, no guessing. An older row without one is
+// reconstructed per record via reconstructLegacyBefore above instead of
+// being refused outright; the mass-approve-undo summary this logs records
+// how many ids were exact vs. reconstructed from a default, so Recent
+// Actions can show that honestly rather than silently presenting a guess
+// as a certainty.
 function undoMassApproveEntry(entry, actingUser, ip) {
   const def = ENTITY_TABLES[entry.entity_type];
   if (!def) throw new Error(`"${entry.entity_type}" records can't be undone`);
   const after = entry.after_json ? JSON.parse(entry.after_json) : {};
-  const updatedDiffs = after.updatedDiffs || [];
-  if (!updatedDiffs.length) throw new Error('This mass approval was logged before per-record undo data was captured, so the exact prior state per record was never recorded — it can\'t be undone.');
+  let updatedDiffs = after.updatedDiffs || [];
+  let reconstructed = false;
+  if (!updatedDiffs.length) {
+    const ids = after.ids || [];
+    const reconstructor = LEGACY_MASS_APPROVE_RECONSTRUCTORS[entry.entity_type];
+    if (!ids.length || !reconstructor) throw new Error('This mass approval was logged before any per-record data was captured — there\'s nothing to reconstruct from.');
+    updatedDiffs = ids.map(id => { const { state, tier } = reconstructor(id, entry.created_at); return { id, before: state, tier }; });
+    reconstructed = true;
+  }
   let restored = 0;
+  const tierCounts = { exact: 0, derived: 0, default: 0 };
   const run = db.transaction(() => {
-    for (const { id, before } of updatedDiffs) {
+    for (const { id, before, tier } of updatedDiffs) {
       if (!before || !Object.keys(before).length) continue;
       const exists = db.prepare(`SELECT 1 FROM ${def.table} WHERE ${def.pk} = ? AND org_id = ?`).get(id, entry.org_id);
       if (!exists) continue;
@@ -322,12 +395,14 @@ function undoMassApproveEntry(entry, actingUser, ip) {
       db.prepare(`UPDATE ${def.table} SET ${keys.map(k => `${k} = ?`).join(', ')} WHERE ${def.pk} = ?`)
         .run(...keys.map(k => before[k]), id);
       restored++;
+      if (tier) tierCounts[tier] = (tierCounts[tier] || 0) + 1;
     }
   });
   run();
   db.prepare(`UPDATE audit_log SET undone_at = datetime('now') WHERE id = ?`).run(entry.id);
   const touchedIds = updatedDiffs.map(d => d.id);
-  return logMassAudit(entry.org_id, actingUser.id, 'mass-approve-undo', entry.entity_type, touchedIds.length ? touchedIds : [entry.id], { restored }, ip);
+  const summary = { restored, ...(reconstructed ? { reconstructed: true, exactCount: tierCounts.exact, derivedCount: tierCounts.derived, defaultedCount: tierCounts.default } : {}) };
+  return logMassAudit(entry.org_id, actingUser.id, 'mass-approve-undo', entry.entity_type, touchedIds.length ? touchedIds : [entry.id], summary, ip);
 }
 
 // Reverses a mass-delete: every record it hard-deleted gets fully restored
