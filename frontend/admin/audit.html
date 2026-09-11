@@ -81,6 +81,8 @@ renderShell('/admin/audit', `
         <option value="24">Last 24 hours</option>
         <option value="48" selected>Last 48 hours</option>
         <option value="168">Last 7 days</option>
+        <option value="720">Last 30 days</option>
+        <option value="">All time</option>
       </select>
       <select id="f-sort">
         <option value="desc" selected>Newest first</option>
@@ -150,7 +152,7 @@ const ACTION_VERBS = { create: 'Created', update: 'Updated', delete: 'Deleted', 
 // and the record ids/names/counts live in after_json instead of a normal
 // before/after diff. Rendered with their own headline/detail below rather
 // than forced through headline()/changeList(), which assume a single entity.
-const MASS_VERBS = { 'mass-approve': 'Approved', 'mass-reject': 'Rejected', 'mass-set-pending': 'Set to pending', 'mass-delete': 'Deleted', 'mass-delete-undo': 'Restored', 'mass-import': 'Imported', 'mass-set-status': 'Updated status for', 'mass-deactivate': 'Deactivated', 'mass-activate': 'Activated', 'mass-reconcile-accounts': 'Linked', 'mass-retry-deactivation': 'Deactivated on disccardpromos', 'mass-provider-audit': 'Verified against disccardpromos', 'mass-clear-phantom-accounts': 'Cleared phantom disccardpromos ids on', 'mass-retry-provider-sync': 'Re-synced to disccardpromos' };
+const MASS_VERBS = { 'mass-approve': 'Approved', 'mass-approve-undo': 'Restored', 'mass-reject': 'Rejected', 'mass-set-pending': 'Set to pending', 'mass-delete': 'Deleted', 'mass-delete-undo': 'Restored', 'mass-import': 'Imported', 'mass-set-status': 'Updated status for', 'mass-deactivate': 'Deactivated', 'mass-activate': 'Activated', 'mass-reconcile-accounts': 'Linked', 'mass-retry-deactivation': 'Deactivated on disccardpromos', 'mass-provider-audit': 'Verified against disccardpromos', 'mass-clear-phantom-accounts': 'Cleared phantom disccardpromos ids on', 'mass-retry-provider-sync': 'Re-synced to disccardpromos' };
 const FIELD_LABELS = {
   approval_status: 'Status', card_amount: 'Card Amount', is_active: 'Active', first_name: 'First Name', last_name: 'Last Name',
   name_en: 'Name', name: 'Name', role: 'Role', phone: 'Phone', slots_allocated: 'Slots', email: 'Email', home_phone: 'Home Phone',

@@ -219,7 +219,9 @@ async function openStore(id) {
       qsa('#stabs button').forEach(x => x.classList.remove('active')); b.classList.add('active');
       ['info','billing','documents','history'].forEach(t => qs('#stab-'+t).style.display = t === b.dataset.t ? 'block' : 'none');
     }));
-    loadDocumentsTab('store', id, 'stab-documents-list', s.owner_email || s.manager_email || '');
+    loadDocumentsTab('store', id, 'stab-documents-list', s.owner_email || s.manager_email || '', [
+      { label: 'Owner', email: s.owner_email }, { label: 'Manager', email: s.manager_email },
+    ]);
     loadHistoryTab('store', id, 'stab-history-list');
     loadGoogleMaps().then(() => { attachPlacesAutocomplete('e-address', { address: 'e-address', city: 'e-city', state: 'e-state', zip: 'e-zip' }); });
   } catch (err) { toast(err.message, true); }

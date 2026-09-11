@@ -458,7 +458,7 @@ router.post('/mass-approve', requirePermission('stores', 'can_edit'), async (req
   const { ids, bypass_contract } = req.body || {};
   if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids array required' });
   let approved = 0, skipped = 0, emailErrors = 0;
-  const affectedIds = [], names = [];
+  const affectedIds = [], names = [], updatedDiffs = [];
   for (const id of ids) {
     const store = db.prepare('SELECT * FROM stores WHERE id = ? AND org_id = ?').get(id, req.user.org_id);
     if (!store) { skipped++; continue; }
@@ -468,9 +468,13 @@ router.post('/mass-approve', requirePermission('stores', 'can_edit'), async (req
     if (result.emailError) emailErrors++;
     db.prepare(`UPDATE stores SET setup_status = 'active' WHERE id = ?`).run(store.id);
     affectedIds.push(store.id); names.push(store.name);
+    // Per-record prior state — the same column the single /:id/approve
+    // route's own before-snapshot captures — so this whole batch can be
+    // undone from Recent Actions (see undoMassApproveEntry in services/audit.js).
+    updatedDiffs.push({ id: store.id, before: { setup_status: store.setup_status } });
     approved++;
   }
-  logMassAudit(req.user.org_id, req.user.id, 'mass-approve', 'store', affectedIds, { skipped, emailErrors, names }, req.ip);
+  logMassAudit(req.user.org_id, req.user.id, 'mass-approve', 'store', affectedIds, { skipped, emailErrors, names, updatedDiffs }, req.ip);
   res.json({ approved, skipped, emailErrors });
 });
 

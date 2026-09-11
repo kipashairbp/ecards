@@ -178,8 +178,15 @@ router.post('/:id/send', auth, requirePermission('documents', 'can_edit'), async
   const isStandalone = document.entity_type === 'standalone';
   const entity = isStandalone ? null : resolveEntity(document.entity_type, document.entity_id, req.user.org_id);
   if (!isStandalone && !entity) return res.status(404).json({ error: 'Linked record no longer exists' });
-  const to = req.body?.email || (isStandalone ? document.recipient_email : entity.contactEmail);
-  if (!to) return res.status(400).json({ error: 'No email on file for this record' });
+  const toRaw = req.body?.email || (isStandalone ? document.recipient_email : entity.contactEmail);
+  if (!toRaw) return res.status(400).json({ error: 'No email on file for this record' });
+  // Comma-separated multiple recipients — same convention as notifyNewSignup
+  // and the Email/SMS Center's mass-send (services/mail.js, routes/emails.js)
+  // — everyone listed gets their own separately-logged send of the exact
+  // same signing link, so a store can loop in more than just its default
+  // contact (e.g. the owner AND the manager) on one click.
+  const recipients = [...new Set(String(toRaw).split(',').map(s => s.trim()).filter(Boolean))];
+  if (!recipients.length) return res.status(400).json({ error: 'No email on file for this record' });
 
   const token = uuid();
   const expires = new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString();
@@ -190,8 +197,12 @@ router.post('/:id/send', auth, requirePermission('documents', 'can_edit'), async
   const { subject, body, replyTo } = renderSystemTemplate(req.user.org_id, 'documentReady', {
     docTitle: document.title || 'Document', entityName: isStandalone ? document.recipient_name : entity.displayName, signUrl,
   });
-  const { emailError } = await sendMailChecked(req.user.org_id, to, subject, body, { replyTo, sentBy: req.user.id });
-  if (emailError) console.error('[mail] document send failed:', emailError);
+  const emailErrors = [];
+  for (const to of recipients) {
+    const { emailError } = await sendMailChecked(req.user.org_id, to, subject, body, { replyTo, sentBy: req.user.id });
+    if (emailError) { console.error(`[mail] document send to ${to} failed:`, emailError); emailErrors.push(`${to}: ${emailError}`); }
+  }
+  const emailError = emailErrors.length ? emailErrors.join('; ') : null;
 
   res.json({ document: db.prepare('SELECT * FROM documents WHERE id = ?').get(document.id), emailError });
 });

@@ -793,7 +793,7 @@ router.post('/mass-approve', requirePermission('shuls', 'can_edit'), async (req,
   const { ids, slots_allocated, bypass_contract } = req.body || {};
   if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids array required' });
   if (slots_allocated === undefined || slots_allocated === null) return res.status(400).json({ error: 'slots_allocated is required to approve' });
-  let approved = 0, skipped = 0, emailErrors = 0; const affectedIds = [], names = [];
+  let approved = 0, skipped = 0, emailErrors = 0; const affectedIds = [], names = [], updatedDiffs = [];
   for (const id of ids) {
     const shul = db.prepare('SELECT * FROM shuls WHERE id = ? AND org_id = ?').get(id, req.user.org_id);
     if (!shul || shul.is_paused) { skipped++; continue; }
@@ -807,9 +807,15 @@ router.post('/mass-approve', requirePermission('shuls', 'can_edit'), async (req,
     const { emailError } = await sendMailChecked(req.user.org_id, user.email, tmpl.subject, tmpl.body, { replyTo: tmpl.replyTo, sentBy: req.user.id });
     if (emailError) { emailErrors++; console.error('[mail] mass-approve shul email failed:', emailError); }
     affectedIds.push(shul.id); names.push(shul.name_en);
+    // Per-record prior state — the same three columns this route overwrites
+    // — so this whole batch can be undone from Recent Actions (see
+    // undoMassApproveEntry in services/audit.js). portal_user_id going back
+    // to null (the common case) doesn't delete the login ensureShulPortalUser
+    // just created — same as undoing a single /:id/approve already leaves it.
+    updatedDiffs.push({ id: shul.id, before: { status: shul.status, slots_allocated: shul.slots_allocated, portal_user_id: shul.portal_user_id } });
     approved++;
   }
-  logMassAudit(req.user.org_id, req.user.id, 'mass-approve', 'shul', affectedIds, { skipped, emailErrors, slots_allocated, names }, req.ip);
+  logMassAudit(req.user.org_id, req.user.id, 'mass-approve', 'shul', affectedIds, { skipped, emailErrors, slots_allocated, names, updatedDiffs }, req.ip);
   res.json({ approved, skipped, emailErrors });
 });
 

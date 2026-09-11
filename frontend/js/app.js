@@ -958,10 +958,20 @@ function loadPdfJs() {
 
 // Generic per-entity Documents tab (applicants & stores) — list existing
 // documents, generate new ones, and send a signing link either to the
-// record's own email on file or to any other recipient (so a specific
-// document can be routed to a specific person). The signee always gets an
+// record's own email on file or to any other recipient(s) (so a specific
+// document can be routed to a specific person, or several at once — see
+// the comma-separated "Send To" input below). The signee(s) always get an
 // emailed link; see routes/documents.js.
-async function loadDocumentsTab(entityType, entityId, containerId, defaultEmail) {
+//
+// knownEmails (optional array of {label, email}) drives the "Add from
+// profile" picker next to Send To — every email already on the record
+// (e.g. a store's owner AND manager email) so an admin can add one with a
+// click instead of retyping it. Cached per entityId (window.__docKnownEmails)
+// so the internal reload calls below (after generate/send/void/retract),
+// which don't have it in scope, still render it after the first load.
+async function loadDocumentsTab(entityType, entityId, containerId, defaultEmail, knownEmails) {
+  window.__docKnownEmails = window.__docKnownEmails || {};
+  if (knownEmails) window.__docKnownEmails[entityId] = knownEmails;
   const container = qs('#' + containerId);
   container.innerHTML = '<p class="small-muted">Loading…</p>';
   const safeEmail = esc(defaultEmail || '').replace(/'/g, "\\'");
@@ -978,13 +988,19 @@ async function loadDocumentsTab(entityType, entityId, containerId, defaultEmail)
 }
 function documentRowHtml(d, entityType, entityId, containerId, defaultEmail) {
   const inputId = `doc-email-${d.id}`;
+  const pickId = `doc-email-pick-${d.id}`;
   const safeEmail = esc(defaultEmail || '').replace(/'/g, "\\'");
   const canAct = d.status !== 'signed' && d.status !== 'void';
+  const knownEmails = (window.__docKnownEmails && window.__docKnownEmails[entityId]) || [];
   return `<div class="card" style="margin-bottom:10px">
     <div class="flex-between"><strong>${esc(d.title || 'Agreement')}</strong>${badge(d.status, d.status)}</div>
     <p class="small-muted">Created ${fmtDateTime(d.created_at)}${d.sent_at ? ' · Sent ' + fmtDateTime(d.sent_at) : ''}${d.signed_at ? ' · Signed ' + fmtDateTime(d.signed_at) + ' by ' + esc(d.signer_name || '') : ''}</p>
     ${canAct ? `<div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-top:8px">
-      <div style="flex:1;min-width:180px"><label style="margin-top:0">Send To</label><input id="${inputId}" value="${esc(defaultEmail || '')}" placeholder="email address"></div>
+      <div style="flex:1;min-width:180px"><label style="margin-top:0">Send To</label><input id="${inputId}" value="${esc(defaultEmail || '')}" placeholder="email address(es), comma-separated"></div>
+      ${knownEmails.length ? `<div style="min-width:170px"><label style="margin-top:0">Add from profile</label><select id="${pickId}" onchange="addDocEmailFromProfile('${inputId}','${pickId}')">
+        <option value="">Pick an email…</option>
+        ${knownEmails.filter(e => e.email).map(e => `<option value="${esc(e.email)}">${esc(e.label)}: ${esc(e.email)}</option>`).join('')}
+      </select></div>` : ''}
       <button class="btn btn-sm btn-primary" onclick="sendDocument('${d.id}','${inputId}','${entityType}','${entityId}','${containerId}','${safeEmail}')">${d.status === 'sent' ? 'Resend' : 'Send'}</button>
     </div>` : ''}
     <div style="margin-top:8px;display:flex;gap:8px">
@@ -994,6 +1010,19 @@ function documentRowHtml(d, entityType, entityId, containerId, defaultEmail) {
     </div>
   </div>`;
 }
+// Appends the picked profile email into the Send To input (comma-joined,
+// deduped) instead of replacing whatever's already typed there — lets an
+// admin build up a multi-recipient list by clicking the dropdown more than once.
+window.addDocEmailFromProfile = (inputId, pickId) => {
+  const picker = qs('#' + pickId);
+  const val = picker.value;
+  if (!val) return;
+  const input = qs('#' + inputId);
+  const existing = input.value.split(',').map(s => s.trim()).filter(Boolean);
+  if (!existing.includes(val)) existing.push(val);
+  input.value = existing.join(', ');
+  picker.value = '';
+};
 window.generateDocument = async (entityType, entityId, containerId, defaultEmail) => {
   const titleInput = qs(`#doc-title-${entityType}-${entityId}`);
   const title = titleInput ? titleInput.value.trim() : '';

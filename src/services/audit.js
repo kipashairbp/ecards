@@ -114,13 +114,20 @@ export function logMassAudit(orgId, userId, action, entityType, ids, extra, ip) 
 }
 
 // Last N hours of audit_log for an org, newest first, with the acting user's
-// name attached. `null` user_id (public form submissions, system actions)
-// shows as "System".
+// name attached — hours === null means no time filter at all ("All time"),
+// so an approval (or anything else) from before the previously-fixed 7-day
+// window can actually be found and undone instead of just falling off the
+// list. `null` user_id (public form submissions, system actions) shows as
+// "System".
 export function getRecentActions(orgId, hours = 48) {
-  const rows = db.prepare(`SELECT a.*, u.first_name, u.last_name, u.email AS user_email
-    FROM audit_log a LEFT JOIN users u ON u.id = a.user_id
-    WHERE a.org_id = ? AND a.created_at >= datetime('now', ?) ORDER BY a.created_at DESC`)
-    .all(orgId, `-${hours} hours`);
+  const rows = hours === null
+    ? db.prepare(`SELECT a.*, u.first_name, u.last_name, u.email AS user_email
+        FROM audit_log a LEFT JOIN users u ON u.id = a.user_id
+        WHERE a.org_id = ? ORDER BY a.created_at DESC`).all(orgId)
+    : db.prepare(`SELECT a.*, u.first_name, u.last_name, u.email AS user_email
+        FROM audit_log a LEFT JOIN users u ON u.id = a.user_id
+        WHERE a.org_id = ? AND a.created_at >= datetime('now', ?) ORDER BY a.created_at DESC`)
+        .all(orgId, `-${hours} hours`);
   // A row is only "redoable" if the undo-entry it points to hasn't itself
   // been undone yet — otherwise that undo was already consumed by a
   // previous redo (or a second undo/redo cycle), and pointing at it again
@@ -144,9 +151,17 @@ export function getRecentActions(orgId, hours = 48) {
     // generic fallback for "put every touched row back" the way there is
     // for a plain single-entity update.
     const hasRestorableSnapshot = !!(before && before.kind && CASCADE_RESTORERS[before.kind]);
+    // A mass-approve row is only undoable when it carries the per-record
+    // updatedDiffs snapshot (see routes/{applicants,shuls,stores}.js's
+    // mass-approve + undoMassApproveEntry above) — a row logged before that
+    // snapshot existed has no recorded prior state to restore, so it never
+    // gets an Undo button rather than one that would just error out.
+    const hasMassApproveDiffs = r.action === 'mass-approve' && !!(after && after.updatedDiffs && after.updatedDiffs.length);
     const undoable = SNAPSHOT_ONLY_ACTIONS.has(r.action)
       ? hasRestorableSnapshot && !r.undone_at
-      : (UNDOABLE_ACTIONS.includes(r.action) || r.action === 'mass-import' || r.action === 'mass-delete') && !!ENTITY_TABLES[r.entity_type] && !r.undone_at && !!(r.before_json || r.after_json);
+      : r.action === 'mass-approve'
+        ? hasMassApproveDiffs && !r.undone_at
+        : (UNDOABLE_ACTIONS.includes(r.action) || r.action === 'mass-import' || r.action === 'mass-delete') && !!ENTITY_TABLES[r.entity_type] && !r.undone_at && !!(r.before_json || r.after_json);
     return {
       ...r, before, after, undoable,
       // Lets the UI put a "Redo" button directly on an already-undone row
@@ -274,6 +289,47 @@ function undoMassImportEntry(entry, actingUser, ip) {
   return logMassAudit(entry.org_id, actingUser.id, 'mass-import-undo', entry.entity_type, touchedIds.length ? touchedIds : [entry.id], summary, ip);
 }
 
+// Reverses a mass-approve: every record it approved gets the exact columns
+// it overwrote (approval_status/card_amount for applicants, status/
+// slots_allocated/portal_user_id for shuls, setup_status for stores)
+// restored from the per-row before-snapshot captured at approval time (see
+// routes/{applicants,shuls,stores}.js's mass-approve — same updatedDiffs
+// shape as mass-import's). Side effects the approval triggered (disccardpromos
+// account/funds, the "you're approved" email) are never reversed here —
+// exactly like undoing a single /:id/approve already doesn't reverse those
+// either; this only ever puts the local record state back.
+//
+// Rows logged before this snapshot existed carry no updatedDiffs at all, so
+// there's no way to know what each record's approval_status/slots/etc. was
+// before this action touched it (mass-approve doesn't require the prior
+// state to be "pending" — it can legitimately re-approve an already-approved
+// or even a previously-rejected record with a new amount). Refuses rather
+// than guessing, same as the merge/resolve_duplicate legacy-row refusal
+// above.
+function undoMassApproveEntry(entry, actingUser, ip) {
+  const def = ENTITY_TABLES[entry.entity_type];
+  if (!def) throw new Error(`"${entry.entity_type}" records can't be undone`);
+  const after = entry.after_json ? JSON.parse(entry.after_json) : {};
+  const updatedDiffs = after.updatedDiffs || [];
+  if (!updatedDiffs.length) throw new Error('This mass approval was logged before per-record undo data was captured, so the exact prior state per record was never recorded — it can\'t be undone.');
+  let restored = 0;
+  const run = db.transaction(() => {
+    for (const { id, before } of updatedDiffs) {
+      if (!before || !Object.keys(before).length) continue;
+      const exists = db.prepare(`SELECT 1 FROM ${def.table} WHERE ${def.pk} = ? AND org_id = ?`).get(id, entry.org_id);
+      if (!exists) continue;
+      const keys = Object.keys(before);
+      db.prepare(`UPDATE ${def.table} SET ${keys.map(k => `${k} = ?`).join(', ')} WHERE ${def.pk} = ?`)
+        .run(...keys.map(k => before[k]), id);
+      restored++;
+    }
+  });
+  run();
+  db.prepare(`UPDATE audit_log SET undone_at = datetime('now') WHERE id = ?`).run(entry.id);
+  const touchedIds = updatedDiffs.map(d => d.id);
+  return logMassAudit(entry.org_id, actingUser.id, 'mass-approve-undo', entry.entity_type, touchedIds.length ? touchedIds : [entry.id], { restored }, ip);
+}
+
 // Reverses a mass-delete: every record it hard-deleted gets fully restored
 // (main row + every related row the cascade removed/unlinked) from the
 // per-row snapshot routes/{shuls,applicants,stores}.js captured right
@@ -307,6 +363,7 @@ export function undoAuditEntry(auditId, actingUser, ip) {
   if (entry.undone_at) throw new Error('This action was already undone');
   if (entry.action === 'mass-import') return undoMassImportEntry(entry, actingUser, ip);
   if (entry.action === 'mass-delete') return undoMassDeleteEntry(entry, actingUser, ip);
+  if (entry.action === 'mass-approve') return undoMassApproveEntry(entry, actingUser, ip);
   if (!UNDOABLE_ACTIONS.includes(entry.action)) throw new Error(`"${entry.action}" actions can't be undone`);
   if (!ENTITY_TABLES[entry.entity_type]) throw new Error(`"${entry.entity_type}" records can't be undone`);
   const before = entry.before_json ? JSON.parse(entry.before_json) : null;

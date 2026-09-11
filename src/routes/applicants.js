@@ -1853,7 +1853,7 @@ router.post('/mass-approve', requirePermission('applicants', 'can_edit'), async 
   if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids array required' });
   const discountId = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'disccardpromos_discount_id'`).get(req.user.org_id)?.value;
   let approved = 0, skipped = 0, capReached = false, providerErrors = 0, contributionBlocked = 0, zeroAmountSkipped = 0;
-  const affectedIds = [], names = [];
+  const affectedIds = [], names = [], updatedDiffs = [];
   // Unlike the single /:id/approve route (which returns providerFundsError
   // verbatim), this used to only ever report a bare providerErrors COUNT —
   // the actual disccardpromos error text only ever reached console.error,
@@ -1874,6 +1874,10 @@ router.post('/mass-approve', requirePermission('applicants', 'can_edit'), async 
     const amount = card_amount ?? applicant.card_amount ?? season?.default_card_amount ?? 0;
     db.prepare(`UPDATE applicants SET approval_status='approved', approved_by=?, approved_at=datetime('now'), card_amount=? WHERE id=?`).run(req.user.id, amount, id);
     affectedIds.push(id); names.push(`${applicant.first_name} ${applicant.last_name}`.trim());
+    // Per-record prior state — same two columns the single /:id/approve
+    // route's own before-snapshot captures — so this whole batch can be
+    // undone from Recent Actions (see undoMassApproveEntry in services/audit.js).
+    updatedDiffs.push({ id, before: { approval_status: applicant.approval_status, card_amount: applicant.card_amount } });
     approved++;
     // Same best-effort account-write + fund-load as the single /:id/approve
     // route — see the comments there. A disccardpromos hiccup on one
@@ -1915,7 +1919,7 @@ router.post('/mass-approve', requirePermission('applicants', 'can_edit'), async 
       }
     }
   }
-  logMassAudit(req.user.org_id, req.user.id, 'mass-approve', 'applicant', affectedIds, { skipped, capReached, providerErrors, contributionBlocked, zeroAmountSkipped, names, providerErrorDetails }, req.ip);
+  logMassAudit(req.user.org_id, req.user.id, 'mass-approve', 'applicant', affectedIds, { skipped, capReached, providerErrors, contributionBlocked, zeroAmountSkipped, names, providerErrorDetails, updatedDiffs }, req.ip);
   res.json({ approved, skipped, capReached, providerErrors, contributionBlocked, zeroAmountSkipped, providerErrorDetails, providerErrorsHint: providerErrors && !discountId ? 'No disccardpromos Package/Discount ID configured (Settings > Organization > Gift Card Loading).' : undefined });
 });
 

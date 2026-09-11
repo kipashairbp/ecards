@@ -96,24 +96,17 @@ function matchReasons(a, aAddress, c) {
 // candidate pool entirely — not "real" submissions yet, so they never
 // count as either side of a match: two drafts that happen to share a name
 // don't flag each other, and an already-active applicant never gets
-// flagged just because some unrelated draft shares a field with them. A
-// draft/incomplete row being checked can still match — and get flagged
-// against — a genuinely active (non-draft/incomplete) applicant, since
-// this only narrows the CANDIDATE side, not which row is doing the
-// checking.
+// flagged just because some unrelated draft shares a field with them.
 export function checkApplicantDuplicate(orgId, applicant, previousApplicant) {
-  // 'incomplete' (carried-forward, awaiting re-enrollment) is excluded as
-  // the SUBJECT too, not just the candidate side above — unlike 'draft',
-  // which is still deliberately checked as subject against a genuinely
-  // active applicant (see the comment above). An admin/shul editing basic
-  // info on a carried-forward row before ever re-enrolling it (PUT /:id
-  // calls this on every save, regardless of status) used to be able to
-  // trigger a real flag+pause against, most commonly, its own prior-season
-  // self or a sibling record sharing carried-over data — before the shul
-  // has done anything that counts as "activating" it (complete-
-  // reenrollment/mass-complete-reenrollment, which turns it into 'pending'
-  // and runs this same check for real at that point).
-  if (applicant.approval_status === 'incomplete') return null;
+  // Both 'draft' and 'incomplete' are excluded as the SUBJECT too, not just
+  // the candidate side above — a still-in-progress bulk upload or a
+  // carried-forward row awaiting re-enrollment shouldn't be able to flag
+  // (and pause) some unrelated, already-active applicant just because a
+  // shul hasn't finished entering/reviewing it yet. Real matching happens
+  // once the row is actually submitted (mass upload's submit step / complete-
+  // reenrollment, either of which turns it into 'pending' and runs this same
+  // check for real at that point).
+  if (applicant.approval_status === 'draft' || applicant.approval_status === 'incomplete') return null;
   const candidates = db.prepare(`SELECT * FROM applicants WHERE org_id = ? AND season_id = ? AND id != ? AND approval_status NOT IN ('draft', 'incomplete')`).all(orgId, applicant.season_id, applicant.id);
   return checkAgainst(applicant, candidates, previousApplicant);
 }

@@ -14,7 +14,12 @@ const router = Router();
 router.use(auth, requireRole('super_admin'));
 
 router.get('/recent', (req, res) => {
-  const hours = Math.min(168, Math.max(1, +req.query.hours || 48));
+  // An empty/omitted-but-present hours param (the "All time" option — see
+  // frontend/admin/audit.html) means no time filter at all, so an approval
+  // (or anything else) from before the old fixed 7-day cap can still be
+  // found and undone, not just newer ones.
+  const raw = req.query.hours;
+  const hours = raw === '' || raw === 'all' ? null : Math.min(8760, Math.max(1, +raw || 48));
   res.json({ actions: getRecentActions(req.user.org_id, hours) });
 });
 
