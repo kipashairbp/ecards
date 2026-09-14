@@ -345,6 +345,32 @@ router.get('/export', requirePermission('shuls', 'can_export'), (req, res) => {
   sendXlsx(res, `shuls-${Date.now()}.xlsx`, redact(withCounts, req.permission.hidden_fields));
 });
 
+// Every id matching the same filters as the list view above, with no
+// pagination — powers "Select All Matching Filters" on the mass-select bar
+// (frontend/js/app.js). Must be registered before /:id.
+router.get('/ids', (req, res) => {
+  const { search, status, paused, season_id } = req.query;
+  let where = 'WHERE org_id = ? AND is_locked = 0';
+  const params = [req.user.org_id];
+  if (req.permission.scope === 'assigned') {
+    where += ` AND id IN (SELECT entity_id FROM user_assignments WHERE user_id = ? AND entity_type = 'shul')`;
+    params.push(req.user.id);
+  }
+  if (status) { where += ' AND status = ?'; params.push(status); }
+  if (paused === '1' || paused === '0') { where += ' AND is_paused = ?'; params.push(+paused); }
+  if (season_id) { where += ' AND season_id = ?'; params.push(season_id); }
+  if (search) {
+    where += ` AND (name_en LIKE ? OR name_he LIKE ? OR address LIKE ? OR city LIKE ? OR state LIKE ? OR zip LIKE ?
+      OR ruv_first_name LIKE ? OR ruv_last_name LIKE ? OR ruv_phone LIKE ? OR ruv_address LIKE ? OR ruv_city LIKE ?
+      OR gabai_first_name LIKE ? OR gabai_last_name LIKE ? OR gabai_cell LIKE ? OR gabai_email LIKE ? OR gabai_address LIKE ? OR gabai_city LIKE ?
+      OR permanent_comments LIKE ?)`;
+    const like = `%${search}%`;
+    params.push(like, like, like, like, like, like, like, like, like, like, like, like, like, like, like, like, like, like);
+  }
+  const ids = db.prepare(`SELECT id FROM shuls ${where}`).all(...params).map(r => r.id);
+  res.json({ ids });
+});
+
 router.get('/:id', (req, res) => {
   const shul = db.prepare('SELECT * FROM shuls WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!shul) return res.status(404).json({ error: 'Not found' });

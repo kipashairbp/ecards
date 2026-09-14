@@ -60,7 +60,19 @@ export function findAccountByPhone(orgId, rawPhone) {
 // (same {{first_name}} for everyone, or none at all) — this gives each
 // recipient their own. Field names match ENTITY_TEMPLATE_VARS in
 // frontend/js/app.js (varsHintHtml) — keep the two in sync.
-export function resolveRecipientsForIds(orgId, entityType, ids, channel) {
+// storeRole ('manager' | 'owner' | 'both', default 'both'): which of a
+// store's two independent contacts to send to — a store's manager and
+// owner are two different people who may each want (or NOT want) every
+// mass send, unlike a shul/applicant which only ever has one contact on
+// file. 'both' (the default, and the only option for shul/applicant since
+// they don't have this split) returns ONE row per store using whichever
+// contact is on file (manager preferred, same fallback as before this
+// param existed) UNLESS both roles are explicitly requested AND the store
+// has two distinct contacts, in which case it returns one row per role so
+// each actually gets their own message rather than only whichever one the
+// fallback picked. 'manager'/'owner' returns only that role's contact,
+// skipping a store with nothing on file for it even if the other role has one.
+export function resolveRecipientsForIds(orgId, entityType, ids, channel, storeRole = 'both') {
   if (!ids || !ids.length) return [];
   const placeholders = ids.map(() => '?').join(',');
   let rows;
@@ -75,10 +87,22 @@ export function resolveRecipientsForIds(orgId, entityType, ids, channel) {
       FROM applicants a LEFT JOIN shuls s ON s.id = a.shul_id WHERE a.org_id = ? AND a.id IN (${placeholders})`).all(orgId, ...ids)
       .map(r => ({ id: r.id, contact: r.contact, vars: { first_name: r.first_name || '', last_name: r.last_name || '', shul_name: r.shul_name || '', external_id: r.external_id || '', email: r.email || '' } }));
   } else if (entityType === 'store') {
-    const contactCol = channel === 'email' ? `COALESCE(NULLIF(manager_email,''), owner_email)` : `COALESCE(NULLIF(manager_phone,''), owner_phone)`;
-    rows = db.prepare(`SELECT id, ${contactCol} AS contact, name, manager_name, owner_name
-      FROM stores WHERE org_id = ? AND id IN (${placeholders})`).all(orgId, ...ids)
-      .map(r => ({ id: r.id, contact: r.contact, vars: { name: r.name || '', manager_name: r.manager_name || '', owner_name: r.owner_name || '' } }));
+    const managerCol = channel === 'email' ? 'manager_email' : 'manager_phone';
+    const ownerCol = channel === 'email' ? 'owner_email' : 'owner_phone';
+    const stores = db.prepare(`SELECT id, ${managerCol} AS manager_contact, ${ownerCol} AS owner_contact, name, manager_name, owner_name
+      FROM stores WHERE org_id = ? AND id IN (${placeholders})`).all(orgId, ...ids);
+    rows = [];
+    for (const s of stores) {
+      const vars = { name: s.name || '', manager_name: s.manager_name || '', owner_name: s.owner_name || '' };
+      if (storeRole === 'manager') { if (s.manager_contact) rows.push({ id: s.id, contact: s.manager_contact, vars }); }
+      else if (storeRole === 'owner') { if (s.owner_contact) rows.push({ id: s.id, contact: s.owner_contact, vars }); }
+      else if (s.manager_contact && s.owner_contact && s.manager_contact !== s.owner_contact) {
+        rows.push({ id: s.id, contact: s.manager_contact, vars }, { id: s.id, contact: s.owner_contact, vars });
+      } else {
+        const contact = s.manager_contact || s.owner_contact;
+        if (contact) rows.push({ id: s.id, contact, vars });
+      }
+    }
   } else {
     throw new Error(`Unsupported entity type: ${entityType}`);
   }

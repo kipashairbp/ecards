@@ -170,6 +170,39 @@ async function ensureProviderAccount(orgId, applicant, index) {
         const shared = db.prepare('SELECT 1 FROM applicants WHERE provider_account_id = ? AND id != ?').get(applicant.provider_account_id, applicant.id);
         if (shared) await giftcard.reactivateCustomer(applicant.season_id, applicant.provider_account_id, current?.external_id || applicant.external_id);
         else await giftcard.updateCustomer(applicant.season_id, applicant.provider_account_id, { ...opts, isActive: true, externalId: current?.external_id || applicant.external_id });
+        // Callers of ensureProviderAccount (the single /:id/approve route,
+        // mass-approve) each already have their own addFunds call right
+        // after this, gated on `!account.linked` (== `!shared`) — that
+        // already correctly rewrites the balance for the ordinary,
+        // non-merged case. What it silently MISSES is a merge-group OWNER
+        // being re-approved once another member has been linked to point at
+        // this same account: `shared` is then true for the owner's own row
+        // too (someone else references this provider_account_id), so those
+        // callers' `!account.linked` gate wrongly treats the owner itself as
+        // "just a linked secondary" and skips the rewrite — the owner's real
+        // account (what its whole group's card actually draws from) then
+        // never hears about a bumped card_amount. This fires only for that
+        // exact gap: an owner whose account IS shared. addFunds's `amount`
+        // is confirmed to SET the package balance outright, not add to it
+        // (see that function's comment), so this is always the applicant's
+        // full current card_amount, never a delta. isGroupOwner still guards
+        // it — a secondary's own card_amount is never authoritative for a
+        // shared balance, same rule runProviderEnforce's own balance check
+        // uses.
+        const isGroupOwner = !applicant.merge_group_id || applicant.merge_group_id === applicant.id;
+        if (isGroupOwner && shared && (applicant.card_amount ?? 0) > 0) {
+          const discountId = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'disccardpromos_discount_id'`).get(orgId)?.value;
+          // Skip the write entirely when `current` (already in hand — from
+          // the index, or the getCustomerById call above) shows the balance
+          // already matches, so a routine re-approve of an unchanged amount
+          // doesn't cost an extra PATCH every time.
+          const existingPkg = (current?.packages || []).find(p => String(p.id) === String(discountId));
+          const alreadyCorrect = existingPkg && Number(existingPkg.amount) === applicant.card_amount;
+          if (discountId && !alreadyCorrect) {
+            try { await giftcard.addFunds(applicant.season_id, { customerId: applicant.provider_account_id, externalId: current?.external_id || applicant.external_id, discountId, amount: applicant.card_amount }); }
+            catch (e) { console.error(`[giftcard] failed to rewrite the balance for applicant ${applicant.id}:`, e.message); }
+          }
+        }
         return { accountId: cleanProviderId(applicant.provider_account_id), created: false, linked: !!shared };
       } catch (e) {
         // 404 = the stored id is stale (deleted on their side) — fall through
@@ -494,6 +527,34 @@ router.get('/export', requirePermission('applicants', 'can_export'), (req, res) 
   }
   const rows = db.prepare(`SELECT a.*, s.name_en as shul_name FROM applicants a LEFT JOIN shuls s ON s.id = a.shul_id ${where} ORDER BY a.created_at DESC`).all(...params);
   sendXlsx(res, `applicants-${Date.now()}.xlsx`, redact(rows, req.permission.hidden_fields));
+});
+
+// Every id matching the same filters as the list view above, with no
+// pagination — powers "Select All Matching Filters" on the mass-select bar
+// (frontend/js/app.js) so an admin can group-select "every approved
+// applicant at Shul X" etc. in one click instead of paging through and
+// re-checking the page checkbox on every page. Must be registered before
+// /:id. Same filters as GET / and /export — kept in sync by hand, same as
+// those two already are with each other.
+router.get('/ids', (req, res) => {
+  const { search, status, shul_id, season_id, home_for_yomtov, marital_status, paused, amount_min, amount_max } = req.query;
+  let { where, params } = scopeWhere(req);
+  if (status) { where += ' AND a.approval_status = ?'; params.push(status); }
+  if (paused === '1' || paused === '0') { where += ' AND a.is_paused = ?'; params.push(+paused); }
+  if (shul_id) { where += ' AND (a.shul_id = ? OR a.id IN (SELECT applicant_id FROM applicant_submissions WHERE shul_id = ?))'; params.push(shul_id, shul_id); }
+  if (season_id) { where += ' AND a.season_id = ?'; params.push(season_id); }
+  if (marital_status) { where += ' AND a.marital_status = ?'; params.push(marital_status); }
+  if (home_for_yomtov !== undefined && home_for_yomtov !== '') { where += ' AND a.home_for_yomtov = ?'; params.push(home_for_yomtov === 'true' || home_for_yomtov === '1' ? 1 : 0); }
+  if (amount_min !== undefined && amount_min !== '') { where += ' AND a.card_amount >= ?'; params.push(+amount_min); }
+  if (amount_max !== undefined && amount_max !== '') { where += ' AND a.card_amount <= ?'; params.push(+amount_max); }
+  if (search) {
+    where += ` AND (a.first_name LIKE ? OR a.last_name LIKE ? OR a.email LIKE ? OR a.home_phone LIKE ? OR a.husband_cell LIKE ? OR a.wife_cell LIKE ? OR a.external_id LIKE ?
+      OR a.address LIKE ? OR a.city LIKE ? OR a.state LIKE ? OR a.zip LIKE ? OR a.comments LIKE ? OR a.permanent_comments LIKE ?)`;
+    const like = `%${search}%`;
+    params.push(like, like, like, like, like, like, like, like, like, like, like, like, like);
+  }
+  const ids = db.prepare(`SELECT a.id FROM applicants a ${where}`).all(...params).map(r => r.id);
+  res.json({ ids });
 });
 
 // Answers "594 approved but only 567 in disccardpromos" — the counts
@@ -858,6 +919,45 @@ async function runProviderEnforce(orgId, seasonId, job) {
         }
         if (seenAccounts.has(cust._id)) counts.sharedByMerge++;
         seenAccounts.add(cust._id);
+        // Rewrite an EXISTING account's balance whenever it's fallen out of
+        // sync with what's actually committed here — a merge changing the
+        // surviving record's card_amount, a pause interrupting approval
+        // right after the account write but before the amount ever got
+        // pushed, or simply re-approving with a different amount, all used
+        // to leave this permanently wrong with nothing ever correcting it
+        // (every other write above only fixes LINKING/activation state,
+        // never the amount). addFunds's `amount` SETS the package balance
+        // outright — confirmed live with disccardpromos support, see that
+        // function's comment in services/giftcard.js — it does NOT add to
+        // whatever's already there, so this always writes the applicant's
+        // full card_amount, never a computed difference (a shortfall/delta
+        // passed as `amount` would overwrite the balance with just that
+        // small difference instead of the real total — the exact bug this
+        // replaces). cust.packages is already present on the list pulled
+        // once at the top of this function (confirmed in disccardpromos'
+        // own docs — no extra per-customer request needed here). Only the
+        // record that actually OWNS the group's card_amount (the merge
+        // primary, or an unmerged record) drives this — an old-style
+        // multi-row merge group predating collapseAllMergedApplicantGroups
+        // would otherwise have every member's own stale card_amount
+        // independently trying to rewrite the one account they all share.
+        const isGroupOwner = !a.merge_group_id || a.merge_group_id === a.id;
+        const committed = a.card_amount ?? 0;
+        if (isGroupOwner && committed > 0) {
+          if (!discountId) {
+            notes.push(`${describe(a)}: $${committed} is committed but no disccardpromos Package/Discount ID is configured, so the balance can't be verified or corrected`);
+          } else {
+            const pkg = (cust.packages || []).find(p => String(p.id) === String(discountId));
+            const current = pkg ? Number(pkg.amount) || 0 : 0;
+            if (current !== committed) {
+              try {
+                await giftcard.addFunds(seasonId, { customerId: cust._id, externalId: cust.external_id || a.external_id, discountId, amount: committed });
+                counts.fundsLoaded++;
+                if (pkg) pkg.amount = committed; // keep the in-memory list correct for any later iteration sharing this account
+              } catch (e) { notes.push(`${describe(a)}: balance is $${current} but $${committed} is committed — rewriting it failed: ${e.message}`); }
+            }
+          }
+        }
         setCheck.run('active', now, a.id);
       } else {
         const r = await ensureProviderAccount(orgId, a, { byId, byExt });
@@ -1379,6 +1479,23 @@ router.put('/:id', requirePermission('applicants', 'can_edit'), async (req, res)
     } catch (e) {
       console.error('[giftcard] failed to push applicant update to disccardpromos:', e.message);
     }
+    // card_amount is one of the admin-only EDITABLE_FIELDS above — editing
+    // it here used to only ever change our own DB; the disccardpromos side
+    // never heard about it outside of the approve routes. addFunds's
+    // `amount` SETS the package balance outright (see giftcard.js's
+    // comment), so this always writes the applicant's current card_amount
+    // as an absolute value, same isMergedSecondary guard ensureProviderAccount
+    // uses (a merge-group secondary's own card_amount was never authoritative
+    // for the shared account it merely links to).
+    if (sets.includes('card_amount') && !isMergedSecondary(updated) && (updated.card_amount ?? 0) > 0) {
+      const discountId = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'disccardpromos_discount_id'`).get(req.user.org_id)?.value;
+      if (discountId) {
+        try { await giftcard.addFunds(updated.season_id, { customerId: updated.provider_account_id, externalId: updated.external_id, discountId, amount: updated.card_amount }); }
+        catch (e) { console.error('[giftcard] failed to rewrite the balance after a card_amount edit:', e.message); }
+      } else {
+        console.error(`[giftcard] card_amount was edited for applicant ${updated.id} but no disccardpromos Package/Discount ID is configured — balance was not corrected`);
+      }
+    }
   }
   res.json({ applicant: maskForShul(updated, req.user.role, req.user.org_id) });
 });
@@ -1697,6 +1814,11 @@ router.post('/:id/approve', requirePermission('applicants', 'can_edit'), async (
       .run(req.user.id, amount, applicant.id);
     logAudit(req.user.org_id, req.user.id, 'approve', 'applicant', applicant.id,
       { approval_status: applicant.approval_status, card_amount: applicant.card_amount }, { approval_status: 'approved', card_amount: amount }, req.ip);
+    // ensureProviderAccount (below) reads applicant.card_amount to decide
+    // what to rewrite the disccardpromos balance to — this in-memory object
+    // was loaded before the UPDATE above, so without this it would still be
+    // handing ensureProviderAccount the PRE-approval amount.
+    applicant.card_amount = amount;
     let emailError = null;
     if (applicant.email) {
       const tmpl = renderSystemTemplate(req.user.org_id, 'applicantApproved', { name: `${applicant.first_name} ${applicant.last_name}` });
@@ -1939,6 +2061,11 @@ router.post('/mass-approve', requirePermission('applicants', 'can_edit'), async 
     // undone from Recent Actions (see undoMassApproveEntry in services/audit.js).
     updatedDiffs.push({ id, before: { approval_status: applicant.approval_status, card_amount: applicant.card_amount } });
     approved++;
+    // Same reason as the single /:id/approve route: ensureProviderAccount
+    // (below) reads applicant.card_amount to decide what to rewrite the
+    // disccardpromos balance to, and this in-memory object was loaded
+    // before the UPDATE above.
+    applicant.card_amount = amount;
     // Same best-effort account-write + fund-load as the single /:id/approve
     // route — see the comments there. A disccardpromos hiccup on one
     // applicant never stops the rest of the batch. A merged-duplicate
@@ -2288,6 +2415,33 @@ router.post('/:id/appeal', (req, res) => {
   const id = uuid();
   db.prepare(`INSERT INTO applicant_rejection_appeals (id, org_id, applicant_id, shul_id) VALUES (?,?,?,?)`).run(id, req.user.org_id, applicant.id, req.user.shul_id);
   res.status(201).json({ appeal: db.prepare('SELECT * FROM applicant_rejection_appeals WHERE id = ?').get(id) });
+});
+
+// "Contact Admin" button on a locked (merged-into-another-shul's-record)
+// applicant view — a shul that only sees "Account locked, please contact
+// the admin" with no other way to act on it. Emails the org's configured
+// support address (Settings > Organization > default Reply-To) a direct
+// link into this applicant's admin-portal record, so the admin doesn't have
+// to go search for it. Same access rule as /appeal above — the requesting
+// shul must actually be a contributor (owner or, for a merged record, an
+// applicant_submissions row), not just any shul in the org.
+router.post('/:id/contact-admin', async (req, res) => {
+  if (req.user.role !== 'shul') return res.status(403).json({ error: 'Not permitted' });
+  const applicant = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
+  if (!applicant) return res.status(404).json({ error: 'Not found' });
+  const isOwner = applicant.shul_id === req.user.shul_id;
+  const hasSubmission = isOwner || db.prepare('SELECT 1 FROM applicant_submissions WHERE applicant_id = ? AND shul_id = ?').get(applicant.id, req.user.shul_id);
+  if (!hasSubmission) return res.status(403).json({ error: 'Not your applicant' });
+  const adminEmail = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'email_reply_to'`).get(req.user.org_id)?.value;
+  if (!adminEmail) return res.status(400).json({ error: 'No admin contact email is configured for this organization yet — ask your admin to set one under Settings > Organization.' });
+  const shul = db.prepare('SELECT name_en FROM shuls WHERE id = ?').get(req.user.shul_id);
+  const link = `${process.env.APP_URL || ''}/admin/applicants?id=${applicant.id}`;
+  const subject = `Locked applicant record — ${applicant.first_name} ${applicant.last_name}`.trim();
+  const body = `<p>${escapeHtml(shul?.name_en || 'A shul')} is asking about a locked applicant record.</p>
+    <p><strong>Applicant:</strong> ${escapeHtml(`${applicant.first_name} ${applicant.last_name}`.trim())}</p>
+    <p><a href="${link}">View this applicant in the admin portal</a></p>`;
+  const { emailError } = await sendMailChecked(req.user.org_id, adminEmail, subject, body, { relatedEntityType: 'applicant', relatedEntityId: applicant.id, sentBy: null });
+  res.json({ ok: !emailError, emailError });
 });
 
 // Open appeals, admin-only — backs the Appeals button's tally badge and its

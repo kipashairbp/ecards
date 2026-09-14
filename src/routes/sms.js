@@ -176,7 +176,7 @@ router.get('/groups/:group', (req, res) => {
 // `variables` for single sends (groups don't get per-recipient variables —
 // send the same message to everyone).
 router.post('/send', requirePermission('sms', 'can_edit'), async (req, res) => {
-  const { to, group, entity_type, ids, body, variables, season_id } = req.body || {};
+  const { to, group, entity_type, ids, body, variables, season_id, store_role } = req.body || {};
   if (!body) return res.status(400).json({ error: 'body is required' });
   const substitute = (text, vars) => String(text).replace(/\{\{(\w+)\}\}/g, (m, key) => (vars && vars[key] != null ? vars[key] : m));
 
@@ -192,7 +192,10 @@ router.post('/send', requirePermission('sms', 'can_edit'), async (req, res) => {
     // seasonal at all.
     const seasonId = season_id || getActiveSeasonId(orgId);
     if (group === 'shuls') recipients = db.prepare(`SELECT gabai_cell AS phone FROM shuls WHERE org_id = ? AND gabai_cell IS NOT NULL AND gabai_cell != '' AND season_id = ?`).all(orgId, seasonId);
-    else if (group === 'stores') recipients = db.prepare(`SELECT COALESCE(NULLIF(manager_phone,''), owner_phone) AS phone FROM stores WHERE org_id = ?`).all(orgId);
+    else if (group === 'stores') {
+      const roleCol = store_role === 'manager' ? 'manager_phone' : store_role === 'owner' ? 'owner_phone' : `COALESCE(NULLIF(manager_phone,''), owner_phone)`;
+      recipients = db.prepare(`SELECT ${roleCol} AS phone FROM stores WHERE org_id = ?`).all(orgId);
+    }
     else if (group === 'applicants') recipients = db.prepare(`SELECT COALESCE(NULLIF(husband_cell,''), NULLIF(wife_cell,''), home_phone) AS phone FROM applicants WHERE org_id = ? AND season_id = ?`).all(orgId, seasonId);
     else if (group === 'staff') recipients = db.prepare(`SELECT phone FROM users WHERE org_id = ? AND role IN ('super_admin','org_admin','staff') AND is_active = 1 AND phone IS NOT NULL AND phone != ''`).all(orgId);
     else return res.status(400).json({ error: 'Invalid group' });
@@ -213,7 +216,7 @@ router.post('/send', requirePermission('sms', 'can_edit'), async (req, res) => {
   // than one shared `variables` object applied identically to everyone.
   if (entity_type) {
     if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids is required with entity_type' });
-    const recipients = resolveRecipientsForIds(req.user.org_id, entity_type, ids, 'phone');
+    const recipients = resolveRecipientsForIds(req.user.org_id, entity_type, ids, 'phone', store_role);
     if (!recipients.length) return res.status(400).json({ error: 'None of the selected records have a phone number on file' });
     let sent = 0, failed = 0;
     for (const r of recipients) {

@@ -131,7 +131,7 @@ router.get('/recipients/search', (req, res) => {
 // Stores list pages uses, so it only ever reaches the checked rows. Not
 // combinable with `to` in the same request.
 router.post('/send', requirePermission('emails', 'can_edit'), async (req, res) => {
-  const { to, entity_type, ids, subject, body_html, variables } = req.body || {};
+  const { to, entity_type, ids, subject, body_html, variables, store_role } = req.body || {};
   if (!subject || !body_html) return res.status(400).json({ error: 'subject and body_html are required' });
   const substitute = (text, vars) => String(text).replace(/\{\{(\w+)\}\}/g, (m, key) => (vars && vars[key] != null ? vars[key] : m));
   const results = [];
@@ -139,8 +139,10 @@ router.post('/send', requirePermission('emails', 'can_edit'), async (req, res) =
     if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids is required with entity_type' });
     // Per-recipient vars (each record's own name/shul/etc.), not one shared
     // `variables` object applied identically to everyone — see
-    // resolveRecipientsForIds in utils/contactLookup.js.
-    const recipients = resolveRecipientsForIds(req.user.org_id, entity_type, ids, 'email');
+    // resolveRecipientsForIds in utils/contactLookup.js. store_role
+    // ('manager'/'owner'/'both') only matters for entity_type 'store' —
+    // ignored (defaults to 'both') for shul/applicant.
+    const recipients = resolveRecipientsForIds(req.user.org_id, entity_type, ids, 'email', store_role);
     if (!recipients.length) return res.status(400).json({ error: 'None of the selected records have an email address on file' });
     for (const r of recipients) {
       const { emailError } = await sendMailChecked(req.user.org_id, r.contact, substitute(subject, r.vars), substitute(body_html, r.vars), { sentBy: req.user.id });

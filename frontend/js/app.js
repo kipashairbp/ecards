@@ -1221,8 +1221,17 @@ function openMassMessageModal(entityType, kind, ids) {
     let templates = [];
     try { ({ templates } = await api(kind === 'email' ? '/emails/templates/all' : '/sms/templates/all')); } catch { /* compose still works without templates */ }
     const templateOptions = `<option value="">Start from scratch</option>` + templates.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('');
+    // A store has two independent contacts (manager/owner) — a shul or
+    // applicant only ever has one, so this picker only makes sense here.
+    // 'both' matches the pre-existing behavior (whichever's on file, and
+    // both if they're two different people).
     const body = `
       <p class="small-muted">Sending to ${ids.length} selected record(s), using whichever ${kind === 'email' ? 'email address' : 'phone number'} each has on file — any without one is skipped.</p>
+      ${entityType === 'store' ? `<label>Send To</label><select id="mm-store-role">
+        <option value="both">Managers &amp; Owners (whichever's on file)</option>
+        <option value="manager">Managers only</option>
+        <option value="owner">Owners only</option>
+      </select>` : ''}
       <p class="small-muted">Available variables (filled in per-recipient): ${varsHintHtml(entityType, {})}</p>
       ${templates.length ? `<label>Use Template</label><select id="mm-template">${templateOptions}</select>` : ''}
       ${kind === 'email' ? `<label>Subject</label><input id="mm-subject"><label>Message</label><div id="mm-body"></div>` : `<label>Message</label><textarea id="mm-body" rows="5"></textarea>`}
@@ -1250,10 +1259,11 @@ function openMassMessageModal(entityType, kind, ids) {
       if (!messageBody) return toast('Enter a message', true);
       if (kind === 'email' && !qs('#mm-subject').value.trim()) return toast('Enter a subject', true);
       sendBtn.disabled = true; sendBtn.textContent = 'Sending…';
+      const storeRole = entityType === 'store' ? qs('#mm-store-role').value : undefined;
       try {
         const r = kind === 'email'
-          ? await api('/emails/send', { method: 'POST', body: { entity_type: entityType, ids, subject: qs('#mm-subject').value.trim(), body_html: messageBody } })
-          : await api('/sms/send', { method: 'POST', body: { entity_type: entityType, ids, body: messageBody } });
+          ? await api('/emails/send', { method: 'POST', body: { entity_type: entityType, ids, subject: qs('#mm-subject').value.trim(), body_html: messageBody, store_role: storeRole } })
+          : await api('/sms/send', { method: 'POST', body: { entity_type: entityType, ids, body: messageBody, store_role: storeRole } });
         observer.disconnect();
         closeModal();
         finish(r);

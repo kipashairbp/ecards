@@ -43,6 +43,7 @@ renderShell('/admin/shuls', `
       <option value="sms">SMS</option>
       <option value="delete">Delete Permanently</option>
     </select>
+    <button class="btn btn-sm btn-outline" id="btn-select-all-filtered">Select All Matching Filters</button>
     <button class="btn btn-sm btn-primary" id="btn-mass-apply" disabled>Apply to Selected (0)</button>
   </div>
   <div id="live-banner"></div>
@@ -185,6 +186,24 @@ function onCheck(e) {
   qs('#btn-mass-apply').textContent = `Apply to Selected (${selected.size})`;
   qs('#btn-mass-apply').disabled = selected.size === 0;
 }
+
+// Selects every id matching the CURRENT filters — every page, not just the
+// one on screen — same idea as applicants.html's identical button.
+qs('#btn-select-all-filtered').addEventListener('click', async () => {
+  const btn = qs('#btn-select-all-filtered');
+  btn.disabled = true;
+  try {
+    const params = new URLSearchParams(Object.fromEntries(Object.entries(state).filter(([,v]) => v !== '')));
+    const { ids } = await api('/shuls/ids?' + params);
+    for (const id of ids) selected.add(id);
+    qsa('.row-chk').forEach(c => { if (selected.has(c.dataset.id)) c.checked = true; });
+    qs('#chk-all').checked = qsa('.row-chk').length > 0 && qsa('.row-chk:not(:checked)').length === 0;
+    qs('#btn-mass-apply').textContent = `Apply to Selected (${selected.size})`;
+    qs('#btn-mass-apply').disabled = selected.size === 0;
+    toast(`Selected ${ids.length} matching the current filters`);
+  } catch (err) { toast(err.message, true); }
+  finally { btn.disabled = false; }
+});
 
 // Inline save for the Seasonal Comments column — skips the round-trip if
 // nothing actually changed (every blur fires this, not just an edit), and
