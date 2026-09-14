@@ -125,7 +125,17 @@ const cleanProviderId = id => String(id).replace(/\.0$/, '');
 // applicants in exactly that state.) Best-effort like every other provider
 // write at approval: returns { accountId, created, linked, error } and
 // never throws.
-async function ensureProviderAccount(orgId, applicant) {
+//
+// index (optional): a { byId, byExt } map from ONE giftcard.buildCustomerIndex()
+// pull, passed by a bulk caller (mass-approve, retry-provider-sync,
+// runProviderEnforce) covering every applicant in that whole run — every
+// lookup below reads off it instead of this function doing its own GET, which
+// used to mean one disccardpromos round trip per applicant in a mass action
+// (a mass-approve of 200 applicants made 200+ separate calls just to look
+// up accounts that a single List Customers call already covers). Omit it
+// (the default) for a single-record caller, where a live per-id lookup is
+// the right, simplest thing and not worth a full list pull.
+async function ensureProviderAccount(orgId, applicant, index) {
   if (!applicant.shul_id || applicant.provider_exempt) return { skipped: true };
   if (!applicant.provider_account_id && applicant.merge_group_id) {
     reconcileAccountsForGroup(applicant.merge_group_id);
@@ -148,26 +158,45 @@ async function ensureProviderAccount(orgId, applicant) {
     // giftcard.js — would too, which is how earlier duplicates happened).
     // A shared customer only gets re-activated, not overwritten with this
     // member's copy of the name/contact details.
-    try {
-      const current = await giftcard.getCustomerById(applicant.season_id, applicant.provider_account_id);
-      const shared = db.prepare('SELECT 1 FROM applicants WHERE provider_account_id = ? AND id != ?').get(applicant.provider_account_id, applicant.id);
-      if (shared) await giftcard.reactivateCustomer(applicant.season_id, applicant.provider_account_id, current?.external_id || applicant.external_id);
-      else await giftcard.updateCustomer(applicant.season_id, applicant.provider_account_id, { ...opts, isActive: true, externalId: current?.external_id || applicant.external_id });
-      return { accountId: cleanProviderId(applicant.provider_account_id), created: false, linked: !!shared };
-    } catch (e) {
-      // 404 = the stored id is stale (deleted on their side) — fall through
-      // and create a fresh one. Anything else is a real failure.
-      if (e.status !== 404) return { accountId: applicant.provider_account_id, error: e.message };
+    const cleanId = cleanProviderId(applicant.provider_account_id);
+    // With an index in hand, "not in the fresh list" means the same thing a
+    // live 404 would have: the stored id is stale (deleted on their side) —
+    // fall through to create a fresh one below instead of trying to
+    // update/reactivate an id that doesn't exist.
+    const staleInIndex = index ? !index.byId.has(cleanId) : false;
+    if (!staleInIndex) {
+      try {
+        const current = index ? index.byId.get(cleanId) : await giftcard.getCustomerById(applicant.season_id, applicant.provider_account_id);
+        const shared = db.prepare('SELECT 1 FROM applicants WHERE provider_account_id = ? AND id != ?').get(applicant.provider_account_id, applicant.id);
+        if (shared) await giftcard.reactivateCustomer(applicant.season_id, applicant.provider_account_id, current?.external_id || applicant.external_id);
+        else await giftcard.updateCustomer(applicant.season_id, applicant.provider_account_id, { ...opts, isActive: true, externalId: current?.external_id || applicant.external_id });
+        return { accountId: cleanProviderId(applicant.provider_account_id), created: false, linked: !!shared };
+      } catch (e) {
+        // 404 = the stored id is stale (deleted on their side) — fall through
+        // and create a fresh one. Anything else is a real failure.
+        if (e.status !== 404) return { accountId: applicant.provider_account_id, error: e.message };
+      }
     }
   }
   try {
-    const result = await giftcard.upsertAccountForApproval(applicant.season_id, opts);
+    const existingHint = index ? (opts.externalId ? (index.byExt.get(String(opts.externalId)) || null) : null) : undefined;
+    const result = await giftcard.upsertAccountForApproval(applicant.season_id, opts, existingHint);
     if (!result.accountId) { scheduleProviderEnforceSoon(orgId, `no account id for applicant ${applicant.id}`); return { error: 'disccardpromos returned no account id' }; }
     db.prepare('UPDATE applicants SET provider_account_id = ? WHERE id = ?').run(result.accountId, applicant.id);
     // Every other member of the group without an account links to this one
     // (a member that already holds a DIFFERENT real account is left alone —
     // reconcileAccountsForGroup reports those as conflicts, never clobbers).
     db.prepare(`UPDATE applicants SET provider_account_id = ? WHERE merge_group_id = ? AND id != ? AND provider_account_id IS NULL`).run(result.accountId, applicant.merge_group_id || applicant.id, applicant.id);
+    // Keep a passed-in batch index in sync with what this call just created
+    // — the only way a LATER applicant in the same batch could otherwise
+    // miss it is two unrelated (non-merged) rows sharing one external_id,
+    // but this is free insurance against that regardless.
+    if (index && result.created) {
+      const id = cleanProviderId(result.accountId);
+      const stub = { id, external_id: opts.externalId, is_active: true };
+      index.byId.set(id, stub);
+      if (opts.externalId) index.byExt.set(String(opts.externalId), stub);
+    }
     return { accountId: result.accountId, created: !!result.created };
   } catch (e) {
     // Best-effort at approval time, but the enforcer re-runs shortly and
@@ -176,6 +205,28 @@ async function ensureProviderAccount(orgId, applicant) {
     scheduleProviderEnforceSoon(orgId, `account write failed for applicant ${applicant.id}`);
     return { error: e.message };
   }
+}
+
+// One giftcard.buildCustomerIndex() pull per distinct season, cached for the
+// lifetime of the caller's request/job — used by every bulk caller of
+// ensureProviderAccount (mass-approve, retry-provider-sync) so a batch that's
+// all one season (the overwhelmingly common case — mass actions run off an
+// already season-filtered list) makes exactly ONE List Customers call for
+// the whole batch instead of one lookup per applicant. Falls back to null
+// (ensureProviderAccount's per-record live-lookup path) if the pull itself
+// fails, so a disccardpromos hiccup degrades to the slower-but-correct old
+// behavior instead of failing the whole batch.
+function providerIndexCache() {
+  const cache = new Map();
+  return async (seasonId) => {
+    if (!cache.has(seasonId)) {
+      cache.set(seasonId, giftcard.isMockMode(seasonId) ? Promise.resolve(null) : giftcard.buildCustomerIndex(seasonId).catch(e => {
+        console.error(`[giftcard] couldn't pull the customer list up front for this batch (season ${seasonId}) — falling back to a per-applicant lookup:`, e.message);
+        return null;
+      }));
+    }
+    return cache.get(seasonId);
+  };
 }
 
 // Season setting "require_shul_contribution": before an applicant can be
@@ -809,7 +860,7 @@ async function runProviderEnforce(orgId, seasonId, job) {
         seenAccounts.add(cust._id);
         setCheck.run('active', now, a.id);
       } else {
-        const r = await ensureProviderAccount(orgId, a);
+        const r = await ensureProviderAccount(orgId, a, { byId, byExt });
         if (!r.accountId) { unfixable.push({ id: a.id, name: describe(a), reason: r.error || 'disccardpromos returned no account id' }); setCheck.run('error', now, a.id); continue; }
         if (r.error) notes.push(`${describe(a)}: ${r.error}`);
         const id = cleanProviderId(r.accountId);
@@ -998,6 +1049,14 @@ router.post('/retry-provider-sync', requireAdmin, async (req, res) => {
   const seasonId = req.body?.season_id || getActiveSeasonId(req.user.org_id);
   const rows = db.prepare(`SELECT * FROM applicants WHERE org_id = ? AND season_id = ? AND approval_status = 'approved' AND provider_exempt = 0 AND provider_account_id IS NULL`).all(req.user.org_id, seasonId);
   const discountId = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'disccardpromos_discount_id'`).get(req.user.org_id)?.value;
+  // Every row here starts with no account at all (query above), so this is
+  // ONE List Customers pull for the whole batch instead of every single
+  // applicant triggering its own by-external-id lookup inside
+  // upsertAccountForApproval — see ensureProviderAccount's `index` param.
+  const index = giftcard.isMockMode(seasonId) ? null : await giftcard.buildCustomerIndex(seasonId).catch(e => {
+    console.error('[giftcard] retry-provider-sync: could not pull the customer list up front, falling back to per-applicant lookups:', e.message);
+    return null;
+  });
   let created = 0, linkedExisting = 0, linkedSecondaries = 0, failed = 0, fundsLoaded = 0;
   const failureDetails = [], notes = [];
   for (const applicant of rows) {
@@ -1008,7 +1067,7 @@ router.post('/retry-provider-sync', requireAdmin, async (req, res) => {
     const fresh = db.prepare('SELECT * FROM applicants WHERE id = ?').get(applicant.id);
     if (fresh.provider_account_id) { linkedSecondaries++; continue; }
     {
-      const result = await ensureProviderAccount(req.user.org_id, fresh);
+      const result = await ensureProviderAccount(req.user.org_id, fresh, index);
       if (result.error && !result.accountId) { failed++; failureDetails.push(`${name}: ${result.error}`); continue; }
       if (result.error) notes.push(`${name}: ${result.error}`);
       db.prepare(`UPDATE applicants SET provider_check_status = 'active', provider_check_at = datetime('now') WHERE id = ?`).run(applicant.id);
@@ -1852,6 +1911,7 @@ router.post('/mass-approve', requirePermission('applicants', 'can_edit'), async 
   const { ids, card_amount } = req.body || {};
   if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids array required' });
   const discountId = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'disccardpromos_discount_id'`).get(req.user.org_id)?.value;
+  const getProviderIndex = providerIndexCache();
   let approved = 0, skipped = 0, capReached = false, providerErrors = 0, contributionBlocked = 0, zeroAmountSkipped = 0;
   const affectedIds = [], names = [], updatedDiffs = [];
   // Unlike the single /:id/approve route (which returns providerFundsError
@@ -1889,7 +1949,8 @@ router.post('/mass-approve', requirePermission('applicants', 'can_edit'), async 
     if (applicant.shul_id && !applicant.provider_exempt) {
       // See ensureProviderAccount — a member linked to its group's existing
       // shared account (accountOk stays false) never loads funds here.
-      const account = await ensureProviderAccount(req.user.org_id, applicant);
+      const index = await getProviderIndex(applicant.season_id);
+      const account = await ensureProviderAccount(req.user.org_id, applicant, index);
       let accountOk = !!account.accountId && !account.error && !account.linked;
       if (account.error) {
         providerErrors++;

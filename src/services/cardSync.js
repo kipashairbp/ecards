@@ -68,6 +68,14 @@ export async function lockApplicantCards(orgId, applicant) {
   }
 }
 
+// disccardpromos' documented List Customers response already includes both
+// active_cards (masked numbers) and packages (with amount/rate) on every
+// customer by default — confirmed against their own docs — so an `index`
+// from ONE giftcard.buildCustomerIndex() pull covering the whole sweep has
+// everything this function needs; no per-applicant GET required at all when
+// it's provided. See syncAllCards below, which is the only real caller.
+const cleanProviderId = id => String(id).replace(/\.0$/, '');
+
 // Reconciles a customer's actual active_cards (from disccardpromos' real,
 // confirmed Customer API) against our local cards table in both directions:
 //  - discovers cards activated directly on disccardpromos' own dashboard,
@@ -79,14 +87,30 @@ export async function lockApplicantCards(orgId, applicant) {
 // Matches by masked number: disccardpromos has no stable per-card id at all
 // (confirmed — see giftcard.js's linkCardToCustomer), so masked number is
 // the only thing both sides agree on. Returns { discovered, removed } counts.
-export async function syncApplicantCards(orgId, applicant) {
+//
+// index (optional): a { byId, byExt } map from ONE giftcard.buildCustomerIndex()
+// pull, passed by syncAllCards below covering every applicant in that whole
+// sweep — read off it instead of this function doing its own GET. This used
+// to mean one disccardpromos request PER APPLICANT with a provider account,
+// every single 15-minute sweep, all day, regardless of whether anything
+// actually needed discovering — the list pull's active_cards/packages fields
+// (present on every customer per disccardpromos' own docs, no extra query
+// param needed) cover exactly what this function reads. Omit index for a
+// single-record caller — none currently exist — which falls back to the
+// same live per-id lookup this always used.
+export async function syncApplicantCards(orgId, applicant, index) {
   if (!applicant.provider_account_id || applicant.provider_exempt) return { discovered: 0, removed: 0 };
   let customer;
-  try {
-    customer = await giftcard.getCustomerByExternalId(applicant.season_id, applicant.external_id, { balances: true });
-  } catch (e) {
-    console.error('[cardSync] failed to fetch customer for card discovery, applicant', applicant.id, ':', e.message);
-    return { discovered: 0, removed: 0 };
+  if (index) {
+    const cleanId = cleanProviderId(applicant.provider_account_id);
+    customer = index.byId.get(cleanId) || (applicant.external_id ? index.byExt.get(String(applicant.external_id)) : null) || null;
+  } else {
+    try {
+      customer = await giftcard.getCustomerByExternalId(applicant.season_id, applicant.external_id, { balances: true });
+    } catch (e) {
+      console.error('[cardSync] failed to fetch customer for card discovery, applicant', applicant.id, ':', e.message);
+      return { discovered: 0, removed: 0 };
+    }
   }
   if (!customer) return { discovered: 0, removed: 0 };
   const remoteMasked = new Set(Array.isArray(customer.active_cards) ? customer.active_cards : []);
@@ -130,10 +154,26 @@ export async function syncAllCards(orgId) {
     catch (e) { console.error('[cardSync] failed for card', card.id, e.message); }
   }
   const applicants = db.prepare(`SELECT * FROM applicants WHERE org_id = ? AND provider_account_id IS NOT NULL AND provider_exempt = 0`).all(orgId);
+  // One List Customers pull per distinct season represented here (cached —
+  // almost always just the one active season in practice), instead of
+  // syncApplicantCards doing its own GET for every single applicant on
+  // every 15-minute sweep. Falls back to null (syncApplicantCards' own
+  // per-applicant lookup) if the pull itself fails.
+  const indexBySeason = new Map();
+  const getIndex = async (seasonId) => {
+    if (!indexBySeason.has(seasonId)) {
+      indexBySeason.set(seasonId, giftcard.isMockMode(seasonId) ? null : giftcard.buildCustomerIndex(seasonId).catch(e => {
+        console.error(`[cardSync] could not pull the customer list up front for season ${seasonId}, falling back to per-applicant lookups:`, e.message);
+        return null;
+      }));
+    }
+    return indexBySeason.get(seasonId);
+  };
   let cardsDiscovered = 0, cardsRemoved = 0;
   for (const applicant of applicants) {
     try {
-      const { discovered, removed } = await syncApplicantCards(orgId, applicant);
+      const index = await getIndex(applicant.season_id);
+      const { discovered, removed } = await syncApplicantCards(orgId, applicant, index);
       cardsDiscovered += discovered; cardsRemoved += removed;
     } catch (e) { console.error('[cardSync] card discovery failed for applicant', applicant.id, e.message); }
   }
