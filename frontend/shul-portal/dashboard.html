@@ -311,9 +311,23 @@ function openApplicantReadOnly(a) {
     <p><strong>Comments</strong><br>${esc(a.comments||'')||'<span class="small-muted">None</span>'}</p>
     ${'card_amount' in a ? `<div class="divider"></div><p><strong>Card Amount</strong><br>${a.card_amount!=null?fmtMoney(a.card_amount):'Not yet set'}</p>` : ''}
     ${a.requiresShulContribution && !a._merged_readonly ? `<div class="divider"></div><p><strong>Amount Your Shul Gave This Family</strong><br>${a.shul_contribution_amount!=null?fmtMoney(a.shul_contribution_amount):'Not entered'}</p>` : ''}
-    <p class="small-muted">${a.approval_status === 'rejected' ? 'This applicant was rejected; contact your admin for details.' : a._merged_readonly ? 'This applicant is shared with another shul and is locked; contact your admin for changes.' : 'This applicant has been approved and is locked; contact your admin for changes.'}</p>
+    <p class="small-muted">${a.approval_status === 'rejected' ? 'This applicant was rejected; contact your admin for details.' : a._merged_readonly ? 'Account locked, please contact the admin.' : 'This applicant has been approved and is locked; contact your admin for changes.'}</p>
+    ${a._merged_readonly ? `<button class="btn btn-outline btn-sm" id="btn-contact-admin" onclick="contactAdminAboutApplicant('${a.id}')">Contact Admin</button>` : ''}
   `, '');
 }
+window.contactAdminAboutApplicant = async (id) => {
+  const btn = qs('#btn-contact-admin');
+  if (btn?.disabled) return;
+  if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
+  try {
+    const r = await api(`/applicants/${id}/contact-admin`, { method: 'POST' });
+    if (btn) { btn.textContent = 'Sent'; }
+    toast(r.emailError ? `Request logged, but the email failed: ${r.emailError}` : 'Sent — the admin has been emailed a link to this record.', !!r.emailError);
+  } catch (err) {
+    toast(err.message, true);
+    if (btn) { btn.disabled = false; btn.textContent = 'Contact Admin'; }
+  }
+};
 window.askRejectionReason = async (id) => {
   const btn = qs('#btn-ask-reason');
   if (btn?.disabled) return;
@@ -366,7 +380,11 @@ window.saveApplicantEdit = async (id) => {
     body.shul_contribution_amount = qs('#e-shul-contrib-amount').value === '' ? null : +qs('#e-shul-contrib-amount').value;
     body.shul_contribution_confirmed = qs('#e-shul-contrib-confirmed').checked;
   }
-  try { await api(`/applicants/${id}`, { method: 'PUT', body }); toast('Saved'); closeModal(); load(); } catch (err) { toast(err.message, true); }
+  try {
+    const r = await api(`/applicants/${id}`, { method: 'PUT', body });
+    toast(r.providerPushError || r.providerFundsError ? 'Saved, but there was a problem syncing this update — please contact the admin.' : 'Saved');
+    closeModal(); load();
+  } catch (err) { toast(err.message, true); }
 };
 // Detaches the applicant from this shul rather than truly deleting the
 // record (see routes/applicants.js's POST /:id/soft-reject) — if they were

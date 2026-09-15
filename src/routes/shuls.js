@@ -677,27 +677,20 @@ router.put('/:id', (req, res) => {
   // edit here otherwise had zero effect on an already-issued login, so
   // "removing" a shul's email in this form never actually revoked access:
   // the old login kept working with the old address indefinitely (same bug
-  // as stores.js's PUT /:id, fixed there identically). Unlike stores, a
-  // shul CAN reach this route on their own record (isSelf) — revoking here
-  // would immediately kill the session of the very person mid-edit of their
-  // own profile, which is a confusing self-lockout, not a security fix. So
-  // self-edits sync the login's email to match instead (same account, same
-  // session, just re-pointed to the address they just typed as themselves,
-  // already authenticated); only an admin editing someone else's shul
-  // revokes on mismatch, the same as the store fix.
+  // as stores.js's PUT /:id, fixed there identically). Confirmed 2026-09-15:
+  // an admin's edit here should sync the login too, same as a shul's own
+  // self-edit already did — not revoke it — so notification emails
+  // (invite/welcome/reminders, all sent to users.email) actually reach the
+  // corrected address right away instead of requiring a manual re-invite.
+  // Only a genuinely unusable new value still revokes instead of syncing:
+  // users.email is NOT NULL/UNIQUE, so a blanked email or one that collides
+  // with another account can't be synced to either way.
   if (sets.includes('gabai_email') && updated.portal_user_id) {
     const portalUser = db.prepare('SELECT * FROM users WHERE id = ?').get(updated.portal_user_id);
     const newEmail = normalizeEmail(updated.gabai_email);
     if (portalUser && portalUser.is_active && normalizeEmail(portalUser.email) !== newEmail) {
-      // Sync only for a self-edit to a real, non-colliding address — the
-      // login stays the same account/session, just re-pointed. Everything
-      // else (an admin's edit, a blanked email, or one that collides with
-      // another account) revokes instead: users.email is NOT NULL/UNIQUE so
-      // a blank or colliding value can't be synced to anyway, and an
-      // admin's edit is exactly the "cut off the old address" case this
-      // whole fix exists for.
       const clash = newEmail ? db.prepare('SELECT id FROM users WHERE email = ? COLLATE NOCASE AND id != ?').get(newEmail, portalUser.id) : null;
-      if (isSelf && newEmail && !clash) {
+      if (newEmail && !clash) {
         db.prepare('UPDATE users SET email = ? WHERE id = ?').run(newEmail, portalUser.id);
       } else {
         db.prepare('UPDATE users SET is_active = 0, token_version = token_version + 1 WHERE id = ?').run(portalUser.id);

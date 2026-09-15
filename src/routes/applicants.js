@@ -1478,12 +1478,21 @@ router.put('/:id', requirePermission('applicants', 'can_edit'), async (req, res)
   // approval — only meaningful once a customer already exists there
   // (provider_account_id is set the first time they're approved); nothing
   // to push to before that. Best-effort, same as every other provider
-  // write: a disccardpromos hiccup never blocks the save that triggered it.
+  // write: a disccardpromos hiccup never blocks the save that triggered it
+  // — but it used to be swallowed into console.error only, with nothing in
+  // the response at all, so a save could report "Saved" while the actual
+  // disccardpromos side quietly never got the memo (a bad/expired
+  // discountId, a live API hiccup, whatever) and nobody had any way to
+  // know short of separately checking disccardpromos' own dashboard.
+  // Surfaced now the same way providerAccountError/providerFundsError
+  // already are on the approve routes.
+  let providerPushError = null, providerFundsError = null;
   if (sets.length && updated.provider_account_id && !updated.provider_exempt) {
     try {
       const shul = updated.shul_id ? db.prepare('SELECT name_en FROM shuls WHERE id = ?').get(updated.shul_id) : null;
       await giftcard.updateCustomer(updated.season_id, updated.provider_account_id, buildProviderOpts(req.user.org_id, updated, shul?.name_en || 'Unknown'));
     } catch (e) {
+      providerPushError = e.message;
       console.error('[giftcard] failed to push applicant update to disccardpromos:', e.message);
     }
     // card_amount is one of the admin-only EDITABLE_FIELDS above — editing
@@ -1498,13 +1507,17 @@ router.put('/:id', requirePermission('applicants', 'can_edit'), async (req, res)
       const discountId = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'disccardpromos_discount_id'`).get(req.user.org_id)?.value;
       if (discountId) {
         try { await giftcard.addFunds(updated.season_id, { customerId: updated.provider_account_id, externalId: updated.external_id, discountId, amount: updated.card_amount }); }
-        catch (e) { console.error('[giftcard] failed to rewrite the balance after a card_amount edit:', e.message); }
+        catch (e) {
+          providerFundsError = e.message;
+          console.error('[giftcard] failed to rewrite the balance after a card_amount edit:', e.message);
+        }
       } else {
+        providerFundsError = 'No disccardpromos Package/Discount ID configured (Settings > Organization > Gift Card Loading) — the new card amount was not sent.';
         console.error(`[giftcard] card_amount was edited for applicant ${updated.id} but no disccardpromos Package/Discount ID is configured — balance was not corrected`);
       }
     }
   }
-  res.json({ applicant: maskForShul(updated, req.user.role, req.user.org_id) });
+  res.json({ applicant: maskForShul(updated, req.user.role, req.user.org_id), providerPushError, providerFundsError });
 });
 
 // Turns a carried-forward applicant (approval_status='incomplete' — see
@@ -2412,16 +2425,23 @@ router.get('/duplicates/:flagId/group', requireAdmin, (req, res) => {
 // (mixed and matched across members) written onto that primary only — every
 // other member's own row is left untouched, so each shul keeps seeing
 // exactly what it itself submitted.
-router.post('/duplicates/:flagId/merge', requirePermission('applicants', 'can_edit'), (req, res) => {
+router.post('/duplicates/:flagId/merge', requirePermission('applicants', 'can_edit'), async (req, res) => {
   const flag = db.prepare(`SELECT * FROM duplicate_flags WHERE id = ? AND org_id = ? AND entity_type='applicant'`).get(req.params.flagId, req.user.org_id);
   if (!flag) return res.status(404).json({ error: 'Not found' });
-  const { primaryId, values, memberIds } = req.body || {};
+  const { primaryId, values, memberIds, accountConflictResolution } = req.body || {};
   try {
-    const result = mergeApplicants(req.user.org_id, req.user.id, { primaryId, values, memberIds });
+    const result = await mergeApplicants(req.user.org_id, req.user.id, { primaryId, values, memberIds, accountConflictResolution });
     const { undoSnapshot, ...after } = result;
     logAudit(req.user.org_id, req.user.id, 'merge', 'applicant', primaryId, undoSnapshot, after, req.ip);
     res.json(result);
-  } catch (e) { res.status(400).json({ error: e.message }); }
+  } catch (e) {
+    // ACCOUNT_CONFLICT isn't a real failure — it's mergeApplicants pausing
+    // to ask which real disccardpromos account to keep before it touches
+    // anything (see that function's comment). Distinct status so the UI
+    // can tell "this needs a choice" apart from "this actually failed".
+    if (e.code === 'ACCOUNT_CONFLICT') return res.status(409).json({ accountConflict: true, conflicts: e.conflicts });
+    res.status(400).json({ error: e.message });
+  }
 });
 
 // ============================= Rejection Appeals =============================

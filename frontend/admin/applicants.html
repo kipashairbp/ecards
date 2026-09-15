@@ -700,7 +700,15 @@ window.saveApplicant = async (id) => {
   // sends whatever's selected (unchanged or newly picked).
   const shulId = qs('#e-shul_id').value;
   if (shulId) body.shul_id = shulId;
-  try { await api(`/applicants/${id}`, { method: 'PUT', body }); toast('Saved'); closeModal(); load(); } catch (err) { toast(err.message, true); }
+  try {
+    const r = await api(`/applicants/${id}`, { method: 'PUT', body });
+    if (r.providerPushError || r.providerFundsError) {
+      toast(`Saved here, but disccardpromos rejected it: ${r.providerPushError || r.providerFundsError}`, true);
+    } else {
+      toast('Saved');
+    }
+    closeModal(); load();
+  } catch (err) { toast(err.message, true); }
 };
 window.approveApplicant = async (id) => {
   try {
@@ -1135,40 +1143,71 @@ window.bypassPair = async (flagId) => {
     await refreshMergeGroupAndContinue();
   } catch (err) { toast(err.message, true); }
 };
-window.submitPairMerge = async (flagId) => {
-  const primaryId = qs('input[name="merge-primary"]:checked')?.value;
-  if (!primaryId) return toast('Pick a primary record', true);
-  const values = {};
-  for (const [key] of APPLICANT_MERGE_FIELDS) {
-    const el = qs(`input[name="mf-${key}"]:checked`);
-    if (el) values[key] = key === 'num_children' || key === 'card_amount' ? (el.value === '' ? null : +el.value)
-      : key === 'home_for_yomtov' ? (el.value === '1' || el.value === 'true' ? 1 : 0)
-      : el.value;
+// presetArgs (primaryId/values/memberIds), when passed, is a retry after an
+// ACCOUNT_CONFLICT was just resolved — the original Compare & Merge modal
+// is already gone by then, so the retry reuses the exact choices captured
+// the first time around rather than trying to re-read a form that no
+// longer exists.
+window.submitPairMerge = async (flagId, accountConflictResolution, presetArgs) => {
+  let primaryId, values, memberIds;
+  if (presetArgs) {
+    ({ primaryId, values, memberIds } = presetArgs);
+  } else {
+    primaryId = qs('input[name="merge-primary"]:checked')?.value;
+    if (!primaryId) return toast('Pick a primary record', true);
+    values = {};
+    for (const [key] of APPLICANT_MERGE_FIELDS) {
+      const el = qs(`input[name="mf-${key}"]:checked`);
+      if (el) values[key] = key === 'num_children' || key === 'card_amount' ? (el.value === '' ? null : +el.value)
+        : key === 'home_for_yomtov' ? (el.value === '1' || el.value === 'true' ? 1 : 0)
+        : el.value;
+    }
+    memberIds = mergePairSelection;
   }
   try {
-    const result = await api(`/applicants/duplicates/${flagId}/merge`, { method: 'POST', body: { primaryId, values, memberIds: mergePairSelection } });
+    await api(`/applicants/duplicates/${flagId}/merge`, { method: 'POST', body: { primaryId, values, memberIds, accountConflictResolution } });
     toast('Merged');
-    // The record(s) just folded away are hard-deleted for real (see
-    // mergeApplicants) — if one of them already had its OWN real
-    // disccardpromos account (independently approved before the duplicate
-    // was ever caught), that account is never touched here: automatically
-    // combining two real, possibly-funded accounts is exactly the kind of
-    // silent financial move this app avoids everywhere else. It's left
-    // alone as a conflict instead — which otherwise means it just quietly
-    // goes inactive on the next reconciliation sweep ("held by nobody
-    // approved") with nobody ever told a second, real, no-longer-linked
-    // account is sitting there. Surface it immediately instead of letting
-    // it only ever show up buried in that merge's own Recent Actions entry.
-    if (result?.accountConflicts?.length) {
-      const body = `<p>This merge kept one applicant's disccardpromos account and could not automatically combine it with another real account already on file for the record(s) just merged away — merging two live accounts risks double-crediting, so nothing was moved automatically.</p>
-        <ul style="margin:10px 0 0;padding-left:18px;font-size:13px">
-          ${result.accountConflicts.map(c => `<li><strong>Kept:</strong> ${esc(c.primaryName)} — account ${esc(c.primaryAccountId)}<br><strong>Now orphaned:</strong> ${esc(c.secondaryName)} — account ${esc(c.secondaryAccountId)} (will show inactive after the next disccardpromos match run — check its balance on disccardpromos and reconcile manually, e.g. transfer any remaining funds onto the kept account)</li>`).join('')}
-        </ul>`;
-      openModal('Merge left an account to reconcile manually', body, `<button class="btn btn-primary btn-sm" onclick="closeModal()">Got it</button>`);
-    }
     await refreshMergeGroupAndContinue();
-  } catch (err) { toast(err.message, true); }
+  } catch (err) {
+    // Every disccardpromos account must always be assigned to a record
+    // here, linked to a shul — an account this merge would otherwise
+    // orphan (the record that held it is about to be hard-deleted) has to
+    // be resolved before the merge is allowed to touch anything, not
+    // reported after the fact. See routes/applicants.js's merge route and
+    // mergeApplicants' ACCOUNT_CONFLICT.
+    if (err.data?.accountConflict) return openAccountConflictModal(flagId, err.data.conflicts, { primaryId, values, memberIds });
+    toast(err.message, true);
+  }
 };
+// One radio choice per conflicting account — "Combine balances" (adds the
+// orphaned account's real current balance onto the kept one, then closes
+// it) or "Close without transferring" (discards whatever's on it). Submits
+// the SAME merge again with those choices, which is what actually lets it
+// proceed past ACCOUNT_CONFLICT this time.
+function openAccountConflictModal(flagId, conflicts, mergeArgs) {
+  const fmt = v => v == null ? 'unknown (could not read live)' : `$${Number(v).toFixed(2)}`;
+  const body = `
+    <p>Merging would leave a second, real disccardpromos account behind with nothing here pointing at it anymore. Choose what to do with each one before this merge can continue — nothing has been changed yet.</p>
+    ${conflicts.map((c, i) => `
+      <div class="divider"></div>
+      <p><strong>Keeping:</strong> ${esc(c.primaryName)} — account ${esc(c.primaryAccountId)} (currently ${fmt(c.primaryBalance)})<br>
+      <strong>Would be orphaned:</strong> ${esc(c.secondaryName)} — account ${esc(c.secondaryAccountId)} (currently ${fmt(c.secondaryBalance)})</p>
+      <label><input type="radio" name="acr-${i}" value="transfer" checked> Combine balances — add ${fmt(c.secondaryBalance)} onto the kept account, then close this one</label><br>
+      <label><input type="radio" name="acr-${i}" value="delete"> Just close it — the ${fmt(c.secondaryBalance)} on it is not moved</label>
+    `).join('')}
+  `;
+  const footer = `
+    <button class="btn btn-outline btn-sm" onclick="closeModal()">Cancel — don't merge yet</button>
+    <button class="btn btn-primary btn-sm" id="btn-confirm-account-conflict">Confirm &amp; Merge</button>
+  `;
+  openModal('Choose what happens to the other account', body, footer);
+  qs('#btn-confirm-account-conflict').addEventListener('click', () => {
+    const resolution = {};
+    conflicts.forEach((c, i) => { resolution[c.secondaryAccountId] = qs(`input[name="acr-${i}"]:checked`).value; });
+    closeModal();
+    submitPairMerge(flagId, resolution, mergeArgs);
+  });
+}
 
 // Deliberately no load() in this initial-resolution .then() (only in the
 // onChange callback above, fired later by an actual reorder) — the season

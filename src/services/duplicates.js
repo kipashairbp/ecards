@@ -1,5 +1,7 @@
 import { db, uuid } from '../db.js';
 import { captureApplicantSnapshot, hardDeleteApplicant, restoreApplicantSnapshot } from '../utils/entityDelete.js';
+import { scheduleProviderEnforceSoon } from './providerEnforce.js';
+import * as giftcard from './giftcard.js';
 
 const norm = (s) => (s || '').toString().trim().toLowerCase().replace(/[^a-z0-9]/g, '');
 
@@ -184,7 +186,18 @@ export function unpauseIfNoLongerFlagged(entityType, ids) {
       db.prepare(`UPDATE shuls SET is_paused = 0, duplicate_status = NULL, duplicate_of_shul_id = NULL WHERE id = ?`).run(id);
       db.prepare(`UPDATE users SET is_paused = 0 WHERE shul_id = ?`).run(id);
     } else {
+      // Being paused never actually locked the real disccardpromos money —
+      // pauseAccountsFor only ever touched local `cards.status` — but it
+      // could have interrupted an approval that was mid-flight (account
+      // created, funds not yet loaded) or left an already-approved
+      // applicant's committed card_amount silently ahead of their real
+      // balance the whole time it sat paused. Unpausing alone never fixed
+      // that on its own; scheduling the enforcer here means it actually
+      // gets checked and topped up shortly (see runProviderEnforce's
+      // balance top-up), same as approval's own failure-retry path.
+      const row = db.prepare('SELECT org_id FROM applicants WHERE id = ?').get(id);
       db.prepare(`UPDATE applicants SET is_paused = 0, duplicate_status = NULL, duplicate_of_applicant_id = NULL WHERE id = ?`).run(id);
+      if (row) scheduleProviderEnforceSoon(row.org_id, 'duplicate partner unpaused');
     }
   }
 }
@@ -216,6 +229,7 @@ export function recheckAllApplicantDuplicates(orgId, seasonId) {
   for (const f of spurious) {
     db.prepare(`UPDATE duplicate_flags SET status = 'resolved', resolved_at = datetime('now') WHERE id = ?`).run(f.id);
     db.prepare(`UPDATE applicants SET is_paused = 0, duplicate_status = NULL, duplicate_of_applicant_id = NULL WHERE id = ?`).run(f.entity_id);
+    scheduleProviderEnforceSoon(orgId, 'spurious duplicate flag cleared');
     const stillFlagged = db.prepare(`SELECT 1 FROM duplicate_flags WHERE status = 'open' AND (entity_id = ? OR matched_entity_id = ?)`).get(f.matched_entity_id, f.matched_entity_id);
     if (!stillFlagged) db.prepare(`UPDATE applicants SET is_paused = 0, duplicate_status = NULL, duplicate_of_applicant_id = NULL WHERE id = ?`).run(f.matched_entity_id);
     cleared++;
@@ -235,6 +249,7 @@ export function recheckAllApplicantDuplicates(orgId, seasonId) {
   let unpaused = 0;
   for (const a of orphanPaused) {
     db.prepare(`UPDATE applicants SET is_paused = 0, duplicate_status = NULL, duplicate_of_applicant_id = NULL WHERE id = ?`).run(a.id);
+    scheduleProviderEnforceSoon(orgId, 'orphan-paused applicant unpaused');
     unpaused++;
   }
 
@@ -317,6 +332,12 @@ export function resolveFlag(flagId, resolvedByUserId, action) {
     if (entityA && entityB && applicantsSharePhone(entityA, entityB)) throw new Error('These records share a phone number, so they can\'t be bypassed as different people — resolve this as a merge instead.');
     db.prepare(`UPDATE duplicate_flags SET status = 'bypassed', resolved_by = ?, resolved_at = datetime('now') WHERE id = ?`).run(resolvedByUserId, flagId);
     db.prepare('UPDATE applicants SET is_paused = 0, duplicate_status = ? WHERE id IN (?, ?)').run('bypassed', flag.entity_id, flag.matched_entity_id);
+    // Either side may have been sitting paused mid-approval (account
+    // created, funds never loaded) or already-approved with its card_amount
+    // ahead of its real balance the whole time — see unpauseIfNoLongerFlagged's
+    // comment. Bypassing is exactly the same "now definitely not paused
+    // anymore" moment, so it gets the same check.
+    scheduleProviderEnforceSoon(flag.org_id, 'duplicate flag bypassed');
     return { flag: db.prepare('SELECT * FROM duplicate_flags WHERE id = ?').get(flagId), undoSnapshot };
   }
   db.prepare(`UPDATE duplicate_flags SET status = ?, resolved_by = ?, resolved_at = datetime('now') WHERE id = ?`)
@@ -431,7 +452,7 @@ function restoreRepointedMessages(repointed) {
   }
 }
 
-export function mergeApplicants(orgId, userId, { primaryId, values, memberIds } = {}) {
+export async function mergeApplicants(orgId, userId, { primaryId, values, memberIds, accountConflictResolution } = {}) {
   if (!primaryId) throw new Error('primaryId is required');
   const fullGroupIds = getMergeGroupIds(orgId, [primaryId]);
   // memberIds lets an admin merge only PART of a larger connected group in
@@ -460,6 +481,45 @@ export function mergeApplicants(orgId, userId, { primaryId, values, memberIds } 
   // merge view disables picking a soft-rejected member as primary for
   // exactly this reason, this is just the backend backstop.
   if (!primary.shul_id) throw new Error('This record has no shul — pick the other record as Primary instead.');
+
+  // Confirmed requirement: every disccardpromos account must always be
+  // assigned to a record in this system, linked to a shul — an orphaned
+  // account (real money possibly still on it) is never an acceptable
+  // outcome of a merge. A conflict here means a losing member already held
+  // its OWN real account, separate from whichever member's account this
+  // merge is about to keep — that losing member's row is about to be
+  // hard-deleted below, which would otherwise leave its account
+  // referenced by nothing at all. Checked BEFORE any write happens (not
+  // after, like this used to) so a conflict can be resolved without the
+  // merge having partially applied already.
+  const holder = primary.provider_account_id ? primary : members.find(m => m.provider_account_id);
+  const conflictMembers = holder ? members.filter(m => m.id !== holder.id && m.provider_account_id && m.provider_account_id !== holder.provider_account_id) : [];
+  const discountId = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'disccardpromos_discount_id'`).get(orgId)?.value;
+  if (conflictMembers.length) {
+    const unresolved = conflictMembers.filter(m => !accountConflictResolution?.[m.provider_account_id]);
+    if (unresolved.length) {
+      // Live balances for the admin to actually see and choose from — this
+      // is the whole point of asking instead of picking silently.
+      // Best-effort: a balance that can't be read comes back null rather
+      // than blocking the choice entirely (disccardpromos being briefly
+      // unreachable shouldn't make a merge undoable-only-by-support).
+      const readBalance = async (accountId) => {
+        if (!discountId || !accountId) return null;
+        try { return await giftcard.getCustomerPackageAmount(holder.season_id, accountId, discountId); } catch { return null; }
+      };
+      const [primaryBalance, ...secondaryBalances] = await Promise.all([
+        readBalance(holder.provider_account_id),
+        ...unresolved.map(m => readBalance(m.provider_account_id)),
+      ]);
+      const err = new Error("This merge would leave a separate disccardpromos account with nothing here pointing at it — choose what to do with it first.");
+      err.code = 'ACCOUNT_CONFLICT';
+      err.conflicts = unresolved.map((m, i) => ({
+        primaryId: holder.id, primaryName: `${holder.first_name} ${holder.last_name}`.trim(), primaryAccountId: holder.provider_account_id, primaryBalance,
+        secondaryId: m.id, secondaryName: `${m.first_name} ${m.last_name}`.trim(), secondaryAccountId: m.provider_account_id, secondaryBalance: secondaryBalances[i],
+      }));
+      throw err;
+    }
+  }
 
   // Full pre-merge capture — every member's complete row, plus the exact
   // prior state of every flag this merge is about to resolve — so undo can
@@ -494,13 +554,42 @@ export function mergeApplicants(orgId, userId, { primaryId, values, memberIds } 
     const fp = flagIds.map(() => '?').join(',');
     db.prepare(`UPDATE duplicate_flags SET status='resolved', resolved_by=?, resolved_at=datetime('now') WHERE id IN (${fp})`).run(userId, ...flagIds);
   }
-  // A member that already carries its own disccardpromos account (from
-  // before it was ever recognized as a duplicate) is never touched here —
-  // see reconcileAccountsForGroup below for why that's deliberate. Runs
-  // while every member row still exists, so it can find and adopt a loser's
-  // already-real account onto the primary before those rows are folded away
-  // below.
-  const accountConflicts = reconcileAccountsForGroup(primaryId);
+  // Every member without their own account links to whichever one this
+  // merge is keeping — safe unconditionally, nothing to resolve.
+  if (holder) {
+    for (const m of members) {
+      if (m.id === holder.id || m.provider_account_id) continue;
+      db.prepare('UPDATE applicants SET provider_account_id = ? WHERE id = ?').run(holder.provider_account_id, m.id);
+    }
+  }
+  // Every real conflict was already resolved by the admin's explicit choice
+  // (checked before any write above — see accountConflictResolution).
+  // Applying it for real now: "transfer" adds the loser's current balance
+  // onto the kept account first (addFunds SETS the absolute total — see
+  // that function's own comment — so this reads both balances and writes
+  // their sum, never a bare add), then either way the loser's account is
+  // deleted for real on disccardpromos so nothing is ever left assigned to
+  // nothing here. Best-effort: a failure is recorded (surfaced same as any
+  // other provider error) but never blocks the merge itself — Provider
+  // Audit's orphan cleanup still catches it as a fallback.
+  const accountConflictErrors = [];
+  for (const m of conflictMembers) {
+    const action = accountConflictResolution[m.provider_account_id];
+    try {
+      if (action === 'transfer' && discountId) {
+        const [loserBalance, survivorBalance] = await Promise.all([
+          giftcard.getCustomerPackageAmount(holder.season_id, m.provider_account_id, discountId),
+          giftcard.getCustomerPackageAmount(holder.season_id, holder.provider_account_id, discountId),
+        ]);
+        if (loserBalance > 0) {
+          await giftcard.addFunds(holder.season_id, { customerId: holder.provider_account_id, externalId: holder.external_id, discountId, amount: survivorBalance + loserBalance });
+        }
+      }
+      await giftcard.deleteCustomer(holder.season_id, m.provider_account_id);
+    } catch (e) {
+      accountConflictErrors.push(`account ${m.provider_account_id} (${m.first_name} ${m.last_name}): ${e.message}`);
+    }
+  }
 
   // Snapshot every member's ORIGINAL submitted data (membersBefore, captured
   // before any of the updates above ran) into applicant_submissions — one
@@ -576,7 +665,17 @@ export function mergeApplicants(orgId, userId, { primaryId, values, memberIds } 
   undoSnapshot.repointedMessages = repointedMessages;
   undoSnapshot.deletedApplicantSnapshots = deletedApplicantSnapshots;
 
-  return { primaryId, memberIds: groupIds, accountConflicts, undoSnapshot };
+  // The surviving record's card_amount may have just changed (an admin's
+  // `values` override, or simply inheriting whichever member's amount won),
+  // and reconcileAccountsForGroup above only ever LINKS the shared account —
+  // it never checks whether its real disccardpromos balance still matches
+  // what's now committed. Scheduling the enforcer here means that actually
+  // gets verified and topped up shortly (see runProviderEnforce's balance
+  // top-up), the same "best-effort now, the enforcer finishes the job"
+  // pattern every other provider write in this app already follows.
+  scheduleProviderEnforceSoon(orgId, 'applicant merge');
+
+  return { primaryId, memberIds: groupIds, accountConflictErrors, undoSnapshot };
 }
 
 // Restores everything mergeApplicants' undoSnapshot captured: every
