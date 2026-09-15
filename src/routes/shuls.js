@@ -685,14 +685,26 @@ router.put('/:id', (req, res) => {
   // Only a genuinely unusable new value still revokes instead of syncing:
   // users.email is NOT NULL/UNIQUE, so a blanked email or one that collides
   // with another account can't be synced to either way.
+  //
+  // Confirmed 2026-09-15 (second pass): this used to only run when the
+  // portal user was already ACTIVE — a shul invited but not yet logged in
+  // (portal_user_id set, is_active still 0, exactly the state Resend
+  // Welcome exists for) fell through untouched, so correcting a typo'd
+  // email before the shul ever accepted the invite silently kept sending
+  // Resend Welcome to the old, wrong address forever. The sync must apply
+  // regardless of is_active — a pending login has no session to protect
+  // either way, so there's no self-lockout risk to weigh here at all.
   if (sets.includes('gabai_email') && updated.portal_user_id) {
     const portalUser = db.prepare('SELECT * FROM users WHERE id = ?').get(updated.portal_user_id);
     const newEmail = normalizeEmail(updated.gabai_email);
-    if (portalUser && portalUser.is_active && normalizeEmail(portalUser.email) !== newEmail) {
+    if (portalUser && normalizeEmail(portalUser.email) !== newEmail) {
       const clash = newEmail ? db.prepare('SELECT id FROM users WHERE email = ? COLLATE NOCASE AND id != ?').get(newEmail, portalUser.id) : null;
       if (newEmail && !clash) {
         db.prepare('UPDATE users SET email = ? WHERE id = ?').run(newEmail, portalUser.id);
-      } else {
+      } else if (portalUser.is_active) {
+        // Nothing to actually revoke on an already-pending invite (is_active
+        // is already 0) — it just keeps its old address until fixed to
+        // something usable, same as it always has.
         db.prepare('UPDATE users SET is_active = 0, token_version = token_version + 1 WHERE id = ?').run(portalUser.id);
         logAudit(req.user.org_id, req.user.id, 'update', 'user', portalUser.id, { is_active: 1 }, { is_active: 0 }, req.ip);
       }

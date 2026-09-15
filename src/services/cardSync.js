@@ -173,7 +173,26 @@ export async function syncApplicantCards(orgId, applicant, index) {
   const soleCardId = allLocal.length === 1 ? allLocal[0].id : null;
 
   let synced = 0, unattributed = 0;
-  const txns = Array.isArray(customer.transactions) ? customer.transactions : [];
+  // customer.transactions is the best-guess field name for the array
+  // ?transactions=true adds — not yet confirmed against a real response
+  // (this environment can't reach disccardpromos' docs or API directly).
+  // Falls back to checking each package for a nested transactions array,
+  // a plausible alternate shape given amount/balance are already scoped
+  // per package there. If genuinely nothing is found, logs exactly which
+  // top-level (and array-valued) fields the real response DOES carry, so
+  // the actual field name is discoverable straight from server logs the
+  // next time a real sync runs, without needing a live sample handed over
+  // separately.
+  const hasTopLevelArray = Array.isArray(customer.transactions);
+  const packagesWithTxns = (customer.packages || []).filter(p => Array.isArray(p.transactions));
+  const txns = hasTopLevelArray ? customer.transactions : packagesWithTxns.flatMap(p => p.transactions);
+  // Only a genuinely missing/wrong-typed field is worth flagging — an
+  // array that's just empty (a real customer with no spend yet) is not a
+  // mapping bug and would make this fire on almost every sync.
+  if (!hasTopLevelArray && !packagesWithTxns.length) {
+    const arrayKeys = Object.keys(customer).filter(k => Array.isArray(customer[k]) && k !== 'active_cards' && k !== 'packages');
+    console.error(`[cardSync] no transaction history field found on customer ${customer.id ?? customer._id ?? applicant.external_id} even though ?transactions=true was requested — top-level keys on the response: ${Object.keys(customer).join(', ')}.${arrayKeys.length ? ` Other array field(s) present: ${arrayKeys.join(', ')} — one of these is likely the real transaction list; tell Claude the name to fix the mapping.` : ' No array field at all was found on this customer to guess from.'}`);
+  }
   const insert = db.prepare(`INSERT OR IGNORE INTO card_transactions (id, card_id, provider_txn_id, type, amount, balance_after, store_name, store_id, occurred_at, raw_payload)
     VALUES (?,?,?,?,?,?,?,?,?,?)`);
   for (const t of txns) {

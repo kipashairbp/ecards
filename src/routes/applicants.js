@@ -784,6 +784,7 @@ async function runProviderAudit(orgId, seasonId, job) {
   let provider = null;
   if (!listError) {
     const ourIds = new Set(db.prepare(`SELECT DISTINCT provider_account_id FROM applicants WHERE org_id = ? AND provider_account_id IS NOT NULL`).all(orgId).map(r => cleanProviderId(r.provider_account_id)));
+    const orphanDiscountId = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'disccardpromos_discount_id'`).get(orgId)?.value;
     const orphans = [];
     let active = 0, inactive = 0;
     for (const c of list) {
@@ -816,7 +817,8 @@ async function runProviderAudit(orgId, seasonId, job) {
           }
         }
       }
-      orphans.push({ accountId: id, name: `${c.first_name || ''} ${c.last_name || ''}`.trim() || '(no name)', externalId: ext, groupName: c.group_name || null, isActive: c.is_active !== false, origin });
+      const orphanPkg = orphanDiscountId ? (c.packages || []).find(p => String(p.id) === String(orphanDiscountId)) : null;
+      orphans.push({ accountId: id, name: `${c.first_name || ''} ${c.last_name || ''}`.trim() || '(no name)', externalId: ext, groupName: c.group_name || null, isActive: c.is_active !== false, origin, balance: orphanPkg ? Number(orphanPkg.amount) || 0 : null });
     }
     provider = { total: list.length, active, inactive, orphans };
   }
@@ -1122,6 +1124,37 @@ router.post('/provider-audit/deactivate-orphan', requireAdmin, async (req, res) 
   saveProviderAudit(req.user.org_id, seasonId, last);
   logAudit(req.user.org_id, req.user.id, 'mass-deactivate-orphans', 'applicant', null, null,
     { count: 1, names: [`disccardpromos customer ${accountId}${orphan.externalId ? ` (external id ${orphan.externalId})` : ''}${orphan.origin ? ` — ${orphan.origin}` : ''}`] }, req.ip);
+  res.json({ ok: true });
+});
+
+// Permanently removes an orphan for real — confirmed requirement: every
+// disccardpromos account must always be assigned to a record here, linked
+// to a shul, with no exceptions for old data either. Deactivate (above)
+// predates that requirement and only locks an orphan, leaving it sitting
+// there forever; this actually deletes it via disccardpromos' confirmed
+// DELETE endpoint (added 2026-09-15, the same one a merge conflict now
+// uses automatically going forward — see services/duplicates.js). Never
+// auto-transfers a balance first: unlike a live merge conflict, a
+// historical orphan has no known "kept" account to combine it onto by the
+// time an admin gets here — the balance is shown so it can be checked/
+// moved manually on disccardpromos first if it's worth recovering.
+router.post('/provider-audit/delete-orphan', requireAdmin, async (req, res) => {
+  const seasonId = req.body?.season_id || getActiveSeasonId(req.user.org_id);
+  const accountId = req.body?.account_id ? cleanProviderId(req.body.account_id) : null;
+  if (!accountId) return res.status(400).json({ error: 'account_id is required' });
+  const last = loadProviderAudit(req.user.org_id, seasonId);
+  const orphan = last?.provider?.orphans?.find(o => o.accountId === accountId);
+  if (!orphan) return res.status(400).json({ error: 'That account was not reported as an orphan by the last verification — run Verify again first.' });
+  if (db.prepare('SELECT 1 FROM applicants WHERE org_id = ? AND provider_account_id = ?').get(req.user.org_id, accountId)) {
+    return res.status(400).json({ error: 'An applicant here now holds that account — nothing to do.' });
+  }
+  try {
+    await giftcard.deleteCustomer(seasonId, accountId);
+  } catch (e) { return res.status(502).json({ error: e.message }); }
+  last.provider.orphans = last.provider.orphans.filter(o => o.accountId !== accountId);
+  saveProviderAudit(req.user.org_id, seasonId, last);
+  logAudit(req.user.org_id, req.user.id, 'mass-delete-orphans', 'applicant', null, null,
+    { count: 1, names: [`disccardpromos customer ${accountId}${orphan.externalId ? ` (external id ${orphan.externalId})` : ''}${orphan.origin ? ` — ${orphan.origin}` : ''}${orphan.balance ? ` — had a balance of $${orphan.balance}` : ''}`] }, req.ip);
   res.json({ ok: true });
 });
 
@@ -1923,7 +1956,7 @@ router.get('/:id/provider-customer', requireAdmin, async (req, res) => {
   if (!applicant) return res.status(404).json({ error: 'Not found' });
   if (!applicant.external_id) return res.status(400).json({ error: 'This applicant has no external_id yet' });
   try {
-    const customer = await giftcard.getCustomerByExternalId(applicant.season_id, applicant.external_id, { balances: true, suppressNotFound: false });
+    const customer = await giftcard.getCustomerByExternalId(applicant.season_id, applicant.external_id, { balances: true, transactions: true, suppressNotFound: false });
     res.json({ customer, mockMode: giftcard.isMockMode(applicant.season_id) });
   } catch (e) {
     res.status(502).json({ error: e.message, status: e.status, rawText: e.rawText });

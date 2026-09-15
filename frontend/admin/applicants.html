@@ -360,7 +360,7 @@ function showProviderAuditResult(res) {
     </table>
     ${phantom ? `<p class="small-muted" style="margin-top:12px"><strong>${phantom} phantom id(s)</strong> — we count these as accounts, disccardpromos doesn't have them. This is what inflates our number above theirs. Clear them, then Retry Sync re-creates real accounts for any that are approved.</p>${list(res.details.not_found.concat(res.details.mock), d => `<li>${esc(d.names)} — ${esc(d.statuses)} — id ${esc(d.accountId)}</li>`)}` : ''}
     ${o.relinked ? `<p class="small-muted" style="margin-top:12px"><strong>${o.relinked} relinked</strong> — these already existed on disccardpromos; we'd only lost the id. Nothing to re-create.</p>${list(res.details.relinked, d => `<li>${esc(d.names)} — id ${esc(d.accountId)}</li>`)}` : ''}
-    ${p && p.orphans.length ? `<p class="small-muted" style="margin-top:12px"><strong>${p.orphans.length} customer(s) on disccardpromos with no applicant here</strong> — created directly on their dashboard, or from a record deleted here. These count on their side, never on ours. Deactivating locks the card there (reversible on their dashboard); nothing is deleted.</p>${list(p.orphans, c => `<li>${esc(c.name)} — id ${esc(c.accountId)}${c.externalId ? `, external id ${esc(c.externalId)}` : ', no external id'}${c.groupName ? `, group ${esc(c.groupName)}` : ''} — ${c.isActive ? 'active' : 'inactive'}${c.origin ? `<br><span class="small-muted">${esc(c.origin)}</span>` : ''}${c.isActive ? ` <button class="btn btn-outline btn-sm" style="margin-left:6px" onclick="deactivateOrphan('${esc(c.accountId)}')">Deactivate</button>` : ''}</li>`)}` : ''}
+    ${p && p.orphans.length ? `<p class="small-muted" style="margin-top:12px"><strong>${p.orphans.length} customer(s) on disccardpromos with no applicant here</strong> — created directly on their dashboard, from a record deleted here, or left behind by a merge from before this was fixed. These count on their side, never on ours. Deactivate locks it (reversible on their dashboard, nothing removed); Delete removes it for real on disccardpromos — every account should end up assigned to something here, so this is how to actually clear one out rather than leave it sitting inactive forever.</p>${list(p.orphans, c => `<li>${esc(c.name)} — id ${esc(c.accountId)}${c.externalId ? `, external id ${esc(c.externalId)}` : ', no external id'}${c.groupName ? `, group ${esc(c.groupName)}` : ''} — ${c.isActive ? 'active' : 'inactive'}${c.balance != null ? `, balance $${c.balance}` : ''}${c.origin ? `<br><span class="small-muted">${esc(c.origin)}</span>` : ''}${c.isActive ? ` <button class="btn btn-outline btn-sm" style="margin-left:6px" onclick="deactivateOrphan('${esc(c.accountId)}')">Deactivate</button>` : ''} <button class="btn btn-outline btn-sm" style="margin-left:6px;color:#b71c1c;border-color:#b71c1c" onclick="deleteOrphan('${esc(c.accountId)}', ${c.balance ?? 0})">Delete</button></li>`)}` : ''}
     ${o.error ? `<p class="small-muted" style="margin-top:12px;color:var(--danger)">Could not check:</p>${list(res.details.error, d => `<li>${esc(d.names)}: ${esc(d.message || '')}</li>`)}` : ''}
   `;
   // Read-only: anything actionable here is picked up by the automatic match
@@ -429,6 +429,16 @@ async function deactivateOrphan(accountId) {
   try {
     await api('/applicants/provider-audit/deactivate-orphan', { method: 'POST', body: { ...seasonBody(), account_id: accountId } });
     toast(`Customer ${accountId} deactivated on disccardpromos`);
+    showLastProviderAudit();
+  } catch (err) { toast(err.message, true); }
+}
+// Permanently removes it on disccardpromos, unlike Deactivate above — see
+// routes/applicants.js's /provider-audit/delete-orphan.
+async function deleteOrphan(accountId, balance) {
+  if (!confirm(`Permanently delete disccardpromos customer ${accountId}?\n\nNo applicant here holds it.${balance ? ` It currently has a balance of $${balance} — this is NOT moved anywhere first, check/transfer it on disccardpromos yourself before deleting if it's worth recovering.` : ''}\n\nThis cannot be undone.`)) return;
+  try {
+    await api('/applicants/provider-audit/delete-orphan', { method: 'POST', body: { ...seasonBody(), account_id: accountId } });
+    toast(`Customer ${accountId} deleted from disccardpromos`);
     showLastProviderAudit();
   } catch (err) { toast(err.message, true); }
 }
@@ -662,6 +672,7 @@ async function openApplicant(id) {
       </div>`;
     const footer = `
       <button class="btn btn-outline btn-sm" onclick="showOtherSeasons('Applicant', '/applicants/${id}/other-seasons', 'openApplicant')">View Other Seasons</button>
+      ${a.provider_account_id && ['super_admin','org_admin'].includes(Auth.user()?.role) ? `<button class="btn btn-outline btn-sm" onclick="viewLiveProviderData('${id}')">View Live Disccardpromos Data</button>` : ''}
       <button class="btn btn-outline btn-sm" onclick="openQuickTaskModal('applicant','${id}','${esc(a.first_name+' '+a.last_name).replace(/'/g,"\\'")}')">+ Add Task</button>
       ${['super_admin','org_admin'].includes(Auth.user()?.role) ? `<button class="btn btn-outline btn-sm" style="color:#b71c1c;border-color:#b71c1c" onclick="deleteApplicant('${id}')">Delete Permanently</button>` : ''}
       ${a.approval_status !== 'pending' ? `<button class="btn btn-outline btn-sm" onclick="setApplicantPending('${id}')">Set to Pending</button>` : ''}
@@ -680,6 +691,22 @@ async function openApplicant(id) {
     loadHistoryTab('applicant', id, 'atab-history-list');
   } catch (err) { toast(err.message, true); }
 }
+
+// Raw GET /:id/provider-customer passthrough, shown as-is — the exact
+// field names disccardpromos actually uses for things like transaction
+// history aren't all confirmed (their docs site is unreachable from this
+// environment's own network policy), so seeing the real JSON here is the
+// most direct way to check what a live response actually looks like,
+// rather than only via server logs.
+window.viewLiveProviderData = async (id) => {
+  try {
+    const { customer, mockMode } = await api(`/applicants/${id}/provider-customer`);
+    const body = mockMode
+      ? `<p class="small-muted">This season is in mock mode — nothing real to show.</p>`
+      : `<pre style="white-space:pre-wrap;word-break:break-word;font-size:12px;max-height:60vh;overflow:auto">${esc(JSON.stringify(customer, null, 2))}</pre>`;
+    openModal('Live Disccardpromos Customer Data', body, '');
+  } catch (err) { toast(err.message, true); }
+};
 
 window.saveApplicant = async (id) => {
   const body = {
