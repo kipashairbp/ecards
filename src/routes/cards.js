@@ -164,10 +164,21 @@ router.post('/:id/deactivate', requirePermission('cards', 'can_edit'), async (re
 });
 
 // Pull latest balance/status + transactions from disccardpromos for one card.
+// Unlike sync-all (below), which sweeps many cards and can't let one bad
+// card take the whole batch down, this is a single card the admin just
+// clicked "Sync Now" on — a disccardpromos failure here should come back as
+// a real error to show them, same 502 pattern as activate/deactivate above,
+// not an unhandled throw that surfaces as a bare "Internal server error".
 router.post('/:id/sync', requirePermission('cards', 'can_edit'), async (req, res) => {
   const card = db.prepare('SELECT * FROM cards WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!card) return res.status(404).json({ error: 'Not found' });
-  const synced = await syncOneCard(req.user.org_id, card);
+  let synced;
+  try {
+    synced = await syncOneCard(req.user.org_id, card);
+  } catch (e) {
+    console.error('[cards] sync failed:', e.message);
+    return res.status(502).json({ error: `disccardpromos sync failed: ${e.message}` });
+  }
   res.json({ synced, mockMode: giftcard.isMockMode(card.season_id) });
 });
 

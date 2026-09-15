@@ -275,6 +275,7 @@ async function showProviderSync() {
     const footer = `
       ${s.missing ? `<button class="btn btn-outline btn-sm" onclick="closeModal();viewMissingProviderSync()">View the ${s.missing} without an account</button>` : ''}
       <button class="btn btn-outline btn-sm" onclick="closeModal();startProviderAudit()">Verify Against Disccardpromos (read-only)</button>
+      <button class="btn btn-primary btn-sm" ${e.status === 'running' ? 'disabled' : ''} onclick="closeModal();startProviderEnforce()">Make It Match Now</button>
     `;
     openModal('Disccardpromos Match Status', body, footer);
   } catch (err) { toast(err.message, true); }
@@ -375,7 +376,7 @@ function showProviderAuditResult(res) {
 // approved applicant, deactivate everything nobody approved holds, then
 // re-pull their list and show their active count next to ours.
 async function startProviderEnforce() {
-  if (!confirm('Make disccardpromos match this season?\n\n• Every approved applicant gets one ACTIVE account (existing ones are re-activated or linked; missing ones are CREATED and loaded with their Card Amount — real money).\n• Accounts held only by rejected/pending applicants, or by nobody, are DEACTIVATED (never deleted).\n\nSafe to run again any time. Continue?')) return;
+  if (!confirm('Make disccardpromos match this season?\n\n• Every approved applicant gets one ACTIVE account (existing ones are re-activated or linked; missing ones are CREATED) loaded with their full Card Amount — real money. This also catches anyone whose balance is out of sync for any reason (a skipped/failed load, a later card_amount change, etc.) and corrects it to the right amount.\n• Accounts held only by rejected/pending applicants, or by nobody, are DEACTIVATED (never deleted).\n\nSafe to run again any time. Continue?')) return;
   try {
     await api('/applicants/provider-enforce', { method: 'POST', body: seasonBody() });
   } catch (err) {
