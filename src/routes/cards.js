@@ -4,7 +4,7 @@ import { auth } from '../middleware/auth.js';
 import { requirePermission, redact } from '../middleware/permissions.js';
 import * as giftcard from '../services/giftcard.js';
 import { sendXlsx } from '../services/xlsx.js';
-import { syncOneCard, syncAllCards } from '../services/cardSync.js';
+import { syncOneCard, syncAllCards, lockApplicantCards } from '../services/cardSync.js';
 import { normalizePhone, isValidPhone } from '../utils/phone.js';
 
 const router = Router();
@@ -130,36 +130,47 @@ router.post('/assign', requirePermission('cards', 'can_edit'), async (req, res) 
   res.status(201).json({ card: db.prepare('SELECT * FROM cards WHERE id = ?').get(id) });
 });
 
-// Activate — the phone number the applicant/gabai provides "gets written onto their account."
-router.post('/:id/activate', requirePermission('cards', 'can_edit'), async (req, res) => {
+// Activate — records the phone number the applicant/gabai provides against
+// this card locally. Per disccardpromos' confirmed real Customer API (see
+// giftcard.js's Customer section comment), the card is already live and
+// spendable the moment Assign PATCHes card_number onto the customer — their
+// own docs call that write "activate a card number for this customer".
+// There is no separate live activation call to make here: the
+// giftcard.activateCard() this used to call hit a guessed placeholder
+// endpoint (/cards/:id/activate) that was never real and always 404'd —
+// confirmed 2026-09-15 that Assign alone is sufficient, so this is now a
+// purely local status change, same as it already effectively was in
+// practice (every card assigned here was already live regardless of
+// whether this step ever succeeded).
+router.post('/:id/activate', requirePermission('cards', 'can_edit'), (req, res) => {
   const card = db.prepare('SELECT * FROM cards WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!card) return res.status(404).json({ error: 'Not found' });
   const { phone } = req.body || {};
   if (!phone) return res.status(400).json({ error: 'Activation phone number is required' });
   if (!isValidPhone(phone)) return res.status(400).json({ error: 'Activation phone number must be a valid phone number (10 digits, or 11 digits starting with 1)' });
-  let result;
-  try {
-    result = await giftcard.activateCard(card.season_id, { providerCardId: card.provider_card_id, phone });
-  } catch (e) {
-    console.error('[cards] activate failed:', e.message);
-    return res.status(502).json({ error: `disccardpromos rejected the activation: ${e.message}` });
-  }
-  db.prepare(`UPDATE cards SET status='activated', activation_phone=?, activated_at=? WHERE id=?`).run(normalizePhone(phone), result.activatedAt, card.id);
-  db.prepare(`INSERT INTO card_transactions (id, card_id, type, amount, occurred_at) VALUES (?,?,?,0,?)`).run(uuid(), card.id, 'activation', result.activatedAt);
+  const activatedAt = new Date().toISOString();
+  db.prepare(`UPDATE cards SET status='activated', activation_phone=?, activated_at=? WHERE id=?`).run(normalizePhone(phone), activatedAt, card.id);
+  db.prepare(`INSERT INTO card_transactions (id, card_id, type, amount, occurred_at) VALUES (?,?,?,0,?)`).run(uuid(), card.id, 'activation', activatedAt);
   res.json({ card: db.prepare('SELECT * FROM cards WHERE id = ?').get(card.id) });
 });
 
+// Deactivates the whole disccardpromos ACCOUNT this card belongs to, not
+// just this one card — confirmed against their real API, there is no
+// per-card lock at all, only whole-customer is_active (see cardSync.js's
+// lockApplicantCards, the same function reject/set-pending already use to
+// do exactly this). giftcard.deactivateCard() used to be called here
+// instead, hitting a guessed placeholder endpoint that was never real (same
+// "OLD unverified placeholder" issue as activate — see that route's
+// comment) and always 404'd, so this never actually worked before. Reuses
+// lockApplicantCards rather than duplicating its logic so this stays
+// consistent with reject/pause.
 router.post('/:id/deactivate', requirePermission('cards', 'can_edit'), async (req, res) => {
   const card = db.prepare('SELECT * FROM cards WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!card) return res.status(404).json({ error: 'Not found' });
-  let result;
-  try {
-    result = await giftcard.deactivateCard(card.season_id, { providerCardId: card.provider_card_id, reason: req.body?.reason });
-  } catch (e) {
-    console.error('[cards] deactivate failed:', e.message);
-    return res.status(502).json({ error: `disccardpromos rejected the deactivation: ${e.message}` });
-  }
-  db.prepare(`UPDATE cards SET status='deactivated', deactivated_at=? WHERE id=?`).run(result.deactivatedAt, card.id);
+  const applicant = card.applicant_id ? db.prepare('SELECT * FROM applicants WHERE id = ?').get(card.applicant_id) : null;
+  if (!applicant) return res.status(400).json({ error: 'This card has no applicant on file to deactivate the account for' });
+  const result = await lockApplicantCards(req.user.org_id, applicant);
+  if (result.errors.length) return res.status(502).json({ error: `disccardpromos rejected the deactivation: ${result.errors[0]}` });
   res.json({ ok: true });
 });
 

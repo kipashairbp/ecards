@@ -32,17 +32,20 @@
 // is no confirmed "assign/activate a card to an applicant" endpoint at all —
 // every real endpoint we've seen operates on an existing customer (who
 // already carries `active_cards`), not on a card being provisioned fresh.
-// assignCard/activateCard/deactivateCard/getCardStatus/listTransactions
-// below are the OLD unverified best-guess placeholder (paths like
-// /cards/assign, /cards/:id/activate) and almost certainly do NOT match the
-// real API — real confirmed paths all live under /v1/ or /org/, never
-// /cards/. They're left in place (and still used by routes/cards.js /
-// services/cardSync.js) because pulling them without a confirmed
-// replacement would break the app; treat them as known-wrong pending real
-// docs for card provisioning/activation and a transaction-history endpoint.
+// Confirmed 2026-09-15: a customer's card_number write field IS the real
+// assign/activate step (disccardpromos' own docs call it "activate a card
+// number for this customer") — see linkCardToCustomer below — so
+// routes/cards.js's assign/activate/deactivate no longer touch the
+// guessed /cards/... placeholder paths at all (deactivate uses
+// updateCustomer's is_active, same whole-account lock reject/pause already
+// use — disccardpromos has no per-card lock). Transaction history is the
+// same story: also confirmed 2026-09-15 to be per-CUSTOMER, not per-card —
+// GET /org/customers/?balances=true&transactions=true (list) and the same
+// two flags on getCustomerByExternalId below embed each customer's
+// transaction history directly, no separate endpoint at all. There is no
+// guessed /cards/... path left anywhere in this file.
 // ---------------------------------------------------------------------------
 
-import { randomUUID } from 'crypto';
 import { db } from '../db.js';
 import { logApiCall } from './apiCallLog.js';
 
@@ -247,65 +250,20 @@ export async function getCustomerPackageAmount(seasonId, customerId, discountId)
 }
 
 // ---------------------------------------------------------------------------
-// OLD unverified placeholder — see the file header note above. Kept in use
-// by routes/cards.js and services/cardSync.js pending confirmed real
-// endpoints for provisioning/activating a card and reading its transaction
-// history.
+// OLD unverified placeholder — see the file header note above.
+// assignCard/activateCard/deactivateCard/getCardStatus/listTransactions/
+// listAllTransactions used to live here too, guessing at paths like
+// /cards/assign, /cards/:id/activate, /cards/:id/transactions, and
+// /transactions that were never real. Confirmed 2026-09-15 there's nothing
+// left in this "guessed placeholder" family at all: routes/cards.js's
+// assign/activate/deactivate use the real Customer PATCH/is_active
+// endpoints (see linkCardToCustomer/updateCustomer), and transaction
+// history is pulled per-customer via listCustomers'/
+// getCustomerByExternalId's confirmed ?transactions=true (see
+// services/cardSync.js) — not per-card at all, since disccardpromos has no
+// stable per-card id to ask about in the first place. Deleted rather than
+// left as known-dead, known-wrong code.
 // ---------------------------------------------------------------------------
-
-// Assign the next available card to an applicant. externalId is the
-// applicant's 4-digit external_id (see utils/externalId.js) — disccardpromos
-// uses this as its own external reference for the card, in place of our
-// internal UUID. Returns { providerCardId, maskedNumber }.
-export async function assignCard(seasonId, { applicantId, externalId, amount }) {
-  if (isMockMode(seasonId)) {
-    const last4 = String(Math.floor(1000 + Math.random() * 9000));
-    return { providerCardId: `mock_${randomUUID()}`, maskedNumber: `**** **** **** ${last4}`, amount };
-  }
-  const body = await call(seasonId, '/cards/assign', { method: 'POST', body: JSON.stringify({ external_ref: externalId || applicantId, amount }) });
-  return { providerCardId: body.card_id, maskedNumber: body.masked_number, amount: body.amount ?? amount };
-}
-
-// Activate a card by the phone number the recipient provides — this is what
-// "writes" the card onto their account per the spec. Returns { activatedAt }.
-export async function activateCard(seasonId, { providerCardId, phone }) {
-  if (isMockMode(seasonId)) return { activatedAt: new Date().toISOString() };
-  const body = await call(seasonId, `/cards/${providerCardId}/activate`, { method: 'POST', body: JSON.stringify({ phone }) });
-  return { activatedAt: body.activated_at || new Date().toISOString() };
-}
-
-export async function deactivateCard(seasonId, { providerCardId, reason }) {
-  if (isMockMode(seasonId)) return { deactivatedAt: new Date().toISOString() };
-  const body = await call(seasonId, `/cards/${providerCardId}/deactivate`, { method: 'POST', body: JSON.stringify({ reason }) });
-  return { deactivatedAt: body.deactivated_at || new Date().toISOString() };
-}
-
-// Returns { balance, activatedAt, status }
-export async function getCardStatus(seasonId, { providerCardId }) {
-  if (isMockMode(seasonId)) return { balance: null, activatedAt: null, status: 'unknown (mock mode)' };
-  return call(seasonId, `/cards/${providerCardId}`);
-}
-
-// Returns an array of raw transactions: { id, type, amount, store_name, occurred_at, ... }
-export async function listTransactions(seasonId, { providerCardId, since }) {
-  if (isMockMode(seasonId)) return [];
-  const qs = since ? `?since=${encodeURIComponent(since)}` : '';
-  const body = await call(seasonId, `/cards/${providerCardId}/transactions${qs}`);
-  return body.transactions || body.data || [];
-}
-
-// Pull transactions across ALL cards since a timestamp, if the provider supports
-// a bulk feed (cheaper than per-card polling). Falls back to null so the caller
-// knows to loop per-card instead.
-export async function listAllTransactions(seasonId, { since }) {
-  if (isMockMode(seasonId)) return null;
-  try {
-    const body = await call(seasonId, `/transactions?since=${encodeURIComponent(since || '')}`);
-    return body.transactions || body.data || null;
-  } catch {
-    return null; // endpoint may not exist — caller falls back to per-card polling
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Customers — CONFIRMED against disccardpromos's real Customer Management API
@@ -323,9 +281,8 @@ export async function listAllTransactions(seasonId, { since }) {
 // numbers) — disccardpromos expects the ORG to already hold real physical
 // card numbers and "assigning a card" means activating one of those numbers
 // against a customer via PATCH, not generating a fresh card id the way the
-// old assignCard()/activateCard() below (still kept for
-// deactivate/status/transactions, which their docs don't cover) guessed.
-// See linkCardToCustomer() / getCustomer() further down.
+// old assignCard()/activateCard() (deleted 2026-09-15, see the file header
+// note) guessed. See linkCardToCustomer() / getCustomer() further down.
 //
 // Still unconfirmed: how "current season" maps onto their data model —
 // nothing in the Customer resource represents a season directly. The
@@ -450,10 +407,22 @@ export async function updateCustomer(seasonId, customerId, opts) {
 // a self-linking `next` can't loop forever. Throws on any HTTP failure —
 // the caller treats "couldn't list" as a distinct, reported outcome rather
 // than an empty org.
-export async function listCustomers(seasonId) {
+//
+// { transactions } confirmed 2026-09-15: the SAME ?transactions=true opt-in
+// already confirmed on getCustomerByExternalId below also works here on the
+// list endpoint — this is what services/cardSync.js now pulls per-customer
+// transaction history from, replacing the old guessed per-card
+// /cards/:id/transactions placeholder (which never had a real card id to
+// call in the first place — disccardpromos has no stable per-card id at
+// all, see cardSync.js). Left false by default since every OTHER caller
+// here (the enforcer, the audit, mass-approve's batch index, ...) has no
+// use for a whole org's transaction history on every pull — only cardSync's
+// sync actually asks for it.
+export async function listCustomers(seasonId, { balances = false, transactions = false } = {}) {
   if (isMockMode(seasonId)) return [];
   const all = [];
-  let path = '/org/customers/';
+  const qs = [balances && 'balances=true', transactions && 'transactions=true'].filter(Boolean).join('&');
+  let path = `/org/customers/${qs ? `?${qs}` : ''}`;
   const cfg = resolveConfig(seasonId);
   for (let page = 0; page < 500 && path; page++) {
     const body = await call(seasonId, path);
@@ -530,6 +499,27 @@ export async function linkCardToCustomer(seasonId, customerId, cardNumber, exter
   return call(seasonId, `/org/customers/${normalizeCustomerId(customerId)}/`, { method: 'PATCH', body: JSON.stringify(body) });
 }
 
+// Every customer in the season, pulled ONCE via listCustomers above, indexed
+// both by their id and by external_id — the shared building block every
+// BULK operation (mass-approve, retry-provider-sync, the audit, the
+// enforcer) should pull once and reuse for every record in the batch,
+// instead of ensureProviderAccount/upsertAccountForApproval each doing their
+// own GET per applicant. A single-record action (the lone /:id/approve
+// route) has no reason to pay for a full list pull just to look up one id —
+// passing no index anywhere below falls back to that per-record lookup, so
+// this is opt-in, not a behavior change for anything that doesn't use it.
+export async function buildCustomerIndex(seasonId, opts) {
+  const list = await listCustomers(seasonId, opts);
+  const byId = new Map(), byExt = new Map();
+  for (const c of list) {
+    if (c?.id == null) continue;
+    const id = normalizeCustomerId(c.id);
+    byId.set(id, c);
+    if (c.external_id != null && c.external_id !== '') byExt.set(String(c.external_id), c);
+  }
+  return { list, byId, byExt };
+}
+
 // Idempotent upsert used at applicant-approval time: an existing customer
 // (matched by external_id) gets every field below refreshed (name, contact
 // info, address, group) rather than just group_name — the "not all info
@@ -539,10 +529,16 @@ export async function linkCardToCustomer(seasonId, customerId, cardNumber, exter
 // too. A new customer gets created with the same full set. Returns
 // { created, accountId }. (seasonName isn't wired to anything yet — see
 // note above.)
-export async function upsertAccountForApproval(seasonId, opts) {
+//
+// existingHint: when the caller already knows the answer (from a
+// buildCustomerIndex() pull covering the whole batch it's in), pass the
+// matched customer object (or null if the index confirmed there isn't one)
+// to skip this function's own findCustomerByExternalId round trip entirely.
+// Leave undefined (the default) to look it up here, same as always.
+export async function upsertAccountForApproval(seasonId, opts, existingHint) {
   const { externalId } = opts;
   if (isMockMode(seasonId)) return { created: true, accountId: `mock_acct_${externalId}` };
-  const existing = await findCustomerByExternalId(seasonId, externalId);
+  const existing = existingHint !== undefined ? existingHint : await findCustomerByExternalId(seasonId, externalId);
   if (existing) {
     // isActive: true folded into this same PATCH (not a separate call
     // afterward) — live-tested 2026-08-19 that a follow-up PATCH omitting

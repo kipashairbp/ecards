@@ -274,8 +274,15 @@ function shulContributionError(applicant) {
     return 'The shul has not yet reported and confirmed how much they personally gave this family — cannot approve until they do.';
   }
   const shul = applicant.shul_id ? db.prepare('SELECT min_contribution_default FROM shuls WHERE id = ?').get(applicant.shul_id) : null;
-  const effectiveMin = applicant.min_contribution_override ?? shul?.min_contribution_default ?? 0;
-  const reported = applicant.shul_contribution_amount ?? 0;
+  // Number(...) rather than trusting these are already numbers — these
+  // columns have REAL affinity but SQLite still stores non-numeric text
+  // as-is if it's ever written that way (no column ever enforces this),
+  // and reported/effectiveMin both being non-numeric text used to compare
+  // as plain strings (JS only compares numerically when at least one side
+  // already is a number) — occasionally true, then crashing outright on
+  // .toFixed() below, which isn't a method on strings.
+  const effectiveMin = Number(applicant.min_contribution_override ?? shul?.min_contribution_default ?? 0) || 0;
+  const reported = Number(applicant.shul_contribution_amount ?? 0) || 0;
   if (effectiveMin > 0 && reported < effectiveMin) {
     return `The shul-reported contribution ($${reported.toFixed(2)}) is below the required minimum of $${effectiveMin.toFixed(2)} for this applicant.`;
   }
@@ -2045,6 +2052,7 @@ router.post('/mass-approve', requirePermission('applicants', 'can_edit'), async 
   // genuine live API rejection, instead of guessing from a number alone.
   const providerErrorDetails = [];
   for (const id of ids) {
+   try {
     const applicant = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(id, req.user.org_id);
     if (!applicant || applicant.is_paused) { skipped++; continue; }
     const season = db.prepare('SELECT * FROM seasons WHERE id = ?').get(applicant.season_id);
@@ -2106,8 +2114,30 @@ router.post('/mass-approve', requirePermission('applicants', 'can_edit'), async 
         zeroAmountSkipped++;
       }
     }
+   } catch (e) {
+    // One record hitting something unexpected (bad legacy data, whatever
+    // else nobody's thought of yet) used to abort the entire batch here —
+    // everyone after it in `ids` silently never got processed, and the
+    // whole request came back as a bare 500 despite everyone before it
+    // already having been approved for real. Every disccardpromos call
+    // above already had its own try/catch; this is the same isolation for
+    // the rest of the loop, so one bad record can never take the others
+    // down with it.
+    providerErrors++;
+    providerErrorDetails.push(`applicant ${id}: unexpected error — ${e.message}`);
+    console.error('[applicants] mass-approve: unexpected error for applicant', id, ':', e);
+   }
   }
-  logMassAudit(req.user.org_id, req.user.id, 'mass-approve', 'applicant', affectedIds, { skipped, capReached, providerErrors, contributionBlocked, zeroAmountSkipped, names, providerErrorDetails, updatedDiffs }, req.ip);
+  // Every applicant above is already fully approved in the DB by this
+  // point — logging the batch is just a Recent Actions record of it, not
+  // something the approvals themselves depend on. Never let a logging
+  // failure turn a batch that fully succeeded into a request that comes
+  // back as a bare 500.
+  try {
+    logMassAudit(req.user.org_id, req.user.id, 'mass-approve', 'applicant', affectedIds, { skipped, capReached, providerErrors, contributionBlocked, zeroAmountSkipped, names, providerErrorDetails, updatedDiffs }, req.ip);
+  } catch (e) {
+    console.error('[applicants] mass-approve: failed to write the Recent Actions log entry:', e);
+  }
   res.json({ approved, skipped, capReached, providerErrors, contributionBlocked, zeroAmountSkipped, providerErrorDetails, providerErrorsHint: providerErrors && !discountId ? 'No disccardpromos Package/Discount ID configured (Settings > Organization > Gift Card Loading).' : undefined });
 });
 

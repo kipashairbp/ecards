@@ -1146,8 +1146,26 @@ window.submitPairMerge = async (flagId) => {
       : el.value;
   }
   try {
-    await api(`/applicants/duplicates/${flagId}/merge`, { method: 'POST', body: { primaryId, values, memberIds: mergePairSelection } });
+    const result = await api(`/applicants/duplicates/${flagId}/merge`, { method: 'POST', body: { primaryId, values, memberIds: mergePairSelection } });
     toast('Merged');
+    // The record(s) just folded away are hard-deleted for real (see
+    // mergeApplicants) — if one of them already had its OWN real
+    // disccardpromos account (independently approved before the duplicate
+    // was ever caught), that account is never touched here: automatically
+    // combining two real, possibly-funded accounts is exactly the kind of
+    // silent financial move this app avoids everywhere else. It's left
+    // alone as a conflict instead — which otherwise means it just quietly
+    // goes inactive on the next reconciliation sweep ("held by nobody
+    // approved") with nobody ever told a second, real, no-longer-linked
+    // account is sitting there. Surface it immediately instead of letting
+    // it only ever show up buried in that merge's own Recent Actions entry.
+    if (result?.accountConflicts?.length) {
+      const body = `<p>This merge kept one applicant's disccardpromos account and could not automatically combine it with another real account already on file for the record(s) just merged away — merging two live accounts risks double-crediting, so nothing was moved automatically.</p>
+        <ul style="margin:10px 0 0;padding-left:18px;font-size:13px">
+          ${result.accountConflicts.map(c => `<li><strong>Kept:</strong> ${esc(c.primaryName)} — account ${esc(c.primaryAccountId)}<br><strong>Now orphaned:</strong> ${esc(c.secondaryName)} — account ${esc(c.secondaryAccountId)} (will show inactive after the next disccardpromos match run — check its balance on disccardpromos and reconcile manually, e.g. transfer any remaining funds onto the kept account)</li>`).join('')}
+        </ul>`;
+      openModal('Merge left an account to reconcile manually', body, `<button class="btn btn-primary btn-sm" onclick="closeModal()">Got it</button>`);
+    }
     await refreshMergeGroupAndContinue();
   } catch (err) { toast(err.message, true); }
 };

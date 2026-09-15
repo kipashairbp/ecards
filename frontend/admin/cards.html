@@ -56,7 +56,7 @@ qs('#tab-byshul-btn').addEventListener('click', () => showCardsTab('byshul'));
 qs('#btn-export-cards').addEventListener('click', () => downloadAuthed('/cards/export?' + new URLSearchParams({ search: state.search, status: state.status }), 'cards.xlsx'));
 qs('#btn-sync-all').addEventListener('click', async () => {
   const btn = qs('#btn-sync-all'); btn.disabled = true; btn.textContent = 'Syncing…';
-  try { const r = await api('/cards/sync-all', { method: 'POST' }); toast(`Checked ${r.cardsChecked} card(s), synced ${r.transactionsSynced} new transaction(s)${r.cardsDiscovered ? `, found ${r.cardsDiscovered} card(s) activated directly on disccardpromos` : ''}${r.cardsRemoved ? `, deactivated ${r.cardsRemoved} card(s) removed on disccardpromos` : ''}`); loadCards(); }
+  try { const r = await api('/cards/sync-all', { method: 'POST' }); toast(`Checked ${r.cardsChecked} card(s), synced ${r.transactionsSynced} new transaction(s)${r.cardsDiscovered ? `, found ${r.cardsDiscovered} card(s) activated directly on disccardpromos` : ''}${r.cardsRemoved ? `, deactivated ${r.cardsRemoved} card(s) removed on disccardpromos` : ''}${r.unattributed ? `, ${r.unattributed} transaction(s) couldn't be matched to a specific card (applicant holds more than one)` : ''}`); loadCards(); }
   catch (err) { toast(err.message, true); }
   finally { btn.disabled = false; btn.textContent = 'Sync All Now'; }
 });
@@ -127,7 +127,7 @@ async function openCard(id) {
     const footer = `
       <button class="btn btn-outline btn-sm" onclick="syncCard('${id}')">Sync Now</button>
       ${card.status === 'assigned' ? `<button class="btn btn-primary btn-sm" onclick="activateCard('${id}')">Activate</button>` : ''}
-      ${card.status !== 'deactivated' ? `<button class="btn btn-danger btn-sm" onclick="deactivateCard('${id}')">Deactivate</button>` : ''}
+      ${card.status !== 'deactivated' ? `<button class="btn btn-danger btn-sm" onclick="deactivateCard('${id}')">Deactivate Account</button>` : ''}
     `;
     openModal('Card Details', body, footer);
   } catch (err) { toast(err.message, true); }
@@ -138,7 +138,17 @@ window.activateCard = async (id) => {
   if (!phone) return toast('Enter the phone number to activate with', true);
   try { await api(`/cards/${id}/activate`, { method: 'POST', body: { phone } }); toast('Card activated'); closeModal(); loadCards(); } catch (err) { toast(err.message, true); }
 };
-window.deactivateCard = async (id) => { if (!confirm('Deactivate this card?')) return; try { await api(`/cards/${id}/deactivate`, { method: 'POST' }); closeModal(); loadCards(); } catch (err) { toast(err.message, true); } };
+// disccardpromos has no per-card lock — deactivating locks the WHOLE
+// account this card belongs to (every card that applicant holds), not just
+// this one. See routes/cards.js's /:id/deactivate.
+window.deactivateCard = async (id) => {
+  if (!confirm("Deactivate this applicant's disccardpromos account?\n\nThis locks the ENTIRE account — every card they hold, not just this one — since disccardpromos doesn't support locking a single card. Continue?")) return;
+  try {
+    await api(`/cards/${id}/deactivate`, { method: 'POST' });
+    toast('Account deactivated');
+    closeModal(); loadCards();
+  } catch (err) { toast(err.message, true); }
+};
 
 loadCards();
 const preselect = new URLSearchParams(location.search).get('card');
