@@ -108,7 +108,7 @@ const cleanProviderId = id => String(id).replace(/\.0$/, '');
 // single 15-minute sweep. Omit index for a single-applicant caller (the
 // manual "Sync Now" button), which falls back to a live per-applicant GET.
 export async function syncApplicantCards(orgId, applicant, index) {
-  if (!applicant.provider_account_id || applicant.provider_exempt) return { discovered: 0, removed: 0, synced: 0, unattributed: 0, malformed: 0 };
+  if (!applicant.provider_account_id || applicant.provider_exempt) return { discovered: 0, removed: 0, synced: 0, unattributed: 0, malformed: 0, fetchFailed: false };
   let customer;
   if (index) {
     const cleanId = cleanProviderId(applicant.provider_account_id);
@@ -118,10 +118,19 @@ export async function syncApplicantCards(orgId, applicant, index) {
       customer = await giftcard.getCustomerByExternalId(applicant.season_id, applicant.external_id, { balances: true, transactions: true });
     } catch (e) {
       console.error('[cardSync] failed to fetch customer for sync, applicant', applicant.id, ':', e.message);
-      return { discovered: 0, removed: 0, synced: 0, unattributed: 0, malformed: 0 };
+      // Distinct from "fetched fine, nothing new" — this used to return the
+      // exact same all-zero shape as a genuinely up-to-date applicant, so a
+      // real fetch failure (network hiccup, disccardpromos rate limit, a
+      // timeout on a large org with many real accounts) was indistinguishable
+      // from "nothing to sync" anywhere the caller could see. Surfaced now so
+      // a sweep that's silently failing for many applicants — the likely
+      // reason a manual re-sync keeps finding a few more each time instead of
+      // catching up in one pass — is visible instead of looking like slow,
+      // steady, expected progress.
+      return { discovered: 0, removed: 0, synced: 0, unattributed: 0, malformed: 0, fetchFailed: true };
     }
   }
-  if (!customer) return { discovered: 0, removed: 0, synced: 0, unattributed: 0, malformed: 0 };
+  if (!customer) return { discovered: 0, removed: 0, synced: 0, unattributed: 0, malformed: 0, fetchFailed: false };
   const remoteMasked = new Set(Array.isArray(customer.active_cards) ? customer.active_cards : []);
   const localActive = db.prepare(`SELECT id, card_number_masked FROM cards WHERE applicant_id = ? AND status IN ('assigned','activated')`).all(applicant.id);
   // Matched by trailing digits, not exact string equality. routes/cards.js's
@@ -274,7 +283,7 @@ export async function syncApplicantCards(orgId, applicant, index) {
   }
   if (allLocal.length) db.prepare(`UPDATE cards SET last_synced_at = datetime('now') WHERE applicant_id = ?`).run(applicant.id);
 
-  return { discovered, removed, synced, unattributed, malformed };
+  return { discovered, removed, synced, unattributed, malformed, fetchFailed: false };
 }
 
 // Sweeps every applicant with a disccardpromos account in an org: syncs
@@ -292,23 +301,35 @@ export async function syncAllCards(orgId) {
   // every 15-minute sweep. Falls back to null (syncApplicantCards' own
   // per-applicant lookup) if the pull itself fails.
   const indexBySeason = new Map();
+  let indexPullsFailed = 0;
   const getIndex = async (seasonId) => {
     if (!indexBySeason.has(seasonId)) {
       indexBySeason.set(seasonId, giftcard.isMockMode(seasonId) ? null : giftcard.buildCustomerIndex(seasonId, { balances: true, transactions: true }).catch(e => {
         console.error(`[cardSync] could not pull the customer list up front for season ${seasonId}, falling back to per-applicant lookups:`, e.message);
+        indexPullsFailed++;
         return null;
       }));
     }
     return indexBySeason.get(seasonId);
   };
-  let totalSynced = 0, cardsDiscovered = 0, cardsRemoved = 0, unattributed = 0, malformed = 0;
+  let totalSynced = 0, cardsDiscovered = 0, cardsRemoved = 0, unattributed = 0, malformed = 0, failed = 0;
   for (const applicant of applicants) {
     try {
       const index = await getIndex(applicant.season_id);
-      const { discovered, removed, synced, unattributed: u, malformed: m } = await syncApplicantCards(orgId, applicant, index);
+      const { discovered, removed, synced, unattributed: u, malformed: m, fetchFailed } = await syncApplicantCards(orgId, applicant, index);
       cardsDiscovered += discovered; cardsRemoved += removed; totalSynced += synced; unattributed += u; malformed += m;
-    } catch (e) { console.error('[cardSync] sync failed for applicant', applicant.id, e.message); }
+      if (fetchFailed) failed++;
+    } catch (e) { console.error('[cardSync] sync failed for applicant', applicant.id, e.message); failed++; }
   }
   const cardsChecked = db.prepare(`SELECT COUNT(*) c FROM cards WHERE org_id = ? AND status IN ('assigned','activated')`).get(orgId).c;
-  return { cardsChecked, transactionsSynced: totalSynced, cardsDiscovered, cardsRemoved, unattributed, malformed };
+  // When the ONE bulk list pull for a season fails, every applicant in it
+  // falls back to its own live per-applicant GET — for an org with many real
+  // accounts, that's a lot of sequential round trips in one request, and any
+  // one of those can time out or get rate-limited independently. `failed`
+  // surfaces exactly how many applicants a run genuinely could not reach,
+  // as opposed to ones that were reached and simply had nothing new — this
+  // is what makes "the total keeps climbing a little on every re-sync
+  // instead of catching up in one pass" diagnosable instead of looking like
+  // ordinary incremental progress.
+  return { cardsChecked, transactionsSynced: totalSynced, cardsDiscovered, cardsRemoved, unattributed, malformed, failed, indexPullsFailed };
 }

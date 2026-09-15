@@ -1191,34 +1191,35 @@ window.submitPairMerge = async (flagId, accountConflictResolution, presetArgs) =
     }
     memberIds = mergePairSelection;
   }
+  // A losing member that already held its own real disccardpromos account
+  // always gets combined into the one this merge keeps — no account is ever
+  // left orphaned. Only pauses to ask when BOTH accounts genuinely have real
+  // money on them (see mergeApplicants' ACCOUNT_CONFLICT) — anything less
+  // just combines automatically with no popup at all.
   try {
-    await api(`/applicants/duplicates/${flagId}/merge`, { method: 'POST', body: { primaryId, values, memberIds, accountConflictResolution } });
-    toast('Merged');
+    const result = await api(`/applicants/duplicates/${flagId}/merge`, { method: 'POST', body: { primaryId, values, memberIds, accountConflictResolution } });
+    if (result.accountConflictErrors?.length) toast(`Merged, but combining the other account's balance failed: ${result.accountConflictErrors.join('; ')} — check Provider Audit for a leftover account`, true);
+    else toast('Merged');
     await refreshMergeGroupAndContinue();
   } catch (err) {
-    // Every disccardpromos account must always be assigned to a record
-    // here, linked to a shul — an account this merge would otherwise
-    // orphan (the record that held it is about to be hard-deleted) has to
-    // be resolved before the merge is allowed to touch anything, not
-    // reported after the fact. See routes/applicants.js's merge route and
-    // mergeApplicants' ACCOUNT_CONFLICT.
     if (err.data?.accountConflict) return openAccountConflictModal(flagId, err.data.conflicts, { primaryId, values, memberIds });
     toast(err.message, true);
   }
 };
-// One radio choice per conflicting account — "Combine balances" (adds the
-// orphaned account's real current balance onto the kept one, then closes
-// it) or "Close without transferring" (discards whatever's on it). Submits
-// the SAME merge again with those choices, which is what actually lets it
-// proceed past ACCOUNT_CONFLICT this time.
+// One radio choice per conflicting account, shown only when both sides
+// genuinely have real money on them — "Combine balances" (adds the other
+// account's real current balance onto the kept one, then closes it) or
+// "Close without transferring" (discards whatever's on it). Submits the
+// SAME merge again with those choices, which is what lets it proceed past
+// ACCOUNT_CONFLICT this time.
 function openAccountConflictModal(flagId, conflicts, mergeArgs) {
   const fmt = v => v == null ? 'unknown (could not read live)' : `$${Number(v).toFixed(2)}`;
   const body = `
-    <p>Merging would leave a second, real disccardpromos account behind with nothing here pointing at it anymore. Choose what to do with each one before this merge can continue — nothing has been changed yet.</p>
+    <p>Both accounts involved in this merge have real money on them. Choose what to do with each one before this merge can continue — nothing has been changed yet.</p>
     ${conflicts.map((c, i) => `
       <div class="divider"></div>
       <p><strong>Keeping:</strong> ${esc(c.primaryName)} — account ${esc(c.primaryAccountId)} (currently ${fmt(c.primaryBalance)})<br>
-      <strong>Would be orphaned:</strong> ${esc(c.secondaryName)} — account ${esc(c.secondaryAccountId)} (currently ${fmt(c.secondaryBalance)})</p>
+      <strong>Would be closed:</strong> ${esc(c.secondaryName)} — account ${esc(c.secondaryAccountId)} (currently ${fmt(c.secondaryBalance)})</p>
       <label><input type="radio" name="acr-${i}" value="transfer" checked> Combine balances — add ${fmt(c.secondaryBalance)} onto the kept account, then close this one</label><br>
       <label><input type="radio" name="acr-${i}" value="delete"> Just close it — the ${fmt(c.secondaryBalance)} on it is not moved</label>
     `).join('')}

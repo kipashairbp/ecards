@@ -452,7 +452,7 @@ function restoreRepointedMessages(repointed) {
   }
 }
 
-export async function mergeApplicants(orgId, userId, { primaryId, values, memberIds, accountConflictResolution } = {}) {
+export async function mergeApplicants(orgId, userId, { primaryId, values, memberIds, accountConflictResolution: accountConflictResolutionInput } = {}) {
   if (!primaryId) throw new Error('primaryId is required');
   const fullGroupIds = getMergeGroupIds(orgId, [primaryId]);
   // memberIds lets an admin merge only PART of a larger connected group in
@@ -495,14 +495,20 @@ export async function mergeApplicants(orgId, userId, { primaryId, values, member
   const holder = primary.provider_account_id ? primary : members.find(m => m.provider_account_id);
   const conflictMembers = holder ? members.filter(m => m.id !== holder.id && m.provider_account_id && m.provider_account_id !== holder.provider_account_id) : [];
   const discountId = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'disccardpromos_discount_id'`).get(orgId)?.value;
+  // An account is never left orphaned — every conflict combines both real
+  // accounts into one, always. The only question is whether an admin needs
+  // to weigh in: when BOTH sides genuinely have money on them, that's a real
+  // choice about real funds, so this still pauses and asks (same popup as
+  // before, showing both balances). When only one side has money (or
+  // neither), there's nothing to actually decide — the merge just combines
+  // silently, no popup. ("it should merge both accounts and if both
+  // accounts have money, then the checkbox... lets me choose what i want to
+  // save" — a real request to keep the choice, but only when it's a real
+  // choice.)
+  let accountConflictResolution = {};
   if (conflictMembers.length) {
-    const unresolved = conflictMembers.filter(m => !accountConflictResolution?.[m.provider_account_id]);
+    const unresolved = conflictMembers.filter(m => !accountConflictResolutionInput?.[m.provider_account_id]);
     if (unresolved.length) {
-      // Live balances for the admin to actually see and choose from — this
-      // is the whole point of asking instead of picking silently.
-      // Best-effort: a balance that can't be read comes back null rather
-      // than blocking the choice entirely (disccardpromos being briefly
-      // unreachable shouldn't make a merge undoable-only-by-support).
       const readBalance = async (accountId) => {
         if (!discountId || !accountId) return null;
         try { return await giftcard.getCustomerPackageAmount(holder.season_id, accountId, discountId); } catch { return null; }
@@ -511,13 +517,31 @@ export async function mergeApplicants(orgId, userId, { primaryId, values, member
         readBalance(holder.provider_account_id),
         ...unresolved.map(m => readBalance(m.provider_account_id)),
       ]);
-      const err = new Error("This merge would leave a separate disccardpromos account with nothing here pointing at it — choose what to do with it first.");
-      err.code = 'ACCOUNT_CONFLICT';
-      err.conflicts = unresolved.map((m, i) => ({
-        primaryId: holder.id, primaryName: `${holder.first_name} ${holder.last_name}`.trim(), primaryAccountId: holder.provider_account_id, primaryBalance,
-        secondaryId: m.id, secondaryName: `${m.first_name} ${m.last_name}`.trim(), secondaryAccountId: m.provider_account_id, secondaryBalance: secondaryBalances[i],
-      }));
-      throw err;
+      // A balance that couldn't be read (null, disccardpromos unreachable)
+      // is treated as "assume there might be money" — auto-combining past an
+      // unknown amount without asking is exactly the kind of silent
+      // financial decision this needs to avoid, not just the case where both
+      // sides are confirmed non-zero.
+      const bothHaveMoney = unresolved.map((m, i) => (primaryBalance == null || primaryBalance > 0) && (secondaryBalances[i] == null || secondaryBalances[i] > 0));
+      const needsChoice = unresolved.filter((m, i) => bothHaveMoney[i]);
+      if (needsChoice.length) {
+        const err = new Error("Both accounts have real money on them — choose what to do before this merge can continue.");
+        err.code = 'ACCOUNT_CONFLICT';
+        err.conflicts = needsChoice.map((m) => {
+          const i = unresolved.indexOf(m);
+          return {
+            primaryId: holder.id, primaryName: `${holder.first_name} ${holder.last_name}`.trim(), primaryAccountId: holder.provider_account_id, primaryBalance,
+            secondaryId: m.id, secondaryName: `${m.first_name} ${m.last_name}`.trim(), secondaryAccountId: m.provider_account_id, secondaryBalance: secondaryBalances[i],
+          };
+        });
+        throw err;
+      }
+      // Nothing genuinely at stake on the unresolved side(s) — combine
+      // automatically, no admin input needed.
+      for (const m of unresolved) accountConflictResolution[m.provider_account_id] = 'transfer';
+    }
+    for (const m of conflictMembers) {
+      if (accountConflictResolutionInput?.[m.provider_account_id]) accountConflictResolution[m.provider_account_id] = accountConflictResolutionInput[m.provider_account_id];
     }
   }
 
@@ -562,9 +586,10 @@ export async function mergeApplicants(orgId, userId, { primaryId, values, member
       db.prepare('UPDATE applicants SET provider_account_id = ? WHERE id = ?').run(holder.provider_account_id, m.id);
     }
   }
-  // Every real conflict was already resolved by the admin's explicit choice
-  // (checked before any write above — see accountConflictResolution).
-  // Applying it for real now: "transfer" adds the loser's current balance
+  // Every conflict is resolved by now — either auto-resolved to 'transfer'
+  // above (nothing genuinely at stake) or explicitly chosen by the admin via
+  // accountConflictResolutionInput after being asked (both sides had real
+  // money). Applying it for real now: "transfer" adds the loser's current balance
   // onto the kept account first (addFunds SETS the absolute total — see
   // that function's own comment — so this reads both balances and writes
   // their sum, never a bare add), then either way the loser's account is

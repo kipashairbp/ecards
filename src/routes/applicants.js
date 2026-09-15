@@ -2503,10 +2503,12 @@ router.post('/duplicates/:flagId/merge', requirePermission('applicants', 'can_ed
     logAudit(req.user.org_id, req.user.id, 'merge', 'applicant', primaryId, undoSnapshot, after, req.ip);
     res.json(result);
   } catch (e) {
-    // ACCOUNT_CONFLICT isn't a real failure — it's mergeApplicants pausing
-    // to ask which real disccardpromos account to keep before it touches
-    // anything (see that function's comment). Distinct status so the UI
-    // can tell "this needs a choice" apart from "this actually failed".
+    // ACCOUNT_CONFLICT isn't a real failure — it's mergeApplicants pausing to
+    // ask which of two REAL, MONEY-holding accounts to keep before it
+    // touches anything (see that function's comment). Only fires when both
+    // sides genuinely have funds — anything less just auto-combines with no
+    // popup at all. Distinct status so the UI can tell "this needs a
+    // choice" apart from "this actually failed".
     if (e.code === 'ACCOUNT_CONFLICT') return res.status(409).json({ accountConflict: true, conflicts: e.conflicts });
     res.status(400).json({ error: e.message });
   }
