@@ -56,7 +56,7 @@ qs('#tab-byshul-btn').addEventListener('click', () => showCardsTab('byshul'));
 qs('#btn-export-cards').addEventListener('click', () => downloadAuthed('/cards/export?' + new URLSearchParams({ search: state.search, status: state.status }), 'cards.xlsx'));
 qs('#btn-sync-all').addEventListener('click', async () => {
   const btn = qs('#btn-sync-all'); btn.disabled = true; btn.textContent = 'Syncing…';
-  try { const r = await api('/cards/sync-all', { method: 'POST' }); toast(`Checked ${r.cardsChecked} card(s), synced ${r.transactionsSynced} new transaction(s)${r.cardsDiscovered ? `, found ${r.cardsDiscovered} card(s) activated directly on disccardpromos` : ''}${r.cardsRemoved ? `, deactivated ${r.cardsRemoved} card(s) removed on disccardpromos` : ''}${r.unattributed ? `, ${r.unattributed} transaction(s) couldn't be matched to a specific card (applicant holds more than one)` : ''}`); loadCards(); }
+  try { const r = await api('/cards/sync-all', { method: 'POST' }); toast(`Checked ${r.cardsChecked} card(s), synced ${r.transactionsSynced} new transaction(s)${r.cardsDiscovered ? `, found ${r.cardsDiscovered} card(s) activated directly on disccardpromos` : ''}${r.cardsRemoved ? `, deactivated ${r.cardsRemoved} card(s) removed on disccardpromos` : ''}${r.unattributed ? `, ${r.unattributed} transaction(s) couldn't be matched to a specific card (applicant holds more than one)` : ''}${r.malformed ? `, ${r.malformed} transaction(s) had an unrecognized shape and were skipped (check server logs)` : ''}`); loadCards(); }
   catch (err) { toast(err.message, true); }
   finally { btn.disabled = false; btn.textContent = 'Sync All Now'; }
 });

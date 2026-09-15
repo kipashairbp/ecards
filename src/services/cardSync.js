@@ -108,7 +108,7 @@ const cleanProviderId = id => String(id).replace(/\.0$/, '');
 // single 15-minute sweep. Omit index for a single-applicant caller (the
 // manual "Sync Now" button), which falls back to a live per-applicant GET.
 export async function syncApplicantCards(orgId, applicant, index) {
-  if (!applicant.provider_account_id || applicant.provider_exempt) return { discovered: 0, removed: 0, synced: 0, unattributed: 0 };
+  if (!applicant.provider_account_id || applicant.provider_exempt) return { discovered: 0, removed: 0, synced: 0, unattributed: 0, malformed: 0 };
   let customer;
   if (index) {
     const cleanId = cleanProviderId(applicant.provider_account_id);
@@ -118,10 +118,10 @@ export async function syncApplicantCards(orgId, applicant, index) {
       customer = await giftcard.getCustomerByExternalId(applicant.season_id, applicant.external_id, { balances: true, transactions: true });
     } catch (e) {
       console.error('[cardSync] failed to fetch customer for sync, applicant', applicant.id, ':', e.message);
-      return { discovered: 0, removed: 0, synced: 0, unattributed: 0 };
+      return { discovered: 0, removed: 0, synced: 0, unattributed: 0, malformed: 0 };
     }
   }
-  if (!customer) return { discovered: 0, removed: 0, synced: 0, unattributed: 0 };
+  if (!customer) return { discovered: 0, removed: 0, synced: 0, unattributed: 0, malformed: 0 };
   const remoteMasked = new Set(Array.isArray(customer.active_cards) ? customer.active_cards : []);
   const localActive = db.prepare(`SELECT id, card_number_masked FROM cards WHERE applicant_id = ? AND status IN ('assigned','activated')`).all(applicant.id);
   // Matched by trailing digits, not exact string equality. routes/cards.js's
@@ -165,6 +165,16 @@ export async function syncApplicantCards(orgId, applicant, index) {
     // disccardpromos' own dashboard shows for the same physical card.
     if (real !== local.card_number_masked) updateMask.run(real, local.id);
   }
+  // Refresh EVERY still-active local card's displayed amount to the real
+  // current balance on every sync — this used to only ever get written once,
+  // at assign time (routes/cards.js) or for a freshly-discovered card
+  // (above), and never again, so the Cards page went on showing whatever the
+  // committed amount happened to be the moment the card was assigned
+  // forever after, regardless of real spend-down or later top-ups.
+  if (localActive.length) {
+    const updateAmount = db.prepare(`UPDATE cards SET amount = ? WHERE id = ?`);
+    for (const local of localActive) updateAmount.run(balance, local.id);
+  }
 
   // Every local card this applicant has (including one just discovered
   // above), for transaction attribution below.
@@ -200,32 +210,53 @@ export async function syncApplicantCards(orgId, applicant, index) {
   }
   const insert = db.prepare(`INSERT OR IGNORE INTO card_transactions (id, card_id, provider_txn_id, type, amount, balance_after, store_name, store_id, occurred_at, raw_payload)
     VALUES (?,?,?,?,?,?,?,?,?,?)`);
+  let malformed = 0;
   for (const t of txns) {
-    // Real field names confirmed 2026-09-15 from a live sample: "card"
-    // (masked, "************1123" format — matched by trailing digits, see
-    // byLast4 above), "disccardPaid" (the actual amount debited from the
-    // account — preferred over "cartAmount", which can differ when a
-    // discount/split applies), "vendor", "timestamp". There is no "type"
-    // field in real responses at all; the sign-based guess is kept only as
-    // a fallback in case a refund ever does show up with a negative amount.
-    const maskedRaw = t.card || t.card_number_masked || t.masked_card_number || t.card_number || null;
-    const last4 = maskedRaw ? trailingDigits(maskedRaw) : null;
-    const cardId = (last4 && byLast4.get(last4)) || (maskedRaw && byMasked.get(maskedRaw)) || soleCardId;
-    if (!cardId) { unattributed++; continue; }
-    const amount = t.disccardPaid ?? t.cartAmount ?? t.amount;
-    const storeName = t.vendor || t.store_name || t.merchant || '';
-    const occurredAt = t.timestamp || t.occurred_at || t.date;
-    // Stringified explicitly — the real id is a bare JSON number (320972),
-    // and binding a raw JS integer into this TEXT column lets SQLite coerce
-    // it through REAL first, silently storing "320972.0" instead (the same
-    // trailing-".0" quirk documented elsewhere for provider_account_id).
-    const providerTxnId = String(t.id ?? t.transaction_id);
-    const info = insert.run(uuid(), cardId, providerTxnId, t.type || (amount < 0 ? 'refund' : 'purchase'), amount, t.balance_after ?? null, storeName, resolveStoreId(orgId, storeName), occurredAt, JSON.stringify(t));
-    if (info.changes) synced++;
+    // Each entry is handled in its own try/catch — one transaction whose
+    // shape doesn't match anything guessed below (an older/legacy entry
+    // kind, a refund/adjustment shape we haven't seen yet, ...) must never
+    // take down the rest of the array with it. Before this, a single bad
+    // entry (e.g. every guessed amount field missing, so `amount` came out
+    // `undefined` — better-sqlite3 throws on binding `undefined`) threw
+    // uncaught, aborting this whole loop and silently dropping every
+    // transaction after it for the rest of this sync — exactly the "only
+    // some transactions load, older ones never show up" symptom, since
+    // disccardpromos' own array order isn't something this app controls.
+    try {
+      // Real field names confirmed 2026-09-15 from a live sample: "card"
+      // (masked, "************1123" format — matched by trailing digits, see
+      // byLast4 above), "disccardPaid" (the actual amount debited from the
+      // account — preferred over "cartAmount", which can differ when a
+      // discount/split applies), "vendor", "timestamp". There is no "type"
+      // field in real responses at all; the sign-based guess is kept only as
+      // a fallback in case a refund ever does show up with a negative amount.
+      const maskedRaw = t.card || t.card_number_masked || t.masked_card_number || t.card_number || null;
+      const last4 = maskedRaw ? trailingDigits(maskedRaw) : null;
+      const cardId = (last4 && byLast4.get(last4)) || (maskedRaw && byMasked.get(maskedRaw)) || soleCardId;
+      if (!cardId) { unattributed++; continue; }
+      const amount = t.disccardPaid ?? t.cartAmount ?? t.amount;
+      const occurredAt = t.timestamp || t.occurred_at || t.date;
+      if (amount === undefined || occurredAt === undefined) {
+        malformed++;
+        console.error(`[cardSync] transaction ${t.id ?? t.transaction_id ?? '(no id)'} on customer ${customer.id ?? applicant.external_id} doesn't match any known shape (missing amount and/or date) — raw entry: ${JSON.stringify(t)}`);
+        continue;
+      }
+      const storeName = t.vendor || t.store_name || t.merchant || '';
+      // Stringified explicitly — the real id is a bare JSON number (320972),
+      // and binding a raw JS integer into this TEXT column lets SQLite coerce
+      // it through REAL first, silently storing "320972.0" instead (the same
+      // trailing-".0" quirk documented elsewhere for provider_account_id).
+      const providerTxnId = String(t.id ?? t.transaction_id);
+      const info = insert.run(uuid(), cardId, providerTxnId, t.type || (amount < 0 ? 'refund' : 'purchase'), amount, t.balance_after ?? null, storeName, resolveStoreId(orgId, storeName), occurredAt, JSON.stringify(t));
+      if (info.changes) synced++;
+    } catch (e) {
+      malformed++;
+      console.error(`[cardSync] failed to insert a transaction for customer ${customer.id ?? applicant.external_id}:`, e.message, '— raw entry:', JSON.stringify(t));
+    }
   }
   if (allLocal.length) db.prepare(`UPDATE cards SET last_synced_at = datetime('now') WHERE applicant_id = ?`).run(applicant.id);
 
-  return { discovered, removed, synced, unattributed };
+  return { discovered, removed, synced, unattributed, malformed };
 }
 
 // Sweeps every applicant with a disccardpromos account in an org: syncs
@@ -252,14 +283,14 @@ export async function syncAllCards(orgId) {
     }
     return indexBySeason.get(seasonId);
   };
-  let totalSynced = 0, cardsDiscovered = 0, cardsRemoved = 0, unattributed = 0;
+  let totalSynced = 0, cardsDiscovered = 0, cardsRemoved = 0, unattributed = 0, malformed = 0;
   for (const applicant of applicants) {
     try {
       const index = await getIndex(applicant.season_id);
-      const { discovered, removed, synced, unattributed: u } = await syncApplicantCards(orgId, applicant, index);
-      cardsDiscovered += discovered; cardsRemoved += removed; totalSynced += synced; unattributed += u;
+      const { discovered, removed, synced, unattributed: u, malformed: m } = await syncApplicantCards(orgId, applicant, index);
+      cardsDiscovered += discovered; cardsRemoved += removed; totalSynced += synced; unattributed += u; malformed += m;
     } catch (e) { console.error('[cardSync] sync failed for applicant', applicant.id, e.message); }
   }
   const cardsChecked = db.prepare(`SELECT COUNT(*) c FROM cards WHERE org_id = ? AND status IN ('assigned','activated')`).get(orgId).c;
-  return { cardsChecked, transactionsSynced: totalSynced, cardsDiscovered, cardsRemoved, unattributed };
+  return { cardsChecked, transactionsSynced: totalSynced, cardsDiscovered, cardsRemoved, unattributed, malformed };
 }

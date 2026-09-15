@@ -1224,6 +1224,20 @@ router.post('/duplicates/:flagId/merge', requirePermission('shuls', 'can_edit'),
     const result = mergeShuls(req.user.org_id, req.user.id, { primaryId, values, memberIds });
     const { undoSnapshot, ...after } = result;
     logAudit(req.user.org_id, req.user.id, 'merge', 'shul', primaryId, undoSnapshot, after, req.ip);
+    // A third place gabai_email can change besides the single-shul edit and
+    // the mass Excel re-upload: choosing a different value for it while
+    // resolving a duplicate flag. mergeShuls writes it straight onto the
+    // surviving row's gabai_email with no side effect of its own (same as
+    // the raw SQL update the bulk import used before it was wired up) — an
+    // admin merging two shul records and picking the correct email here
+    // kept the survivor's own portal login pointed at whichever (possibly
+    // wrong) address it already had, so Resend Welcome/invite kept going to
+    // the stale one after a merge exactly like it used to after every other
+    // gabai_email edit path.
+    if (values && values.gabai_email !== undefined) {
+      const survivor = db.prepare('SELECT portal_user_id, gabai_email FROM shuls WHERE id = ?').get(primaryId);
+      if (survivor) syncPortalEmailForShul(req.user.org_id, req.user.id, survivor.portal_user_id, survivor.gabai_email, req.ip);
+    }
     res.json(result);
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
