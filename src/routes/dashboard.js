@@ -90,7 +90,17 @@ router.get('/stats', (req, res) => {
     stats.cards = {
       total: db.prepare(`SELECT COUNT(*) c FROM cards WHERE org_id = ?${seasonClause}`).get(orgId, ...seasonParams).c,
       activated: db.prepare(`SELECT COUNT(*) c FROM cards WHERE org_id = ? AND status='activated'${seasonClause}`).get(orgId, ...seasonParams).c,
-      totalLoaded: db.prepare(`SELECT COALESCE(SUM(amount),0) t FROM cards WHERE org_id = ?${seasonClause}`).get(orgId, ...seasonParams).t,
+      // Every approved applicant's committed card_amount, NOT SUM(cards.amount)
+      // — the `cards` table only gets a row once a physical card number is
+      // actually registered/discovered (see cardSync.js), so an approved
+      // applicant whose money was loaded onto their disccardpromos package
+      // but who never had a physical card activated was silently missing
+      // from this total, even though Donor's Dash (routes/donorDashboard.js)
+      // already used this same applicants-based formula and read correctly.
+      // Same query as that page's `loaded` and this file's own /daily route
+      // below (which already made this exact call) — now genuinely one
+      // source of truth instead of two disagreeing ones.
+      totalLoaded: db.prepare(`SELECT COALESCE(SUM(card_amount),0) t FROM applicants WHERE org_id = ? AND approval_status = 'approved'${seasonClause}`).get(orgId, ...seasonParams).t,
     };
   }
   // Duplicate flags aren't tied to a season (a flagged duplicate is either
@@ -108,8 +118,23 @@ router.get('/stats', (req, res) => {
     stats.topStores = db.prepare(`SELECT s.id, s.name, COALESCE(SUM(CASE WHEN t.amount < 0 THEN -t.amount ELSE 0 END),0) total_purchases
       FROM stores s LEFT JOIN card_transactions t ON t.store_id = s.id LEFT JOIN cards c2 ON c2.id = t.card_id
       WHERE s.org_id = ?${storeSeasonClause} GROUP BY s.id ORDER BY total_purchases DESC LIMIT 5`).all(orgId, ...seasonParams).filter(s => s.total_purchases > 0);
+    // Genuinely ALL real spend, not just spend attributable to a store
+    // that's been added as a "participating store" record here — the
+    // headline "Total spent across all participating stores" figure used
+    // an INNER JOIN to stores, so any transaction whose vendor name (per
+    // disccardpromos) didn't match an already-configured store — which is
+    // the overwhelmingly common case for an org that hasn't manually
+    // pre-added every vendor disccardpromos actually has — was silently
+    // excluded from this total entirely, not just from the per-store
+    // breakdown where that scoping actually belongs. Fixing the sync
+    // pipeline to correctly pull and sign real transactions did nothing to
+    // move this number, since the real gap was here, not in what got
+    // synced. topStores above stays store-scoped on purpose — a per-store
+    // breakdown inherently can't include spend with no store to attribute
+    // it to — but the headline total no longer requires that match.
+    const storeCardSeasonClause = seasonId ? ' AND c2.season_id = ?' : '';
     stats.totalStoreSpend = db.prepare(`SELECT COALESCE(SUM(CASE WHEN t.amount < 0 THEN -t.amount ELSE 0 END),0) total
-      FROM card_transactions t JOIN stores s ON s.id = t.store_id JOIN cards c2 ON c2.id = t.card_id WHERE s.org_id = ?${storeSeasonClause}`).get(orgId, ...seasonParams).total;
+      FROM card_transactions t JOIN cards c2 ON c2.id = t.card_id WHERE c2.org_id = ?${storeCardSeasonClause}`).get(orgId, ...seasonParams).total;
   }
   res.json({ stats });
 });
