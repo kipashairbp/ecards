@@ -172,13 +172,18 @@ export async function syncApplicantCards(orgId, applicant, index) {
   const byMasked = new Map(allLocal.filter(c => c.card_number_masked).map(c => [c.card_number_masked, c.id]));
   const soleCardId = allLocal.length === 1 ? allLocal[0].id : null;
 
+  // Real per-card mask on a transaction (confirmed 2026-09-15 from a live
+  // sample: "************1123", 12 asterisks + last4) doesn't match either
+  // our own stored format or disccardpromos' own active_cards format
+  // ("****1123") — same mismatch already handled above for active_cards,
+  // matched here the same way, by trailing digits.
+  const byLast4 = new Map(allLocal.filter(c => c.card_number_masked).map(c => [trailingDigits(c.card_number_masked), c.id]));
+
   let synced = 0, unattributed = 0;
-  // customer.transactions is the best-guess field name for the array
-  // ?transactions=true adds — not yet confirmed against a real response
-  // (this environment can't reach disccardpromos' docs or API directly).
-  // Falls back to checking each package for a nested transactions array,
-  // a plausible alternate shape given amount/balance are already scoped
-  // per package there. If genuinely nothing is found, logs exactly which
+  // customer.transactions is confirmed (2026-09-15, live sample) as the
+  // real field name for the array ?transactions=true adds. Falls back to
+  // checking each package for a nested transactions array in case that
+  // ever changes. If genuinely nothing is found, logs exactly which
   // top-level (and array-valued) fields the real response DOES carry, so
   // the actual field name is discoverable straight from server logs the
   // next time a real sync runs, without needing a live sample handed over
@@ -196,11 +201,26 @@ export async function syncApplicantCards(orgId, applicant, index) {
   const insert = db.prepare(`INSERT OR IGNORE INTO card_transactions (id, card_id, provider_txn_id, type, amount, balance_after, store_name, store_id, occurred_at, raw_payload)
     VALUES (?,?,?,?,?,?,?,?,?,?)`);
   for (const t of txns) {
-    const masked = t.card_number_masked || t.masked_card_number || t.card_number || t.card || null;
-    const cardId = (masked && byMasked.get(masked)) || soleCardId;
+    // Real field names confirmed 2026-09-15 from a live sample: "card"
+    // (masked, "************1123" format — matched by trailing digits, see
+    // byLast4 above), "disccardPaid" (the actual amount debited from the
+    // account — preferred over "cartAmount", which can differ when a
+    // discount/split applies), "vendor", "timestamp". There is no "type"
+    // field in real responses at all; the sign-based guess is kept only as
+    // a fallback in case a refund ever does show up with a negative amount.
+    const maskedRaw = t.card || t.card_number_masked || t.masked_card_number || t.card_number || null;
+    const last4 = maskedRaw ? trailingDigits(maskedRaw) : null;
+    const cardId = (last4 && byLast4.get(last4)) || (maskedRaw && byMasked.get(maskedRaw)) || soleCardId;
     if (!cardId) { unattributed++; continue; }
-    const storeName = t.store_name || t.merchant || '';
-    const info = insert.run(uuid(), cardId, t.id || t.transaction_id, t.type || (t.amount < 0 ? 'purchase' : 'refund'), t.amount, t.balance_after ?? null, storeName, resolveStoreId(orgId, storeName), t.occurred_at || t.date, JSON.stringify(t));
+    const amount = t.disccardPaid ?? t.cartAmount ?? t.amount;
+    const storeName = t.vendor || t.store_name || t.merchant || '';
+    const occurredAt = t.timestamp || t.occurred_at || t.date;
+    // Stringified explicitly — the real id is a bare JSON number (320972),
+    // and binding a raw JS integer into this TEXT column lets SQLite coerce
+    // it through REAL first, silently storing "320972.0" instead (the same
+    // trailing-".0" quirk documented elsewhere for provider_account_id).
+    const providerTxnId = String(t.id ?? t.transaction_id);
+    const info = insert.run(uuid(), cardId, providerTxnId, t.type || (amount < 0 ? 'refund' : 'purchase'), amount, t.balance_after ?? null, storeName, resolveStoreId(orgId, storeName), occurredAt, JSON.stringify(t));
     if (info.changes) synced++;
   }
   if (allLocal.length) db.prepare(`UPDATE cards SET last_synced_at = datetime('now') WHERE applicant_id = ?`).run(applicant.id);

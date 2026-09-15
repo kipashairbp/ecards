@@ -238,15 +238,21 @@ export async function addFunds(seasonId, { customerId, externalId, discountId, a
 }
 
 // The read half of "add funds" for the one caller that actually needs it —
-// a future top-up on an EXISTING balance (not first-time loading, which
-// never needs to read first — see addFunds' comment). Returns the current
-// amount on the given package/discount, or 0 if the customer has no such
-// package yet.
+// duplicates.js's merge-conflict "combine balances" feature, which needs to
+// know how much REAL, currently-spendable money is sitting on each of two
+// accounts before summing them. Confirmed 2026-09-15 from a live sample:
+// packages[].amount is ALWAYS null in real responses (never the write-target
+// echo it was assumed to be — see addFunds above, which really does write
+// `amount`, but that value shows up on the top-level customer.amount, not
+// back on the package); packages[].balance is the real field, and it
+// naturally decreases as the customer actually spends. Requires
+// ?balances=true to be populated at all (getCustomerById now supports that
+// flag). Returns 0 if the customer has no such package yet.
 export async function getCustomerPackageAmount(seasonId, customerId, discountId) {
   if (isMockMode(seasonId)) return 0;
-  const customer = await getCustomerById(seasonId, customerId);
+  const customer = await getCustomerById(seasonId, customerId, { balances: true });
   const pkg = (customer?.packages || []).find(p => String(p.id) === String(discountId));
-  return pkg ? Number(pkg.amount) || 0 : 0;
+  return pkg ? Number(pkg.balance) || 0 : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -348,9 +354,10 @@ export async function findCustomerByExternalId(seasonId, externalId) {
 // carries the external_id we sent, disambiguating "by-external-id doesn't
 // exist as a route" from "it exists but external_id isn't stored/matched
 // the way we assumed."
-export async function getCustomerById(seasonId, customerId) {
+export async function getCustomerById(seasonId, customerId, { balances = false, transactions = false } = {}) {
   if (isMockMode(seasonId)) return null;
-  return call(seasonId, `/org/customers/${normalizeCustomerId(customerId)}/`);
+  const qs = [balances && 'balances=true', transactions && 'transactions=true'].filter(Boolean).join('&');
+  return call(seasonId, `/org/customers/${normalizeCustomerId(customerId)}/${qs ? `?${qs}` : ''}`);
 }
 
 // Live-tested 2026-08-19: disccardpromos silently drops external_id from

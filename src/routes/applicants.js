@@ -166,7 +166,7 @@ async function ensureProviderAccount(orgId, applicant, index) {
     const staleInIndex = index ? !index.byId.has(cleanId) : false;
     if (!staleInIndex) {
       try {
-        const current = index ? index.byId.get(cleanId) : await giftcard.getCustomerById(applicant.season_id, applicant.provider_account_id);
+        const current = index ? index.byId.get(cleanId) : await giftcard.getCustomerById(applicant.season_id, applicant.provider_account_id, { balances: true });
         const shared = db.prepare('SELECT 1 FROM applicants WHERE provider_account_id = ? AND id != ?').get(applicant.provider_account_id, applicant.id);
         if (shared) await giftcard.reactivateCustomer(applicant.season_id, applicant.provider_account_id, current?.external_id || applicant.external_id);
         else await giftcard.updateCustomer(applicant.season_id, applicant.provider_account_id, { ...opts, isActive: true, externalId: current?.external_id || applicant.external_id });
@@ -196,8 +196,14 @@ async function ensureProviderAccount(orgId, applicant, index) {
           // the index, or the getCustomerById call above) shows the balance
           // already matches, so a routine re-approve of an unchanged amount
           // doesn't cost an extra PATCH every time.
-          const existingPkg = (current?.packages || []).find(p => String(p.id) === String(discountId));
-          const alreadyCorrect = existingPkg && Number(existingPkg.amount) === applicant.card_amount;
+          // Confirmed 2026-09-15 from a live sample: packages[].amount is
+          // ALWAYS null in real responses — the write-target echo actually
+          // shows up on the top-level customer.amount instead (packages[].
+          // balance is a different figure: the real, currently-spendable
+          // balance, which correctly decreases as the customer spends and so
+          // is NOT what "does this match what we committed" should compare
+          // against).
+          const alreadyCorrect = current && Number(current.amount) === applicant.card_amount;
           if (discountId && !alreadyCorrect) {
             try { await giftcard.addFunds(applicant.season_id, { customerId: applicant.provider_account_id, externalId: current?.external_id || applicant.external_id, discountId, amount: applicant.card_amount }); }
             catch (e) { console.error(`[giftcard] failed to rewrite the balance for applicant ${applicant.id}:`, e.message); }
@@ -253,7 +259,7 @@ function providerIndexCache() {
   const cache = new Map();
   return async (seasonId) => {
     if (!cache.has(seasonId)) {
-      cache.set(seasonId, giftcard.isMockMode(seasonId) ? Promise.resolve(null) : giftcard.buildCustomerIndex(seasonId).catch(e => {
+      cache.set(seasonId, giftcard.isMockMode(seasonId) ? Promise.resolve(null) : giftcard.buildCustomerIndex(seasonId, { balances: true }).catch(e => {
         console.error(`[giftcard] couldn't pull the customer list up front for this batch (season ${seasonId}) — falling back to a per-applicant lookup:`, e.message);
         return null;
       }));
@@ -721,7 +727,7 @@ async function runProviderAudit(orgId, seasonId, job) {
   // one in-memory pull, so all three sections see the same snapshot instead
   // of three snapshots that could disagree with each other mid-run.
   let list = null, listError = null;
-  try { list = await giftcard.listCustomers(seasonId); } catch (e) { listError = e.message; }
+  try { list = await giftcard.listCustomers(seasonId, { balances: true }); } catch (e) { listError = e.message; }
   const byId = new Map(), byExt = new Map();
   for (const c of list || []) {
     if (c?.id == null) continue;
@@ -817,8 +823,11 @@ async function runProviderAudit(orgId, seasonId, job) {
           }
         }
       }
+      // packages[].balance, not .amount — confirmed 2026-09-15 that .amount
+      // is always null in real responses; .balance is the real, currently-
+      // spendable balance actually sitting on this orphaned account.
       const orphanPkg = orphanDiscountId ? (c.packages || []).find(p => String(p.id) === String(orphanDiscountId)) : null;
-      orphans.push({ accountId: id, name: `${c.first_name || ''} ${c.last_name || ''}`.trim() || '(no name)', externalId: ext, groupName: c.group_name || null, isActive: c.is_active !== false, origin, balance: orphanPkg ? Number(orphanPkg.amount) || 0 : null });
+      orphans.push({ accountId: id, name: `${c.first_name || ''} ${c.last_name || ''}`.trim() || '(no name)', externalId: ext, groupName: c.group_name || null, isActive: c.is_active !== false, origin, balance: orphanPkg ? Number(orphanPkg.balance) || 0 : null });
     }
     provider = { total: list.length, active, inactive, orphans };
   }
@@ -885,7 +894,7 @@ async function runProviderEnforce(orgId, seasonId, job) {
   const unfixable = [], notes = [];
 
   const pullList = async () => {
-    const list = await giftcard.listCustomers(seasonId);
+    const list = await giftcard.listCustomers(seasonId, { balances: true });
     const byId = new Map(), byExt = new Map();
     for (const c of list) {
       if (c?.id == null) continue;
@@ -956,14 +965,25 @@ async function runProviderEnforce(orgId, seasonId, job) {
           if (!discountId) {
             notes.push(`${describe(a)}: $${committed} is committed but no disccardpromos Package/Discount ID is configured, so the balance can't be verified or corrected`);
           } else {
-            const pkg = (cust.packages || []).find(p => String(p.id) === String(discountId));
-            const current = pkg ? Number(pkg.amount) || 0 : 0;
+            // customer.amount (top-level), not packages[].amount — confirmed
+            // 2026-09-15 from a live sample that packages[].amount is ALWAYS
+            // null in real responses, so comparing against it here always
+            // read as $0 and made this believe every account was out of
+            // sync, forcing addFunds on EVERY run (every 15 minutes via the
+            // background enforcer) and silently overwriting the customer's
+            // real, actually-spent-down balance back to the full committed
+            // amount. customer.amount is the real echo of what was last
+            // written here — packages[].balance (the real spendable balance,
+            // which legitimately decreases as the customer spends) is
+            // deliberately NOT used for this comparison, since spend-down is
+            // expected and must never be "corrected" back up.
+            const current = Number(cust.amount) || 0;
             if (current !== committed) {
               try {
                 await giftcard.addFunds(seasonId, { customerId: cust._id, externalId: cust.external_id || a.external_id, discountId, amount: committed });
                 counts.fundsLoaded++;
-                if (pkg) pkg.amount = committed; // keep the in-memory list correct for any later iteration sharing this account
-              } catch (e) { notes.push(`${describe(a)}: balance is $${current} but $${committed} is committed — rewriting it failed: ${e.message}`); }
+                cust.amount = committed; // keep the in-memory list correct for any later iteration sharing this account
+              } catch (e) { notes.push(`${describe(a)}: on-file amount is $${current} but $${committed} is committed — rewriting it failed: ${e.message}`); }
             }
           }
         }
@@ -1107,6 +1127,21 @@ router.get('/provider-enforce', requireAdmin, (req, res) => {
 // deactivating is reversible on their dashboard. Only ever for an id the
 // last audit actually reported as an orphan, so this can't be pointed at
 // an account some applicant still legitimately holds.
+// Re-checked here, not just trusted from whenever the audit last ran —
+// something here could have linked this exact account in the meantime
+// (a fresh approval, a retry-sync, ...). Compares NORMALIZED ids on both
+// sides (cleanProviderId, same as the audit's own ourIds computation
+// above) rather than a raw SQL string match against provider_account_id —
+// a legacy row that predates db.js's own id-normalization migration (or
+// any future write that isn't perfectly normalized) could otherwise carry
+// a trailing ".0" that a plain `= ?` comparison would never match,
+// wrongly clearing an account that's actually still held by a real
+// applicant here for an irreversible delete.
+function accountStillHeldLocally(orgId, accountId) {
+  return db.prepare('SELECT provider_account_id FROM applicants WHERE org_id = ? AND provider_account_id IS NOT NULL').all(orgId)
+    .some(r => cleanProviderId(r.provider_account_id) === accountId);
+}
+
 router.post('/provider-audit/deactivate-orphan', requireAdmin, async (req, res) => {
   const seasonId = req.body?.season_id || getActiveSeasonId(req.user.org_id);
   const accountId = req.body?.account_id ? cleanProviderId(req.body.account_id) : null;
@@ -1114,7 +1149,7 @@ router.post('/provider-audit/deactivate-orphan', requireAdmin, async (req, res) 
   const last = loadProviderAudit(req.user.org_id, seasonId);
   const orphan = last?.provider?.orphans?.find(o => o.accountId === accountId);
   if (!orphan) return res.status(400).json({ error: 'That account was not reported as an orphan by the last verification — run Verify again first.' });
-  if (db.prepare('SELECT 1 FROM applicants WHERE org_id = ? AND provider_account_id = ?').get(req.user.org_id, accountId)) {
+  if (accountStillHeldLocally(req.user.org_id, accountId)) {
     return res.status(400).json({ error: 'An applicant here now holds that account — nothing to do.' });
   }
   try {
@@ -1145,7 +1180,7 @@ router.post('/provider-audit/delete-orphan', requireAdmin, async (req, res) => {
   const last = loadProviderAudit(req.user.org_id, seasonId);
   const orphan = last?.provider?.orphans?.find(o => o.accountId === accountId);
   if (!orphan) return res.status(400).json({ error: 'That account was not reported as an orphan by the last verification — run Verify again first.' });
-  if (db.prepare('SELECT 1 FROM applicants WHERE org_id = ? AND provider_account_id = ?').get(req.user.org_id, accountId)) {
+  if (accountStillHeldLocally(req.user.org_id, accountId)) {
     return res.status(400).json({ error: 'An applicant here now holds that account — nothing to do.' });
   }
   try {

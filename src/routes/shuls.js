@@ -65,6 +65,35 @@ function ensureShulPortalUser(orgId, shul, portalEmailOverride) {
   return db.prepare('SELECT * FROM users WHERE id = ?').get(uid);
 }
 
+// Keeps a shul's portal login pointed at whatever gabai_email now says,
+// whenever it changes — ensureShulPortalUser only ever reads gabai_email at
+// invite time, so without this, editing (or blanking) it afterward had zero
+// effect on an already-issued login: the old address kept working (or
+// receiving Resend Welcome / invite emails) indefinitely (same bug fixed
+// identically in stores.js's PUT /:id). Syncs regardless of is_active — a
+// still-pending invite (never logged in) has no session to protect either
+// way, so there's no self-lockout risk to weigh; a genuinely unusable new
+// value (blank, or colliding with another account — users.email is NOT
+// NULL/UNIQUE) revokes an already-active login instead of syncing to it,
+// same as before. Called from every place gabai_email can change: the
+// single-shul PUT /:id edit AND the mass Excel re-upload (POST /import) —
+// missing it from either one is exactly how "I fixed the email but the
+// welcome email still went to the old address" kept recurring.
+function syncPortalEmailForShul(orgId, adminUserId, portalUserId, newGabaiEmail, ip) {
+  if (!portalUserId) return;
+  const portalUser = db.prepare('SELECT * FROM users WHERE id = ?').get(portalUserId);
+  if (!portalUser) return;
+  const newEmail = normalizeEmail(newGabaiEmail);
+  if (normalizeEmail(portalUser.email) === newEmail) return;
+  const clash = newEmail ? db.prepare('SELECT id FROM users WHERE email = ? COLLATE NOCASE AND id != ?').get(newEmail, portalUser.id) : null;
+  if (newEmail && !clash) {
+    db.prepare('UPDATE users SET email = ? WHERE id = ?').run(newEmail, portalUser.id);
+  } else if (portalUser.is_active) {
+    db.prepare('UPDATE users SET is_active = 0, token_version = token_version + 1 WHERE id = ?').run(portalUser.id);
+    logAudit(orgId, adminUserId, 'update', 'user', portalUser.id, { is_active: 1 }, { is_active: 0 }, ip);
+  }
+}
+
 // A reused already-active portal user (returning shul, same gabai email —
 // see ensureShulPortalUser) has no invite_token to accept; send them
 // straight to login instead of a broken /accept-invite?token=null link.
@@ -673,43 +702,7 @@ router.put('/:id', (req, res) => {
   }
   const updated = db.prepare('SELECT * FROM shuls WHERE id = ?').get(shul.id);
   logAudit(req.user.org_id, req.user.id, 'update', 'shul', shul.id, shul, updated, req.ip);
-  // ensureShulPortalUser only ever reads gabai_email at invite time — an
-  // edit here otherwise had zero effect on an already-issued login, so
-  // "removing" a shul's email in this form never actually revoked access:
-  // the old login kept working with the old address indefinitely (same bug
-  // as stores.js's PUT /:id, fixed there identically). Confirmed 2026-09-15:
-  // an admin's edit here should sync the login too, same as a shul's own
-  // self-edit already did — not revoke it — so notification emails
-  // (invite/welcome/reminders, all sent to users.email) actually reach the
-  // corrected address right away instead of requiring a manual re-invite.
-  // Only a genuinely unusable new value still revokes instead of syncing:
-  // users.email is NOT NULL/UNIQUE, so a blanked email or one that collides
-  // with another account can't be synced to either way.
-  //
-  // Confirmed 2026-09-15 (second pass): this used to only run when the
-  // portal user was already ACTIVE — a shul invited but not yet logged in
-  // (portal_user_id set, is_active still 0, exactly the state Resend
-  // Welcome exists for) fell through untouched, so correcting a typo'd
-  // email before the shul ever accepted the invite silently kept sending
-  // Resend Welcome to the old, wrong address forever. The sync must apply
-  // regardless of is_active — a pending login has no session to protect
-  // either way, so there's no self-lockout risk to weigh here at all.
-  if (sets.includes('gabai_email') && updated.portal_user_id) {
-    const portalUser = db.prepare('SELECT * FROM users WHERE id = ?').get(updated.portal_user_id);
-    const newEmail = normalizeEmail(updated.gabai_email);
-    if (portalUser && normalizeEmail(portalUser.email) !== newEmail) {
-      const clash = newEmail ? db.prepare('SELECT id FROM users WHERE email = ? COLLATE NOCASE AND id != ?').get(newEmail, portalUser.id) : null;
-      if (newEmail && !clash) {
-        db.prepare('UPDATE users SET email = ? WHERE id = ?').run(newEmail, portalUser.id);
-      } else if (portalUser.is_active) {
-        // Nothing to actually revoke on an already-pending invite (is_active
-        // is already 0) — it just keeps its old address until fixed to
-        // something usable, same as it always has.
-        db.prepare('UPDATE users SET is_active = 0, token_version = token_version + 1 WHERE id = ?').run(portalUser.id);
-        logAudit(req.user.org_id, req.user.id, 'update', 'user', portalUser.id, { is_active: 1 }, { is_active: 0 }, req.ip);
-      }
-    }
-  }
+  if (sets.includes('gabai_email')) syncPortalEmailForShul(req.user.org_id, req.user.id, updated.portal_user_id, updated.gabai_email, req.ip);
   const shulOut = { ...updated };
   if (isSelf) { delete shulOut.permanent_comments; delete shulOut.needs_follow_up_call; delete shulOut.comments; }
   const missingInfo = shulInfoErrors(updated);
@@ -1336,6 +1329,12 @@ router.post('/import', requirePermission('shuls', 'can_edit'), upload.single('fi
           db.prepare(`UPDATE shuls SET ${sets.map(f => `${f}=?`).join(',')}, updated_at=datetime('now') WHERE id=?`).run(...vals, existing.id);
           updatedIds.push(existing.id); updatedNames.push(existing.name_en);
           updatedDiffs.push({ id: existing.id, before: Object.fromEntries(sets.map(f => [f, existing[f]])) });
+          // Same portal-login sync PUT /:id uses — a mass Excel re-upload
+          // editing gabai_email is exactly as real an "edit" as the single-
+          // shul modal, and used to bypass this entirely (a raw UPDATE with
+          // no side effect at all), so Resend Welcome/invite kept going to
+          // whatever the login already had regardless of what the sheet said.
+          if (sets.includes('gabai_email')) syncPortalEmailForShul(req.user.org_id, req.user.id, existing.portal_user_id, SHUL_UPDATABLE_FIELDS.gabai_email(r), req.ip);
         }
         updated++;
       } catch (e) {
