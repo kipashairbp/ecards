@@ -234,9 +234,9 @@ export async function syncApplicantCards(orgId, applicant, index) {
       const last4 = maskedRaw ? trailingDigits(maskedRaw) : null;
       const cardId = (last4 && byLast4.get(last4)) || (maskedRaw && byMasked.get(maskedRaw)) || soleCardId;
       if (!cardId) { unattributed++; continue; }
-      const amount = t.disccardPaid ?? t.cartAmount ?? t.amount;
+      const rawAmount = t.disccardPaid ?? t.cartAmount ?? t.amount;
       const occurredAt = t.timestamp || t.occurred_at || t.date;
-      if (amount === undefined || occurredAt === undefined) {
+      if (rawAmount === undefined || occurredAt === undefined) {
         malformed++;
         console.error(`[cardSync] transaction ${t.id ?? t.transaction_id ?? '(no id)'} on customer ${customer.id ?? applicant.external_id} doesn't match any known shape (missing amount and/or date) — raw entry: ${JSON.stringify(t)}`);
         continue;
@@ -247,7 +247,25 @@ export async function syncApplicantCards(orgId, applicant, index) {
       // it through REAL first, silently storing "320972.0" instead (the same
       // trailing-".0" quirk documented elsewhere for provider_account_id).
       const providerTxnId = String(t.id ?? t.transaction_id);
-      const info = insert.run(uuid(), cardId, providerTxnId, t.type || (amount < 0 ? 'refund' : 'purchase'), amount, t.balance_after ?? null, storeName, resolveStoreId(orgId, storeName), occurredAt, JSON.stringify(t));
+      const type = t.type || (rawAmount < 0 ? 'refund' : 'purchase');
+      // Every existing spend total in this app (dashboard.js's
+      // totalStoreSpend/topStores, stores.js's total_purchases) sums
+      // card_transactions by SIGN, not by `type`: negative = a purchase,
+      // positive = money added back (refund/load) — set by the ONE other
+      // writer of this table, /cards/assign's initial "load" row, which is
+      // always a positive amount. disccardPaid/cartAmount are always
+      // POSITIVE in real disccardpromos data (confirmed 2026-09-15 — it's
+      // "how much was charged", not signed), so storing it as-is put every
+      // single real purchase on the wrong side of every sign check in the
+      // app — the actual reason store/dashboard spend totals came out a
+      // small fraction of the real disccardpromos number, since virtually
+      // all real spend was silently excluded from every SUM(...WHERE
+      // amount < 0...) in the codebase. Negating it here (a purchase becomes
+      // negative, a refund becomes positive) is the one place this needs to
+      // happen to match every existing convention instead of rewriting every
+      // query that already relies on it.
+      const storedAmount = -rawAmount;
+      const info = insert.run(uuid(), cardId, providerTxnId, type, storedAmount, t.balance_after ?? null, storeName, resolveStoreId(orgId, storeName), occurredAt, JSON.stringify(t));
       if (info.changes) synced++;
     } catch (e) {
       malformed++;

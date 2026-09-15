@@ -726,7 +726,17 @@ router.post('/:id/approve', requirePermission('shuls', 'can_edit'), async (req, 
     .run(slots, user.id, shul.id);
   const loginUrl = shulLoginUrl(user);
   const tmpl = renderSystemTemplate(req.user.org_id, 'accountApproved', { shulName: shul.name_en, loginUrl, slots });
-  const { emailError } = await sendMailChecked(req.user.org_id, user.email, tmpl.subject, tmpl.body, { replyTo: tmpl.replyTo, sentBy: req.user.id });
+  // Every outbound admin-triggered email below is sent to shul.gabai_email
+  // directly, NOT user.email — gabai_email is the single, always-fresh
+  // field an admin actually edits; user.email is a separate denormalized
+  // copy kept in sync (for LOGIN purposes only, via syncPortalEmailForShul)
+  // across three different places gabai_email can change (single edit,
+  // mass Excel re-upload, duplicate-shul merge). A gap in any one of those
+  // sync call sites meant outbound mail silently kept using a stale copy
+  // even after the admin-visible gabai_email was already correct — reading
+  // the canonical field directly here means it can never lag behind
+  // regardless of whether that sync ran.
+  const { emailError } = await sendMailChecked(req.user.org_id, shul.gabai_email, tmpl.subject, tmpl.body, { replyTo: tmpl.replyTo, sentBy: req.user.id });
   if (emailError) console.error('[mail] shul approval email failed:', emailError);
   logAudit(req.user.org_id, req.user.id, 'approve', 'shul', shul.id, shul, { slots_allocated: slots }, req.ip);
   res.json({ ok: true, shul: db.prepare('SELECT * FROM shuls WHERE id = ?').get(shul.id), emailError });
@@ -748,7 +758,7 @@ router.post('/:id/resend-welcome', requirePermission('shuls', 'can_edit'), async
   db.prepare('UPDATE users SET invite_token = ?, invite_expires = ? WHERE id = ?').run(token, expires, user.id);
   const loginUrl = `${process.env.APP_URL || ''}/accept-invite?token=${token}`;
   const tmpl = renderSystemTemplate(req.user.org_id, 'accountApproved', { shulName: shul.name_en, loginUrl, slots: shul.slots_allocated });
-  const { emailError } = await sendMailChecked(req.user.org_id, user.email, tmpl.subject, tmpl.body, { replyTo: tmpl.replyTo, sentBy: req.user.id });
+  const { emailError } = await sendMailChecked(req.user.org_id, shul.gabai_email, tmpl.subject, tmpl.body, { replyTo: tmpl.replyTo, sentBy: req.user.id });
   if (emailError) console.error('[mail] shul welcome resend failed:', emailError);
   res.json({ ok: true, emailError });
 });
@@ -828,7 +838,7 @@ router.post('/mass-approve', requirePermission('shuls', 'can_edit'), async (req,
     const loginUrl = shulLoginUrl(user);
     user = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
     const tmpl = renderSystemTemplate(req.user.org_id, 'accountApproved', { shulName: shul.name_en, loginUrl, slots: slots_allocated });
-    const { emailError } = await sendMailChecked(req.user.org_id, user.email, tmpl.subject, tmpl.body, { replyTo: tmpl.replyTo, sentBy: req.user.id });
+    const { emailError } = await sendMailChecked(req.user.org_id, shul.gabai_email, tmpl.subject, tmpl.body, { replyTo: tmpl.replyTo, sentBy: req.user.id });
     if (emailError) { emailErrors++; console.error('[mail] mass-approve shul email failed:', emailError); }
     affectedIds.push(shul.id); names.push(shul.name_en);
     // Per-record prior state — the same three columns this route overwrites
@@ -857,7 +867,7 @@ router.post('/:id/invite', requirePermission('shuls', 'can_edit'), async (req, r
   if (shul.portal_user_id !== user.id) db.prepare('UPDATE shuls SET portal_user_id = ? WHERE id = ?').run(user.id, shul.id);
   const loginUrl = shulLoginUrl(user);
   const tmpl = renderSystemTemplate(req.user.org_id, 'accountApproved', { shulName: shul.name_en, loginUrl, slots: shul.slots_allocated });
-  const { emailError } = await sendMailChecked(req.user.org_id, user.email, tmpl.subject, tmpl.body, { replyTo: tmpl.replyTo, sentBy: req.user.id });
+  const { emailError } = await sendMailChecked(req.user.org_id, shul.gabai_email, tmpl.subject, tmpl.body, { replyTo: tmpl.replyTo, sentBy: req.user.id });
   if (emailError) console.error('[mail] shul invite email failed:', emailError);
   logAudit(req.user.org_id, req.user.id, 'update', 'shul', shul.id, { portal_user_id: shul.portal_user_id }, { portal_user_id: user.id }, req.ip);
   res.json({ ok: true, shul: db.prepare('SELECT * FROM shuls WHERE id = ?').get(shul.id), emailError });
@@ -898,7 +908,7 @@ router.post('/mass-invite', requirePermission('shuls', 'can_edit'), async (req, 
     if (shul.portal_user_id !== user.id) db.prepare('UPDATE shuls SET portal_user_id = ? WHERE id = ?').run(user.id, shul.id);
     const loginUrl = shulLoginUrl(user);
     const tmpl = renderSystemTemplate(req.user.org_id, 'accountApproved', { shulName: shul.name_en, loginUrl, slots: shul.slots_allocated });
-    const { emailError } = await sendMailChecked(req.user.org_id, user.email, tmpl.subject, tmpl.body, { replyTo: tmpl.replyTo, sentBy: req.user.id });
+    const { emailError } = await sendMailChecked(req.user.org_id, shul.gabai_email, tmpl.subject, tmpl.body, { replyTo: tmpl.replyTo, sentBy: req.user.id });
     if (emailError) { emailErrors++; console.error('[mail] mass-invite shul email failed:', emailError); }
     affectedIds.push(shul.id); names.push(shul.name_en);
     invited++;
