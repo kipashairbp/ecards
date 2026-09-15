@@ -156,6 +156,27 @@ router.get('/export', requirePermission('stores', 'can_export'), (req, res) => {
   sendXlsx(res, `stores-${Date.now()}.xlsx`, redact(withSpend, req.permission.hidden_fields));
 });
 
+// Every id matching the current list filters (search/status/season), not
+// just one page — same "Select All Matching Filters" pattern as
+// /applicants/ids and /shuls/ids, so mass email/SMS can target a group like
+// "all Active stores" or "all Pending stores" in one click instead of
+// paging through and hand-checking rows. Must be registered before /:id.
+router.get('/ids', (req, res) => {
+  const { search, setup_status, season_id } = req.query;
+  let { where, params } = scopeWhere(req);
+  if (setup_status) { where += ' AND setup_status = ?'; params.push(setup_status); }
+  if (season_id) { where += ' AND season_id = ?'; params.push(season_id); }
+  if (search) {
+    where += ` AND (name LIKE ? OR address LIKE ? OR city LIKE ? OR state LIKE ? OR zip LIKE ? OR phone LIKE ?
+      OR manager_name LIKE ? OR manager_phone LIKE ? OR manager_email LIKE ? OR owner_name LIKE ? OR owner_phone LIKE ? OR owner_email LIKE ?
+      OR pos_system LIKE ? OR comments LIKE ? OR discount LIKE ?)`;
+    const like = `%${search}%`;
+    params.push(like, like, like, like, like, like, like, like, like, like, like, like, like, like, like);
+  }
+  const ids = db.prepare(`SELECT id FROM stores ${where}`).all(...params).map(r => r.id);
+  res.json({ ids });
+});
+
 router.get('/:id', (req, res) => {
   const store = db.prepare('SELECT * FROM stores WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!store) return res.status(404).json({ error: 'Not found' });

@@ -16,6 +16,7 @@ renderShell('/admin/stores', `
   <div class="flex-between"><h2>Participating Stores</h2><div class="pill-row"><button class="btn btn-outline btn-sm" id="btn-template">Download Template</button><button class="btn btn-outline btn-sm" id="btn-import">Mass Upload</button><button class="btn btn-outline btn-sm" id="btn-export">Export Excel</button><button class="btn btn-primary btn-sm" id="btn-new">+ Add Store</button></div></div>
   <div class="toolbar"><input id="f-search" placeholder="Search store name or city…"><select id="f-status"><option value="">All statuses</option><option value="pending">Pending</option><option value="in_progress">In Progress</option><option value="active">Active</option><option value="inactive">Inactive</option><option value="rejected">Rejected</option></select><select id="f-source"><option value="">All sources</option><option value="application">Self-Applied</option><option value="admin">Admin Added</option></select>
     <select id="f-season"></select>
+    <button class="btn btn-sm btn-outline" id="btn-select-all-filtered">Select All Matching Filters</button>
     <select id="mass-action">
       <option value="status-pending">Set to Pending</option>
       <option value="status-in_progress">Set to In Progress</option>
@@ -69,6 +70,30 @@ function onCheck(e) {
   qs('#btn-mass-apply').textContent = `Apply to Selected (${selected.size})`;
   qs('#btn-mass-apply').disabled = selected.size === 0;
 }
+
+// Selects every store id matching the CURRENT filters (status/search/season)
+// in one click — same "Select All Matching Filters" pattern as the
+// Applicants and Shuls lists, so "email every Active store" or "text every
+// Pending store" doesn't mean hand-checking rows. Goes straight to the
+// backend rather than just checking what's rendered, since `state.source`
+// (Self-Applied/Admin Added) is filtered client-side only and isn't a
+// column /stores/ids can filter on. Merges into `selected` rather than
+// replacing it, so it composes with rows already hand-picked.
+qs('#btn-select-all-filtered').addEventListener('click', async () => {
+  const btn = qs('#btn-select-all-filtered');
+  btn.disabled = true;
+  try {
+    const params = new URLSearchParams({ search: state.search, setup_status: state.status, season_id: state.season_id });
+    const { ids } = await api('/stores/ids?' + params);
+    for (const id of ids) selected.add(id);
+    qsa('.row-chk').forEach(c => { if (selected.has(c.dataset.id)) c.checked = true; });
+    qs('#chk-all').checked = qsa('.row-chk').length > 0 && qsa('.row-chk:not(:checked)').length === 0;
+    qs('#btn-mass-apply').textContent = `Apply to Selected (${selected.size})`;
+    qs('#btn-mass-apply').disabled = selected.size === 0;
+    toast(`Selected ${ids.length} matching the current filters`);
+  } catch (err) { toast(err.message, true); }
+  finally { btn.disabled = false; }
+});
 
 // Inline save for the Disccard Setup Comments column — same pattern as the
 // Shuls list's Seasonal Comments (skip the round-trip if unchanged, revert
