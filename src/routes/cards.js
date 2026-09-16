@@ -6,6 +6,7 @@ import * as giftcard from '../services/giftcard.js';
 import { sendXlsx } from '../services/xlsx.js';
 import { syncOneCard, syncAllCards, lockApplicantCards } from '../services/cardSync.js';
 import { normalizePhone, isValidPhone } from '../utils/phone.js';
+import { getActiveSeasonId } from '../utils/formSchedule.js';
 
 const router = Router();
 router.use(auth, requirePermission('cards'));
@@ -66,7 +67,7 @@ router.get('/by-shul', (req, res) => {
   const rows = db.prepare(`
     SELECT s.id AS shul_id, s.name_en AS shul_name,
       COALESCE(SUM(c.amount), 0) AS allocated,
-      COALESCE((SELECT SUM(CASE WHEN t.amount < 0 THEN -t.amount ELSE 0 END)
+      COALESCE((SELECT SUM(CASE WHEN t.type = 'refund' THEN -t.amount WHEN t.amount < 0 THEN -t.amount ELSE 0 END)
         FROM card_transactions t WHERE t.card_id IN (
           SELECT c2.id FROM cards c2 JOIN applicants a2 ON a2.id = c2.applicant_id WHERE a2.shul_id = s.id AND c2.org_id = ?
         )), 0) AS spent
@@ -221,6 +222,57 @@ router.get('/transactions/export', requirePermission('cards', 'can_export'), (re
     FROM card_transactions t JOIN cards c ON c.id=t.card_id LEFT JOIN applicants a ON a.id=c.applicant_id LEFT JOIN stores s ON s.id=t.store_id
     ${where} ORDER BY t.occurred_at DESC`).all(...params);
   sendXlsx(res, `transactions-${Date.now()}.xlsx`, rows);
+});
+
+// Reconciliation breakdown for "why doesn't our Total spent match
+// disccardpromos' number for the season" — every known way the two can
+// legitimately drift, each with a count, a dollar figure, and a few sample
+// rows, so the gap can be attributed to a specific cause from the admin
+// screen instead of guessed at. Everything here is read-only over rows the
+// sync pipeline already stored (raw_payload keeps disccardpromos' original
+// entry), scoped to one season through each card's own season.
+router.get('/transactions/reconcile', requirePermission('cards', 'can_view'), (req, res) => {
+  const orgId = req.user.org_id;
+  const seasonId = req.query.season_id || getActiveSeasonId(orgId);
+  const season = seasonId ? db.prepare('SELECT id, name, start_date, end_date FROM seasons WHERE id = ? AND org_id = ?').get(seasonId, orgId) : null;
+  const rows = db.prepare(`SELECT t.id, t.card_id, t.provider_txn_id, t.type, t.amount, t.store_name, t.occurred_at, t.raw_payload,
+      c.status AS card_status, c.card_number_masked, c.season_id, a.id AS applicant_id, a.first_name, a.last_name
+    FROM card_transactions t JOIN cards c ON c.id = t.card_id LEFT JOIN applicants a ON a.id = c.applicant_id
+    WHERE c.org_id = ? AND t.provider_txn_id IS NOT NULL${season ? ' AND c.season_id = ?' : ''}`).all(orgId, ...(season ? [season.id] : []));
+  const money = v => Math.round((Number(v) || 0) * 100) / 100;
+  const sample = r => ({ date: r.occurred_at, store: r.store_name, amount: r.amount, who: `${r.first_name || ''} ${r.last_name || ''}`.trim() || '(deleted applicant)', card: r.card_number_masked, providerId: r.provider_txn_id });
+  const bucket = () => ({ count: 0, amount: 0, samples: [] });
+  const add = (b, r, amt = Math.abs(r.amount)) => { b.count++; b.amount = money(b.amount + amt); if (b.samples.length < 8) b.samples.push(sample(r)); };
+
+  const purchases = bucket(), refunds = bucket(), outOfWindow = bucket(), paidMissing = bucket(), cartDiffers = bucket(),
+    deletedApplicant = bucket(), deactivatedCard = bucket(), duplicates = bucket();
+  const start = season?.start_date ? String(season.start_date).slice(0, 10) : null;
+  const end = season?.end_date ? String(season.end_date).slice(0, 10) : null;
+  const seen = new Map();
+  for (const r of rows) {
+    if (r.amount < 0) add(purchases, r); else if (r.amount > 0) add(refunds, r);
+    const day = String(r.occurred_at || '').slice(0, 10);
+    if (r.amount < 0 && day && ((start && day < start) || (end && day > end))) add(outOfWindow, r);
+    let raw = null; try { raw = JSON.parse(r.raw_payload); } catch {}
+    if (raw && r.amount < 0) {
+      if (raw.disccardPaid == null && raw.cartAmount != null) add(paidMissing, r);
+      else if (raw.disccardPaid != null && raw.cartAmount != null && Number(raw.cartAmount) !== Number(raw.disccardPaid)) add(cartDiffers, r, money(Number(raw.cartAmount) - Number(raw.disccardPaid)));
+    }
+    if (!r.applicant_id && r.amount < 0) add(deletedApplicant, r);
+    if (r.card_status === 'deactivated' && r.amount < 0) add(deactivatedCard, r);
+    // Same card, same moment, same store, same amount under two different
+    // provider ids — an id-representation duplicate the boot-time repair
+    // couldn't pair up. Only the extra copies are counted here.
+    const key = `${r.card_id}|${r.occurred_at}|${r.amount}|${r.store_name}`;
+    if (seen.has(key)) { if (r.amount < 0) add(duplicates, r); } else seen.set(key, r.id);
+  }
+  res.json({
+    season: season ? { id: season.id, name: season.name, start_date: season.start_date, end_date: season.end_date } : null,
+    rowsConsidered: rows.length,
+    purchases, refunds, netAfterRefunds: money(purchases.amount - refunds.amount), totalSpent: money(purchases.amount - refunds.amount),
+    outOfSeasonWindow: outOfWindow, disccardPaidMissing: paidMissing, cartAmountDiffersFromPaid: cartDiffers,
+    onDeletedApplicant: deletedApplicant, onDeactivatedCard: deactivatedCard, likelyDuplicates: duplicates,
+  });
 });
 
 // All transactions across the org — "see all transactions they make in stores,

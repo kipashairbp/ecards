@@ -256,7 +256,18 @@ export async function syncApplicantCards(orgId, applicant, index) {
       // it through REAL first, silently storing "320972.0" instead (the same
       // trailing-".0" quirk documented elsewhere for provider_account_id).
       const providerTxnId = String(t.id ?? t.transaction_id);
-      const type = t.type || (rawAmount < 0 ? 'refund' : 'purchase');
+      // A refund is recognised by any of: a negative charged amount, an
+      // explicit type/kind/status/flag field saying so, or "refund"/
+      // "reversal"/"void"/"chargeback" in the vendor or description text —
+      // disccardpromos' real entries carry no `type`, so which of these
+      // (if any) marks a refund isn't pinned down; matching all of them
+      // means a refund counts as a refund whichever way it shows up, and
+      // an ordinary purchase (positive amount, no such marker) never does.
+      const refundWord = /\b(refund|refunded|reversal|reversed|void|voided|chargeback)\b/i;
+      const isRefund = rawAmount < 0
+        || t.is_refund === true || t.refund === true
+        || [t.type, t.kind, t.transaction_type, t.status, t.description, t.note, t.vendor].some(v => typeof v === 'string' && refundWord.test(v));
+      const type = isRefund ? 'refund' : 'purchase';
       // Every existing spend total in this app (dashboard.js's
       // totalStoreSpend/topStores, stores.js's total_purchases) sums
       // card_transactions by SIGN, not by `type`: negative = a purchase,
@@ -273,7 +284,7 @@ export async function syncApplicantCards(orgId, applicant, index) {
       // negative, a refund becomes positive) is the one place this needs to
       // happen to match every existing convention instead of rewriting every
       // query that already relies on it.
-      const storedAmount = -rawAmount;
+      const storedAmount = isRefund ? Math.abs(rawAmount) : -Math.abs(rawAmount);
       const info = insert.run(uuid(), cardId, providerTxnId, type, storedAmount, t.balance_after ?? null, storeName, resolveStoreId(orgId, storeName), occurredAt, JSON.stringify(t));
       if (info.changes) synced++;
     } catch (e) {

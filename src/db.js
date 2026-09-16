@@ -726,6 +726,11 @@ db.prepare(`DELETE FROM card_transactions WHERE provider_txn_id LIKE '%.0'
 db.prepare(`UPDATE card_transactions SET provider_txn_id = substr(provider_txn_id, 1, length(provider_txn_id) - 2) WHERE provider_txn_id LIKE '%.0'`).run();
 db.prepare(`UPDATE card_transactions SET amount = -amount WHERE provider_txn_id IS NOT NULL
   AND ((type = 'purchase' AND amount > 0) OR (type = 'refund' AND amount < 0))`).run();
+// Every match reason that held at the moment a pair was bypassed as "two
+// different people" — see services/duplicates.js's checkAgainst, which
+// won't re-flag that pair on a later recheck/edit unless a reason NOT in
+// this set has since appeared (i.e. genuinely new data on one of them).
+safeAlter(`ALTER TABLE duplicate_flags ADD COLUMN bypassed_reasons TEXT`);
 safeAlter(`ALTER TABLE forms ADD COLUMN opens_at TEXT`);
 safeAlter(`ALTER TABLE forms ADD COLUMN closes_at TEXT`);
 safeAlter(`ALTER TABLE forms ADD COLUMN is_default INTEGER DEFAULT 0`);

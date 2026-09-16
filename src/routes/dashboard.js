@@ -115,7 +115,12 @@ router.get('/stats', (req, res) => {
     // through the card a transaction was made against (a card belongs to
     // exactly one season).
     const storeSeasonClause = seasonId ? ' AND c2.season_id = ?' : '';
-    stats.topStores = db.prepare(`SELECT s.id, s.name, COALESCE(SUM(CASE WHEN t.amount < 0 THEN -t.amount ELSE 0 END),0) total_purchases
+    // Net of refunds everywhere spend is summed: a refund row is stored as a
+    // positive amount with type='refund' (see cardSync.js), so it subtracts;
+    // a purchase is negative, so it adds; a local 'load' row is positive
+    // with no refund type, so it's ignored. disccardpromos' own seasonal
+    // figure is net, and counting gross here read over by the refund total.
+    stats.topStores = db.prepare(`SELECT s.id, s.name, COALESCE(SUM(CASE WHEN t.type = 'refund' THEN -t.amount WHEN t.amount < 0 THEN -t.amount ELSE 0 END),0) total_purchases
       FROM stores s LEFT JOIN card_transactions t ON t.store_id = s.id LEFT JOIN cards c2 ON c2.id = t.card_id
       WHERE s.org_id = ?${storeSeasonClause} GROUP BY s.id ORDER BY total_purchases DESC LIMIT 5`).all(orgId, ...seasonParams).filter(s => s.total_purchases > 0);
     // Genuinely ALL real spend, not just spend attributable to a store
@@ -133,7 +138,7 @@ router.get('/stats', (req, res) => {
     // breakdown inherently can't include spend with no store to attribute
     // it to — but the headline total no longer requires that match.
     const storeCardSeasonClause = seasonId ? ' AND c2.season_id = ?' : '';
-    stats.totalStoreSpend = db.prepare(`SELECT COALESCE(SUM(CASE WHEN t.amount < 0 THEN -t.amount ELSE 0 END),0) total
+    stats.totalStoreSpend = db.prepare(`SELECT COALESCE(SUM(CASE WHEN t.type = 'refund' THEN -t.amount WHEN t.amount < 0 THEN -t.amount ELSE 0 END),0) total
       FROM card_transactions t JOIN cards c2 ON c2.id = t.card_id WHERE c2.org_id = ?${storeCardSeasonClause}`).get(orgId, ...seasonParams).total;
   }
   res.json({ stats });

@@ -13,7 +13,7 @@
 <script>
 Auth.requireAdmin();
 renderShell('/admin/cards', `
-  <div class="flex-between"><h2>Cards & Transactions</h2><div class="pill-row"><button class="btn btn-outline btn-sm" id="btn-sync-all">Sync All Now</button><button class="btn btn-outline btn-sm" id="btn-export-cards">Export Cards CSV</button><button class="btn btn-outline btn-sm" id="btn-export-txns">Export Transactions CSV</button></div></div>
+  <div class="flex-between"><h2>Cards & Transactions</h2><div class="pill-row"><button class="btn btn-outline btn-sm" id="btn-sync-all">Sync All Now</button><button class="btn btn-outline btn-sm" id="btn-reconcile" title="Break down why Total spent may differ from disccardpromos' own number">Reconcile</button><button class="btn btn-outline btn-sm" id="btn-export-cards">Export Cards CSV</button><button class="btn btn-outline btn-sm" id="btn-export-txns">Export Transactions CSV</button></div></div>
   <p class="small-muted">Cards auto-sync with disccardpromos every 15 minutes in the background. Use Sync All Now for an immediate refresh.</p>
   <div id="mock-banner"></div>
   <div class="tabs"><button class="active" id="tab-cards-btn">Cards</button><button id="tab-txns-btn">All Transactions</button><button id="tab-byshul-btn">Spent by Shul</button></div>
@@ -61,6 +61,28 @@ qs('#btn-sync-all').addEventListener('click', async () => {
   finally { btn.disabled = false; btn.textContent = 'Sync All Now'; }
 });
 qs('#btn-export-txns').addEventListener('click', () => downloadAuthed('/cards/transactions/export', 'transactions.xlsx'));
+qs('#btn-reconcile').addEventListener('click', async () => {
+  try {
+    const r = await api('/cards/transactions/reconcile');
+    const row = (label, b, note) => `<tr><td>${esc(label)}${note ? `<br><span class="small-muted">${esc(note)}</span>` : ''}</td><td>${b.count}</td><td><strong>${fmtMoney(b.amount)}</strong></td></tr>
+      ${b.samples.length ? `<tr><td colspan="3" class="small-muted" style="padding-left:24px">${b.samples.map(s => `${esc(s.date || '')} · ${esc(s.who)} · ${esc(s.store || '')} · ${fmtMoney(Math.abs(s.amount))}`).join('<br>')}</td></tr>` : ''}`;
+    const body = `
+      <p class="small-muted">Season: <strong>${esc(r.season?.name || 'all')}</strong>${r.season?.start_date ? ` (${esc(r.season.start_date)} → ${esc(r.season.end_date || 'open')})` : ' — no start/end dates set on this season, so the "outside the season window" check is skipped'}. ${r.rowsConsidered} synced transaction(s) considered.</p>
+      <table><thead><tr><th>What</th><th>Count</th><th>Amount</th></tr></thead><tbody>
+        <tr><td>Purchases (gross)</td><td>${r.purchases.count}</td><td>${fmtMoney(r.purchases.amount)}</td></tr>
+        ${row('Refunds / money back (subtracted)', r.refunds)}
+        <tr><td><strong>Total spent, net of refunds (what the dashboard shows)</strong></td><td></td><td><strong>${fmtMoney(r.totalSpent)}</strong></td></tr>
+        ${row('Purchases dated outside this season\'s window', r.outOfSeasonWindow, 'Older history on the same disccardpromos customer, counted under this season\'s card')}
+        ${row('Purchases where disccardpromos sent no disccardPaid (cart total used instead)', r.disccardPaidMissing)}
+        ${row('Purchases where cart total differs from what the card paid (difference shown)', r.cartAmountDiffersFromPaid, 'Informational — the total already uses what the card paid')}
+        ${row('Likely duplicate copies (same card, moment, store, amount under two provider ids)', r.likelyDuplicates)}
+        ${row('Purchases on a card whose applicant was deleted', r.onDeletedApplicant)}
+        ${row('Purchases on a deactivated card', r.onDeactivatedCard, 'Still real spend — listed in case disccardpromos excludes closed accounts')}
+      </tbody></table>
+      <p class="small-muted">Send this screen to Claude with disccardpromos' own number for the season to pin down the exact cause of any difference.</p>`;
+    openModal('Reconcile Total Spent', body, '<button class="btn btn-outline btn-sm" onclick="closeModal()">Close</button>', { wide: true });
+  } catch (err) { toast(err.message, true); }
+});
 
 async function loadCards() {
   const params = new URLSearchParams(Object.fromEntries(Object.entries(state).filter(([,v]) => v !== '')));

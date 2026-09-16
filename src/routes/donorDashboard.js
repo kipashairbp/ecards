@@ -76,7 +76,7 @@ router.get('/stats', (req, res) => {
   // purchase convention used everywhere else in the app.
   const loaded = db.prepare(`SELECT COALESCE(SUM(card_amount),0) t FROM applicants WHERE org_id = ? AND approval_status = 'approved'${seasonClause}`).get(orgId, ...seasonParams).t;
   const storeSeasonClause = seasonId ? ' AND c2.season_id = ?' : '';
-  const spent = db.prepare(`SELECT COALESCE(SUM(CASE WHEN t.amount < 0 THEN -t.amount ELSE 0 END),0) s
+  const spent = db.prepare(`SELECT COALESCE(SUM(CASE WHEN t.type = 'refund' THEN -t.amount WHEN t.amount < 0 THEN -t.amount ELSE 0 END),0) s
     FROM card_transactions t JOIN cards c2 ON c2.id = t.card_id WHERE c2.org_id = ?${storeSeasonClause}`).get(orgId, ...seasonParams).s;
   const funds = { loaded, spent, remaining: Math.round((loaded - spent) * 100) / 100 };
 
