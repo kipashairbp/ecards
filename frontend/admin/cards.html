@@ -33,7 +33,7 @@ renderShell('/admin/cards', `
     <div class="paginator" id="pager-txns"></div>
   </div>
   <div id="panel-byshul" style="display:none">
-    <p class="small-muted">Money loaded onto each shul's applicants' cards, and how much of it has been spent in stores so far.</p>
+    <p class="small-muted">Money loaded onto each shul's applicants' cards, and how much of it has been spent in stores so far. "Allocated" counts an applicant only once a physical card has actually been assigned to them — an approved applicant with money committed but no card yet won't appear here (see the Total row below for the org-wide sum).</p>
     <div class="card" style="padding:0;overflow-x:auto">
       <table><thead><tr><th>Shul</th><th>Allocated</th><th>Spent</th><th>Remaining</th><th></th></tr></thead>
       <tbody id="tbody-byshul"><tr><td colspan="5" class="empty-state">Loading…</td></tr></tbody></table>
@@ -118,13 +118,27 @@ async function loadTxns() {
 async function loadByShul() {
   try {
     const { shuls } = await api('/cards/by-shul');
-    qs('#tbody-byshul').innerHTML = shuls.length ? shuls.map(s => {
+    const rows = shuls.map(s => {
       const pct = s.allocated > 0 ? Math.min(100, Math.round((s.spent / s.allocated) * 100)) : 0;
       return `<tr>
         <td>${esc(s.shul_name)}</td><td>${fmtMoney(s.allocated)}</td><td>${fmtMoney(s.spent)}</td><td>${fmtMoney(s.remaining)}</td>
         <td style="min-width:120px"><div style="background:var(--border);border-radius:4px;height:8px;overflow:hidden"><div style="width:${pct}%;background:var(--brand-gold-dark);height:100%"></div></div><span class="small-muted">${pct}%</span></td>
       </tr>`;
-    }).join('') : '<tr><td colspan="5" class="empty-state">No cards loaded yet.</td></tr>';
+    }).join('');
+    // Allocated here is SUM(cards.amount) — a physical card has to exist for
+    // a shul's applicant to count, same rule the org-wide "Live Spend"
+    // total on the Cards tab uses. An approved applicant with money
+    // committed but no card assigned yet won't show here at all, which is
+    // why this total can come in lower than the Dashboard's "Total Loaded"
+    // (that one sums every approved applicant's committed card_amount,
+    // card or no card) — two different, both-correct questions, not a bug.
+    const totalAllocated = shuls.reduce((sum, s) => sum + (Number(s.allocated) || 0), 0);
+    const totalSpent = shuls.reduce((sum, s) => sum + (Number(s.spent) || 0), 0);
+    const totalRemaining = shuls.reduce((sum, s) => sum + (Number(s.remaining) || 0), 0);
+    const totalRow = shuls.length ? `<tr style="font-weight:700;border-top:2px solid var(--border)">
+        <td>Total (${shuls.length} shul${shuls.length===1?'':'s'})</td><td>${fmtMoney(totalAllocated)}</td><td>${fmtMoney(totalSpent)}</td><td>${fmtMoney(totalRemaining)}</td><td></td>
+      </tr>` : '';
+    qs('#tbody-byshul').innerHTML = shuls.length ? rows + totalRow : '<tr><td colspan="5" class="empty-state">No cards loaded yet.</td></tr>';
   } catch (err) { toast(err.message, true); }
 }
 

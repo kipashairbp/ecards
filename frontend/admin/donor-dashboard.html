@@ -16,16 +16,75 @@
   :root {
     --viz-good: #0ca30c; --viz-warning: #fab219; --viz-critical: #d03b3b; --viz-muted: #898781;
     --viz-1: #2a78d6; --viz-2: #eb6834; --viz-3: #1baf7a; --viz-4: #eda100;
+    /* Executive/report palette, scoped to this page only — a deliberately
+       different register from the app's warm branded theme (this page is
+       printed/screenshotted and handed to donors and board members, not
+       used for day-to-day data entry), while still pulling the brand gold
+       in as the one accent color so it doesn't feel like a different product. */
+    --exec-ink: #10151f;
+    --exec-navy: #16243b;
+    --exec-navy-2: #1e3050;
+    --exec-slate: #4a5568;
+    --exec-line: #e4e8ef;
+    --exec-card-bg: #ffffff;
+    --exec-shadow: 0 1px 2px rgba(16,21,31,.04), 0 8px 24px rgba(16,21,31,.06);
   }
+  body { background: #f4f6fa; }
+  .exec-header {
+    background: linear-gradient(135deg, var(--exec-navy) 0%, var(--exec-navy-2) 100%);
+    border-radius: 14px; padding: 28px 32px; margin-bottom: 22px; color: #f2f4f8;
+    box-shadow: var(--exec-shadow); position: relative; overflow: hidden;
+  }
+  .exec-header::after {
+    content: ''; position: absolute; inset: 0; pointer-events: none;
+    background: radial-gradient(600px 240px at 100% 0%, rgba(201,167,106,.16), transparent 60%);
+  }
+  .exec-header-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; position: relative; }
+  .exec-eyebrow { font-size: 11.5px; font-weight: 700; letter-spacing: 1.6px; text-transform: uppercase; color: var(--brand-gold-light); margin-bottom: 6px; }
+  .exec-title { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; font-size: 28px; font-weight: 700; margin: 0; color: #fff; letter-spacing: -.2px; }
+  .exec-subtitle { margin: 10px 0 0; color: #cdd6e4; font-size: 13.5px; max-width: 640px; position: relative; }
+  .exec-season-select { max-width: 220px; background: rgba(255,255,255,.08); border: 1.5px solid rgba(255,255,255,.22); color: #fff; }
+  .exec-season-select option { color: var(--text-dark); }
+  .exec-asof { font-size: 12px; color: #aab6c8; margin-top: 8px; }
+
+  .exec-kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px; margin-bottom: 24px; }
+  .exec-kpi-card {
+    background: var(--exec-card-bg); border: 1px solid var(--exec-line); border-radius: 12px;
+    padding: 18px 18px 16px; box-shadow: var(--exec-shadow); position: relative; overflow: hidden;
+    transition: transform .12s ease, box-shadow .12s ease;
+  }
+  .exec-kpi-card:hover { transform: translateY(-1px); box-shadow: 0 2px 4px rgba(16,21,31,.06), 0 14px 32px rgba(16,21,31,.09); }
+  .exec-kpi-card::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: var(--kpi-accent, var(--brand-gold)); }
+  .exec-kpi-icon {
+    width: 34px; height: 34px; border-radius: 9px; display: flex; align-items: center; justify-content: center;
+    background: var(--brand-panel-2); margin-bottom: 12px;
+  }
+  @supports (background: color-mix(in srgb, red 10%, white)) {
+    .exec-kpi-icon { background: color-mix(in srgb, var(--kpi-accent, var(--brand-gold)) 14%, white); }
+  }
+  .exec-kpi-icon svg { width: 18px; height: 18px; stroke: var(--kpi-accent, var(--brand-gold-dark)); fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .exec-kpi-num { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; font-size: 25px; font-weight: 700; color: var(--exec-ink); line-height: 1.1; }
+  .exec-kpi-label { font-size: 12px; color: var(--exec-slate); margin-top: 3px; font-weight: 600; }
+
+  .exec-section-title { font-size: 13px; font-weight: 700; letter-spacing: .6px; text-transform: uppercase; color: var(--exec-slate); margin: 26px 2px 12px; }
+  .exec-chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+  .exec-chart-card {
+    background: var(--exec-card-bg); border: 1px solid var(--exec-line); border-radius: 12px;
+    padding: 20px 22px; box-shadow: var(--exec-shadow);
+  }
+  .exec-chart-card h4 { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; font-size: 14.5px; font-weight: 700; color: var(--exec-ink); margin: 0 0 4px; display: flex; align-items: center; gap: 8px; }
+  .exec-chart-card h4 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--kpi-accent, var(--brand-gold-dark)); flex-shrink: 0; }
+  .exec-chart-sub { font-size: 12px; color: var(--exec-slate); margin: 0 0 14px; }
+
   .donut-wrap { display: flex; gap: 20px; align-items: center; flex-wrap: wrap; }
   .donut-svg-box { position: relative; width: 160px; height: 160px; flex-shrink: 0; }
   .donut-svg-box svg { transform: rotate(-90deg); }
   .donut-center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; pointer-events: none; }
-  .donut-center .n { font-size: 20px; font-weight: 600; line-height: 1.1; }
-  .donut-center .l { font-size: 11px; color: var(--text-muted); }
+  .donut-center .n { font-size: 20px; font-weight: 700; line-height: 1.1; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; color: var(--exec-ink); }
+  .donut-center .l { font-size: 11px; color: var(--exec-slate); }
   .donut-legend { flex: 1; min-width: 170px; }
-  .donut-legend-row { display: flex; align-items: center; gap: 8px; padding: 5px 6px; border-radius: 6px; cursor: pointer; }
-  .donut-legend-row:hover, .donut-legend-row:focus { background: var(--brand-panel-2); outline: none; }
+  .donut-legend-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 7px; cursor: pointer; }
+  .donut-legend-row:hover, .donut-legend-row:focus { background: #f4f6fa; outline: none; }
   .donut-swatch { width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0; }
   .donut-arc { cursor: pointer; }
   .donut-arc:hover, .donut-arc:focus { opacity: .82; outline: none; }
@@ -41,28 +100,54 @@
 Auth.requireAdmin();
 if (!Auth.can('donor_dashboard')) { location.href = '/admin/dashboard'; }
 renderShell('/admin/donor-dashboard', `
-  <div class="flex-between"><h2>Donor's Dash</h2><select id="f-season" style="max-width:240px"><option value="">All Seasons</option></select></div>
-  <p class="small-muted">A quick-read overview for donors and board members — hover any slice or bar for the exact number behind it.</p>
-  <div class="stat-grid" id="kpi-row"><div class="small-muted">Loading…</div></div>
-  <div class="grid-2" style="margin-top:16px;align-items:start">
-    <div class="card"><h4 style="margin:0 0 10px">Applicants by Status</h4><div id="donut-applicants"></div></div>
-    <div class="card"><h4 style="margin:0 0 10px">Shuls by Status</h4><div id="donut-shuls"></div></div>
+  <div class="exec-header">
+    <div class="exec-header-top">
+      <div>
+        <div class="exec-eyebrow">Board &amp; Donor Report</div>
+        <h1 class="exec-title">Donor's Dash</h1>
+        <p class="exec-subtitle">A real-time overview of program reach and fund utilization, for donors and board members — hover any slice or bar for the exact figure behind it.</p>
+      </div>
+      <select id="f-season" class="exec-season-select"><option value="">All Seasons</option></select>
+    </div>
+    <div class="exec-asof" id="exec-asof"></div>
   </div>
-  <div class="grid-2" style="margin-top:16px;align-items:start">
-    <div class="card"><h4 style="margin:0 0 10px">Cards by Status</h4><div id="donut-cards"></div></div>
-    <div class="card"><h4 style="margin:0 0 10px">Funds — Spent vs. Remaining</h4><div id="donut-funds"></div></div>
+  <div class="exec-kpi-grid" id="kpi-row"><div class="small-muted">Loading…</div></div>
+
+  <div class="exec-section-title">Program Overview</div>
+  <div class="exec-chart-grid">
+    <div class="exec-chart-card"><h4><span class="dot" style="background:var(--viz-good)"></span>Applicants by Status</h4><p class="exec-chart-sub">Where every submitted application stands today.</p><div id="donut-applicants"></div></div>
+    <div class="exec-chart-card"><h4><span class="dot" style="background:var(--viz-good)"></span>Shuls by Status</h4><p class="exec-chart-sub">Participation status across every participating shul.</p><div id="donut-shuls"></div></div>
   </div>
-  <div class="grid-2" style="margin-top:16px;align-items:start">
-    <div class="card"><h4 style="margin:0 0 10px">Stores by Status</h4><div id="donut-stores"></div></div>
+  <div class="exec-chart-grid" style="margin-top:16px">
+    <div class="exec-chart-card"><h4><span class="dot" style="background:var(--viz-2)"></span>Cards by Status</h4><p class="exec-chart-sub">Issued, assigned, and currently active gift cards.</p><div id="donut-cards"></div></div>
+    <div class="exec-chart-card"><h4><span class="dot" style="background:var(--viz-2)"></span>Funds — Spent vs. Remaining</h4><p class="exec-chart-sub">Of everything loaded this season, how much has reached a store so far.</p><div id="donut-funds"></div></div>
   </div>
-  <div class="card" style="margin-top:16px">
-    <div class="flex-between"><h4 style="margin:0">New Applicants, Last 30 Days</h4>
+  <div class="exec-chart-grid" style="margin-top:16px">
+    <div class="exec-chart-card"><h4><span class="dot" style="background:var(--viz-1)"></span>Stores by Status</h4><p class="exec-chart-sub">Onboarding progress across every participating store.</p><div id="donut-stores"></div></div>
+  </div>
+
+  <div class="exec-section-title">Trend</div>
+  <div class="exec-chart-card">
+    <div class="flex-between"><h4 style="margin:0"><span class="dot" style="background:var(--viz-1)"></span>New Applicants, Last 30 Days</h4>
       <select id="f-days" style="max-width:160px"><option value="7">Last 7 days</option><option value="30" selected>Last 30 days</option><option value="90">Last 90 days</option></select>
     </div>
-    <p class="small-muted" style="margin-top:4px">New submissions vs. how many of that day's cohort are approved so far.</p>
-    <div id="bar-daily" style="margin-top:10px">Loading…</div>
+    <p class="exec-chart-sub">New submissions vs. how many of that day's cohort are approved so far.</p>
+    <div id="bar-daily">Loading…</div>
   </div>
 `);
+qs('#exec-asof').textContent = 'As of ' + new Date().toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' });
+
+// Hand-rolled line icons (Feather-style paths, MIT-equivalent simple
+// geometry — no icon library, same no-dependency approach as the charts
+// below) for the KPI row's accent icons. viewBox 0 0 24 24 throughout.
+const EXEC_ICONS = {
+  people: '<svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
+  check: '<svg viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>',
+  card: '<svg viewBox="0 0 24 24"><rect x="1" y="4" width="22" height="16" rx="2"/><line x1="1" y1="10" x2="23" y2="10"/></svg>',
+  coin: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v10M9 9.5c0-1.4 1.3-2.5 3-2.5s3 .8 3 2c0 3-6 1.5-6 4.5 0 1.2 1.3 2 3 2s3-1.1 3-2.5"/></svg>',
+  receipt: '<svg viewBox="0 0 24 24"><path d="M4 2h16v20l-3-2-3 2-3-2-3 2-3-2-1 2z"/><line x1="8" y1="7" x2="16" y2="7"/><line x1="8" y1="11" x2="16" y2="11"/><line x1="8" y1="15" x2="12" y2="15"/></svg>',
+  alert: '<svg viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
+};
 
 // ---------- Donut chart: hand-rolled SVG (stroke-dasharray technique), no
 // charting library — consistent with this app's no-build-step, no-framework
@@ -182,13 +267,17 @@ async function loadDonorDashboard() {
   const { applicants, shuls, cards, stores, funds, duplicatesOpen } = await api('/donor-dashboard/stats' + qp);
 
   qs('#kpi-row').innerHTML = [
-    ['Total Applicants', applicants.total],
-    ['Approved Applicants', applicants.approved],
-    ['Cards Activated', cards.activated],
-    ['Money Loaded', fmtMoney(funds.loaded)],
-    ['Money Spent', fmtMoney(funds.spent)],
-    ['Open Duplicate Flags', duplicatesOpen],
-  ].map(([label, num]) => `<div class="stat-tile"><div class="num">${typeof num === 'string' ? esc(num) : num.toLocaleString()}</div><div class="label">${esc(label)}</div></div>`).join('');
+    ['Total Applicants', applicants.total, 'var(--viz-1)', EXEC_ICONS.people],
+    ['Approved Applicants', applicants.approved, 'var(--viz-good)', EXEC_ICONS.check],
+    ['Cards Activated', cards.activated, 'var(--viz-2)', EXEC_ICONS.card],
+    ['Money Loaded', fmtMoney(funds.loaded), 'var(--brand-gold-dark)', EXEC_ICONS.coin],
+    ['Money Spent', fmtMoney(funds.spent), 'var(--brand-gold-dark)', EXEC_ICONS.receipt],
+    ['Open Duplicate Flags', duplicatesOpen, duplicatesOpen > 0 ? 'var(--viz-critical)' : 'var(--viz-muted)', EXEC_ICONS.alert],
+  ].map(([label, num, accent, icon]) => `<div class="exec-kpi-card" style="--kpi-accent:${accent}">
+      <div class="exec-kpi-icon">${icon}</div>
+      <div class="exec-kpi-num">${typeof num === 'string' ? esc(num) : num.toLocaleString()}</div>
+      <div class="exec-kpi-label">${esc(label)}</div>
+    </div>`).join('');
 
   // approval_status/shul status are genuine STATE (not identity), so this
   // uses the fixed status palette (good/warning/critical), not the

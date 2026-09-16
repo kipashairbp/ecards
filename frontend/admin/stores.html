@@ -33,37 +33,89 @@ renderShell('/admin/stores', `
     <button class="btn btn-sm btn-primary" id="btn-mass-apply" disabled>Apply to Selected (0)</button>
   </div>
   <div class="card" style="padding:0;overflow-x:auto">
-    <table><thead><tr><th style="width:34px"><input type="checkbox" id="chk-all"></th><th>Store</th><th>POS System</th><th>Discount</th><th>Manager</th><th>Owner</th><th>Setup Status</th><th>Contract</th><th>Onboarding</th><th>Live Spend</th><th>Disccard Setup Comments</th><th>Disccard Complete</th><th></th></tr></thead>
+    <table><thead id="thead"></thead>
     <tbody id="tbody"><tr><td colspan="13" class="empty-state">Loading…</td></tr></tbody></table>
   </div>
 `);
 
-let state = { search:'', status:'', source:'', season_id:'' };
+let state = { search:'', status:'', source:'', season_id:'', sort:'created_at', dir:'DESC' };
 let selected = new Set();
+let currentStores = [];
+
+// Every column is sortable client-side (the full list is already fetched in
+// one shot with no server pagination, so there's no reason to round-trip
+// for a sort) — key matches the field renderRows below actually reads, not
+// necessarily the header label.
+const STORE_COLUMNS = [
+  { label: 'Store', sort: 'name' },
+  { label: 'POS System', sort: 'pos_system' },
+  { label: 'Discount', sort: 'discount' },
+  { label: 'Manager', sort: 'manager_name' },
+  { label: 'Owner', sort: 'owner_name' },
+  { label: 'Setup Status', sort: 'setup_status' },
+  { label: 'Contract', sort: 'contract_signed_at' },
+  { label: 'Onboarding', sort: 'onboarding_step' },
+  { label: 'Live Spend', sort: 'total_purchases' },
+  { label: 'Disccard Setup Comments', sort: 'disccard_setup_comments' },
+  { label: 'Disccard Complete', sort: 'disccard_setup_complete' },
+];
+function renderThead() {
+  qs('#thead').innerHTML = `<tr>
+    <th style="width:34px"><input type="checkbox" id="chk-all"></th>
+    ${STORE_COLUMNS.map(c => `<th data-sort="${c.sort}" style="cursor:pointer;white-space:nowrap">${esc(c.label)}${state.sort === c.sort ? (state.dir === 'ASC' ? ' ▲' : ' ▼') : ''}</th>`).join('')}
+    <th></th>
+  </tr>`;
+  qs('#chk-all').addEventListener('change', (e) => { qsa('.row-chk').forEach(c => { c.checked = e.target.checked; c.dispatchEvent(new Event('change')); }); });
+}
+qs('#thead').parentElement.addEventListener('click', (e) => {
+  const th = e.target.closest('th[data-sort]');
+  if (!th) return;
+  const key = th.dataset.sort;
+  state.dir = (state.sort === key && state.dir === 'ASC') ? 'DESC' : 'ASC';
+  state.sort = key;
+  renderThead();
+  renderRows(sortStores(currentStores));
+});
+function sortStores(stores) {
+  const key = state.sort, dir = state.dir === 'ASC' ? 1 : -1;
+  return [...stores].sort((a, b) => {
+    let av = a[key], bv = b[key];
+    if (key === 'total_purchases' || key === 'onboarding_step' || key === 'disccard_setup_complete') { av = Number(av) || 0; bv = Number(bv) || 0; }
+    else { av = (av ?? '').toString().toLowerCase(); bv = (bv ?? '').toString().toLowerCase(); }
+    if (av < bv) return -1 * dir;
+    if (av > bv) return 1 * dir;
+    return 0;
+  });
+}
+function renderRows(stores) {
+  qs('#tbody').innerHTML = stores.length ? stores.map(s => `<tr>
+      <td onclick="event.stopPropagation()"><input type="checkbox" class="row-chk" data-id="${s.id}" ${selected.has(s.id) ? 'checked' : ''}></td>
+      <td><strong>${esc(s.name)}</strong>${s.source === 'application' ? ' ' + badge('applied','pending') : ''}<br><span class="small-muted">${esc(s.address||'')} ${esc(s.city||'')}, ${esc(s.state||'')}</span></td>
+      <td>${esc(s.pos_system||'')}</td>
+      <td>${esc(s.discount||'')}</td>
+      <td>${esc(s.manager_name||'')}<br><span class="small-muted">${esc(s.manager_phone||'')}</span></td>
+      <td>${esc(s.owner_name||'')}<br><span class="small-muted">${esc(s.owner_phone||'')}</span></td>
+      <td>${badge(s.setup_status,s.setup_status)}${s.has_provider_account ? ' <span class="small-muted">(existing account)</span>' : ''}</td>
+      <td>${s.contract_signed_at ? `${badge('signed','active')}<br><span class="small-muted">${fmtDate(s.contract_signed_at)}</span>` : '<span class="small-muted">Not signed</span>'}</td>
+      <td>${(s.onboarding_step||0) >= 3 ? badge('complete','active') : (s.portal_user_id ? `Step ${s.onboarding_step||0} of 3` : 'Not invited')}</td>
+      <td><strong>${fmtMoney(s.total_purchases)}</strong>${s.total_refunds ? `<br><span class="small-muted">Refunds: ${fmtMoney(s.total_refunds)}</span>` : ''}<br><span class="small-muted">${s.txn_count} txn${s.txn_count===1?'':'s'}</span></td>
+      <td onclick="event.stopPropagation()"><input type="text" class="inline-comments" value="${esc(s.disccard_setup_comments||'')}" data-orig="${esc(s.disccard_setup_comments||'')}" placeholder="—" onblur="saveStoreDisccardComments('${s.id}', this)" onkeydown="if(event.key==='Enter') this.blur()"></td>
+      <td onclick="event.stopPropagation()"><input type="checkbox" ${s.disccard_setup_complete ? 'checked' : ''} onchange="saveStoreDisccardComplete('${s.id}', this.checked)"></td>
+      <td><button class="btn btn-sm btn-outline" onclick="openStore('${s.id}')">Manage</button></td>
+    </tr>`).join('') : '<tr><td colspan="13" class="empty-state">No stores yet.</td></tr>';
+  qsa('.row-chk').forEach(c => c.addEventListener('change', onCheck));
+  qs('#chk-all').checked = qsa('.row-chk').length > 0 && qsa('.row-chk:not(:checked)').length === 0;
+}
 async function load() {
+  renderThead();
   const params = new URLSearchParams({ search: state.search, setup_status: state.status, season_id: state.season_id });
   try {
     let { stores } = await api('/stores?' + params);
     if (state.source) stores = stores.filter(s => (s.source || 'admin') === state.source);
-    qs('#tbody').innerHTML = stores.length ? stores.map(s => `<tr>
-        <td onclick="event.stopPropagation()"><input type="checkbox" class="row-chk" data-id="${s.id}"></td>
-        <td><strong>${esc(s.name)}</strong>${s.source === 'application' ? ' ' + badge('applied','pending') : ''}<br><span class="small-muted">${esc(s.address||'')} ${esc(s.city||'')}, ${esc(s.state||'')}</span></td>
-        <td>${esc(s.pos_system||'')}</td>
-        <td>${esc(s.discount||'')}</td>
-        <td>${esc(s.manager_name||'')}<br><span class="small-muted">${esc(s.manager_phone||'')}</span></td>
-        <td>${esc(s.owner_name||'')}<br><span class="small-muted">${esc(s.owner_phone||'')}</span></td>
-        <td>${badge(s.setup_status,s.setup_status)}${s.has_provider_account ? ' <span class="small-muted">(existing account)</span>' : ''}</td>
-        <td>${s.contract_signed_at ? `${badge('signed','active')}<br><span class="small-muted">${fmtDate(s.contract_signed_at)}</span>` : '<span class="small-muted">Not signed</span>'}</td>
-        <td>${(s.onboarding_step||0) >= 3 ? badge('complete','active') : (s.portal_user_id ? `Step ${s.onboarding_step||0} of 3` : 'Not invited')}</td>
-        <td><strong>${fmtMoney(s.total_purchases)}</strong>${s.total_refunds ? `<br><span class="small-muted">Refunds: ${fmtMoney(s.total_refunds)}</span>` : ''}<br><span class="small-muted">${s.txn_count} txn${s.txn_count===1?'':'s'}</span></td>
-        <td onclick="event.stopPropagation()"><input type="text" class="inline-comments" value="${esc(s.disccard_setup_comments||'')}" data-orig="${esc(s.disccard_setup_comments||'')}" placeholder="—" onblur="saveStoreDisccardComments('${s.id}', this)" onkeydown="if(event.key==='Enter') this.blur()"></td>
-        <td onclick="event.stopPropagation()"><input type="checkbox" ${s.disccard_setup_complete ? 'checked' : ''} onchange="saveStoreDisccardComplete('${s.id}', this.checked)"></td>
-        <td><button class="btn btn-sm btn-outline" onclick="openStore('${s.id}')">Manage</button></td>
-      </tr>`).join('') : '<tr><td colspan="13" class="empty-state">No stores yet.</td></tr>';
-    qsa('.row-chk').forEach(c => c.addEventListener('change', onCheck));
+    currentStores = stores;
+    renderRows(sortStores(currentStores));
   } catch (err) { toast(err.message, true); }
 }
-qs('#chk-all').addEventListener('change', (e) => { qsa('.row-chk').forEach(c => { c.checked = e.target.checked; c.dispatchEvent(new Event('change')); }); });
 function onCheck(e) {
   const id = e.target.dataset.id;
   if (e.target.checked) selected.add(id); else selected.delete(id);
@@ -171,8 +223,8 @@ qs('#btn-mass-apply').addEventListener('click', async () => {
 
 async function openStore(id) {
   try {
-    const [{ store: s, transactionTotals, latestAgreement }, { bills: submittedBills }] = await Promise.all([
-      api(`/stores/${id}`), api(`/stores/${id}/bill-submissions`),
+    const [{ store: s, transactionTotals, latestAgreement, providerLinks }, { bills: submittedBills }, { vendors: providerVendors }] = await Promise.all([
+      api(`/stores/${id}`), api(`/stores/${id}/bill-submissions`), api('/stores/provider-vendors'),
     ]);
     // At-a-glance signed/not-signed status, same info the Documents tab
     // shows per-row but surfaced right here so it doesn't require switching
@@ -217,6 +269,17 @@ async function openStore(id) {
         <div class="checkbox-row" style="margin-top:10px"><input type="checkbox" id="e-has_account" ${s.has_provider_account?'checked':''}><label style="margin:0">Already has a disccardpromos account</label></div>
         <div class="divider"></div>
         <p class="small-muted">Transactions: ${transactionTotals.count} · Purchases: ${fmtMoney(transactionTotals.total_purchases)} · Refunds: ${fmtMoney(transactionTotals.total_refunds)}</p>
+        <div class="divider"></div>
+        <label>Linked disccardpromos store name(s)</label>
+        <p class="small-muted" style="margin-top:-6px">disccardpromos has no store list of its own — these are the exact vendor names it's actually sent us on a transaction. Link every name it uses for this store so its spend counts here; one name can only ever be linked to one store, but this store can hold as many aliases as disccardpromos reports it under.</p>
+        <div id="e-provider-links">${providerLinks.length ? providerLinks.map(l => `<span class="badge" style="display:inline-flex;align-items:center;gap:6px;margin:0 6px 6px 0">${esc(l.vendor_name)}<button type="button" title="Unlink" onclick="unlinkStoreVendor('${id}','${l.id}')" style="border:none;background:none;cursor:pointer;color:inherit;font-weight:700;line-height:1;padding:0">&times;</button></span>`).join('') : '<span class="small-muted">No disccardpromos vendor name linked yet.</span>'}</div>
+        <div style="display:flex;gap:8px;margin-top:8px">
+          <select id="e-link-vendor" style="flex:1">
+            <option value="">Choose a disccardpromos vendor name…</option>
+            ${providerVendors.filter(v => !providerLinks.some(l => l.vendor_name.toLowerCase() === v.vendor_name.toLowerCase())).map(v => `<option value="${esc(v.vendor_name)}" ${v.linkedStoreId ? 'disabled' : ''}>${esc(v.vendor_name)} (${v.txn_count} txn, ${fmtMoney(v.total_spend)})${v.linkedStoreId ? ` — already linked to ${esc(v.linkedStoreName)}` : ''}</option>`).join('')}
+          </select>
+          <button type="button" class="btn btn-sm btn-outline" onclick="linkStoreVendor('${id}')">Link</button>
+        </div>
       </div>
       <div id="stab-billing" style="display:none">
         <div class="flex-between"><h4 style="margin:0">Bills This Store Submitted</h4><button class="btn btn-sm btn-outline" onclick="openLogBillModal('${id}')">Log a Bill They Sent Us</button></div>
@@ -259,6 +322,22 @@ window.saveStore = async (id) => {
   body.same_person = qs('#e-same_person').checked;
   if (body.same_person) { body.manager_name = body.owner_name; body.manager_phone = body.owner_phone; body.manager_email = body.owner_email; }
   try { await api(`/stores/${id}`, { method: 'PUT', body }); toast('Saved'); closeModal(); load(); } catch (err) { toast(err.message, true); }
+};
+window.linkStoreVendor = async (id) => {
+  const vendorName = qs('#e-link-vendor').value;
+  if (!vendorName) return toast('Choose a vendor name first', true);
+  try {
+    const r = await api(`/stores/${id}/provider-links`, { method: 'POST', body: { vendor_name: vendorName } });
+    toast(r.backfilled ? `Linked — ${r.backfilled} existing transaction(s) now count toward this store` : 'Linked');
+    openStore(id); load();
+  } catch (err) { toast(err.message, true); }
+};
+window.unlinkStoreVendor = async (id, linkId) => {
+  if (!confirm('Unlink this disccardpromos vendor name? Transactions under it will show as unmatched again until re-linked.')) return;
+  try {
+    await api(`/stores/${id}/provider-links/${linkId}`, { method: 'DELETE' });
+    toast('Unlinked'); openStore(id); load();
+  } catch (err) { toast(err.message, true); }
 };
 window.inviteStore = async (id) => {
   try {

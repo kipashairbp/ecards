@@ -63,6 +63,7 @@ export function hardDeleteApplicant(applicant) {
 // re-delete a store — e.g. redoing a hard delete that undo had just restored.
 export function hardDeleteStore(store) {
   db.prepare('UPDATE card_transactions SET store_id = NULL WHERE store_id = ?').run(store.id);
+  db.prepare('DELETE FROM store_provider_links WHERE store_id = ?').run(store.id);
   db.prepare('DELETE FROM store_billing WHERE store_id = ?').run(store.id);
   if (store.portal_user_id) db.prepare('UPDATE users SET is_active = 0, token_version = token_version + 1 WHERE id = ?').run(store.portal_user_id);
   deletePolymorphicRefs('store', store.id);
@@ -195,6 +196,7 @@ export function captureStoreSnapshot(store) {
     row: store,
     billing: db.prepare('SELECT * FROM store_billing WHERE store_id = ?').all(store.id),
     unlinkedCardTransactionIds: db.prepare('SELECT id FROM card_transactions WHERE store_id = ?').all(store.id).map(r => r.id),
+    providerLinks: db.prepare('SELECT * FROM store_provider_links WHERE store_id = ?').all(store.id),
     portalUser: capturePortalUser(store.portal_user_id),
     ...capturePolymorphicRefs('store', store.id),
   };
@@ -202,6 +204,7 @@ export function captureStoreSnapshot(store) {
 export function restoreStoreSnapshot(snap) {
   insertIfMissing('stores', snap.row);
   snap.billing.forEach(r => insertIfMissing('store_billing', r));
+  (snap.providerLinks || []).forEach(r => insertIfMissing('store_provider_links', r));
   if (snap.unlinkedCardTransactionIds.length) {
     const placeholders = snap.unlinkedCardTransactionIds.map(() => '?').join(',');
     db.prepare(`UPDATE card_transactions SET store_id = ? WHERE id IN (${placeholders}) AND store_id IS NULL`).run(snap.row.id, ...snap.unlinkedCardTransactionIds);
