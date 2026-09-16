@@ -96,8 +96,14 @@ router.get('/stats', (req, res) => {
   };
 
   const duplicatesOpen = db.prepare(`SELECT COUNT(*) c FROM duplicate_flags WHERE org_id = ? AND status = 'open'`).get(orgId).c;
+  // merge_group_id is set to the PRIMARY member's own id on every row in a
+  // confirmed-duplicate group, including the primary (see db.js's column
+  // comment) — a group spanning 3 shuls submitting the same family is 3
+  // rows sharing one merge_group_id, not 3 separate merges. COUNT(DISTINCT
+  // ...) counts each such group once, matching "count it once per merge".
+  const mergedAccounts = db.prepare(`SELECT COUNT(DISTINCT merge_group_id) c FROM applicants WHERE org_id = ? AND merge_group_id IS NOT NULL${seasonClause}`).get(orgId, ...seasonParams).c;
 
-  res.json({ applicants, shuls, cards, stores, funds, duplicatesOpen });
+  res.json({ applicants, shuls, cards, stores, funds, duplicatesOpen, mergedAccounts });
 });
 
 router.get('/daily', (req, res) => {
