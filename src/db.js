@@ -704,6 +704,28 @@ safeAlter(`ALTER TABLE applicants ADD COLUMN provider_check_at TEXT`);
 // as two different accounts in any DISTINCT — one live season showed 667
 // "accounts ever created" against 641 real ones for exactly this reason.
 db.prepare(`UPDATE applicants SET provider_account_id = substr(provider_account_id, 1, length(provider_account_id) - 2) WHERE provider_account_id LIKE '%.0'`).run();
+// Transactions synced from disccardpromos before services/cardSync.js's
+// 2026-09-15 fixes carry two leftovers that a normal re-sync can never
+// correct (INSERT OR IGNORE on provider_txn_id leaves an existing row
+// exactly as it is), so they're repaired once here instead:
+//  1. provider_txn_id got the same trailing-".0" treatment as
+//     provider_account_id above (a raw numeric id bound into a TEXT column).
+//     A later re-sync of the same transaction wrote it again as "320972",
+//     so both copies exist. The old copy is dropped wherever the new one is
+//     already present, then ".0" is stripped off whatever's left so a future
+//     re-sync matches it instead of inserting a third copy.
+//  2. the stored sign was backwards: a real purchase was written as a
+//     positive amount, but every spend total in the app counts only negative
+//     amounts as purchases (see the storedAmount comment in cardSync.js).
+//     Those rows showed in the ledger but were excluded from "Total spent"
+//     — only transactions first synced after the fix ever counted. Flipping
+//     any provider-synced row whose sign disagrees with its type is safe to
+//     re-run: the fixed pipeline never writes a row that matches.
+db.prepare(`DELETE FROM card_transactions WHERE provider_txn_id LIKE '%.0'
+  AND substr(provider_txn_id, 1, length(provider_txn_id) - 2) IN (SELECT provider_txn_id FROM card_transactions WHERE provider_txn_id NOT LIKE '%.0')`).run();
+db.prepare(`UPDATE card_transactions SET provider_txn_id = substr(provider_txn_id, 1, length(provider_txn_id) - 2) WHERE provider_txn_id LIKE '%.0'`).run();
+db.prepare(`UPDATE card_transactions SET amount = -amount WHERE provider_txn_id IS NOT NULL
+  AND ((type = 'purchase' AND amount > 0) OR (type = 'refund' AND amount < 0))`).run();
 safeAlter(`ALTER TABLE forms ADD COLUMN opens_at TEXT`);
 safeAlter(`ALTER TABLE forms ADD COLUMN closes_at TEXT`);
 safeAlter(`ALTER TABLE forms ADD COLUMN is_default INTEGER DEFAULT 0`);
