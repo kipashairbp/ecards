@@ -1082,13 +1082,22 @@ async function renderMergeDone() {
   // Nothing left to compare doesn't necessarily mean the applicant this view
   // was opened from got unpaused along the way — a chain resolved pair by
   // pair can leave the entry record's own is_paused stuck at 1 (its flag
-  // closed, but nothing in that step happened to touch it). Since the group
-  // is genuinely done, clear it here rather than surfacing a dead end with
-  // no action.
+  // closed, but nothing in that step happened to touch it). Since THIS
+  // group is genuinely done, try to clear it here rather than surfacing a
+  // dead end with no action. The unpause endpoint refuses (409) if the
+  // applicant is still paused over a SEPARATE, unrelated open flag (not
+  // part of this group) — that's a real remaining problem, not a no-op, so
+  // it must not be reported as "cleared".
+  let pauseNote = '';
   if (mergeViewReturnToApplicant) {
-    try { await api(`/applicants/${mergeViewReturnToApplicant}/unpause`, { method: 'POST', body: {} }); } catch (err) { /* already active, or a real flag reappeared — fine either way */ }
+    try {
+      const r = await api(`/applicants/${mergeViewReturnToApplicant}/unpause`, { method: 'POST', body: {} });
+      if (r.unpaused) pauseNote = ' Its pause has been cleared.';
+    } catch (err) {
+      pauseNote = ` This record is still paused — ${err.message}`;
+    }
   }
-  openModal('Compare & Merge Records', `<p>This duplicate group is fully resolved — nothing left to compare. Any lingering pause on it has been cleared.</p>`, mergeExitBtn().replace('btn-outline', 'btn-primary'));
+  openModal('Compare & Merge Records', `<p>This duplicate group is fully resolved — nothing left to compare.${pauseNote}</p>`, mergeExitBtn().replace('btn-outline', 'btn-primary'));
   load();
 }
 window.unpauseOrphanedApplicant = async (id) => {
