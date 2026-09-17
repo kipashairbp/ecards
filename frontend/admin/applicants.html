@@ -608,7 +608,10 @@ async function openApplicant(id) {
           <strong>&#9888; Duplicate flag open.</strong>
           ${flags.map(f => `<div style="margin-top:6px">Matches another applicant — reason: ${esc(f.reason)}.
             <button class="btn btn-sm btn-outline" onclick="openMergeView('${f.id}','${id}')">View &amp; Resolve</button></div>`).join('')}
-        </div>` : ''}
+        </div>` : (a.is_paused ? `<div class="divider"></div><div style="color:var(--danger)">
+          <strong>&#9888; Paused, but no open duplicate flag was found.</strong> The flag that caused this was likely already resolved elsewhere.
+          <div style="margin-top:6px"><button class="btn btn-sm btn-outline" onclick="unpauseOrphanedApplicant('${id}')">Unpause</button></div>
+        </div>` : '')}
         ${a.approval_status === 'soft_rejected' && a.previous_shul_name ? `<div class="divider"></div><p class="small-muted">Previously at: <strong>${esc(a.previous_shul_name)}</strong></p>` : ''}
         ${mergeGroup && mergeGroup.length > 1 ? `<div class="divider"></div><div style="color:var(--text-muted);background:#f9efe0;padding:8px 12px;border-radius:6px">
           <strong>One shared record — submitted by ${mergeGroup.length} shuls:</strong>
@@ -1075,9 +1078,27 @@ function mergeExitBtn() {
     ? `<button class="btn btn-outline btn-sm" onclick="closeModal();openApplicant('${mergeViewReturnToApplicant}')">Back to Applicant</button>`
     : `<button class="btn btn-outline btn-sm" onclick="closeModal();showDuplicates()">Back to List</button>`;
 }
-function renderMergeDone() {
-  openModal('Compare & Merge Records', `<p>This duplicate group is fully resolved — nothing left to compare.</p>`, mergeExitBtn().replace('btn-outline', 'btn-primary'));
+async function renderMergeDone() {
+  // Nothing left to compare doesn't necessarily mean the applicant this view
+  // was opened from got unpaused along the way — a chain resolved pair by
+  // pair can leave the entry record's own is_paused stuck at 1 (its flag
+  // closed, but nothing in that step happened to touch it). Since the group
+  // is genuinely done, clear it here rather than surfacing a dead end with
+  // no action.
+  if (mergeViewReturnToApplicant) {
+    try { await api(`/applicants/${mergeViewReturnToApplicant}/unpause`, { method: 'POST', body: {} }); } catch (err) { /* already active, or a real flag reappeared — fine either way */ }
+  }
+  openModal('Compare & Merge Records', `<p>This duplicate group is fully resolved — nothing left to compare. Any lingering pause on it has been cleared.</p>`, mergeExitBtn().replace('btn-outline', 'btn-primary'));
+  load();
 }
+window.unpauseOrphanedApplicant = async (id) => {
+  try {
+    const r = await api(`/applicants/${id}/unpause`, { method: 'POST', body: {} });
+    toast(r.unpaused ? 'Unpaused.' : 'Already active.');
+    openApplicant(id);
+    load();
+  } catch (err) { toast(err.message, true); }
+};
 function renderPairPicker() {
   const active = activeMergeMembers();
   const body = `

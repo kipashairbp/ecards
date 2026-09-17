@@ -369,12 +369,19 @@ export function resolveFlag(flagId, resolvedByUserId, action) {
       ? [...new Set([...matchReasons(entityA, fullAddress(entityA), entityB), ...matchReasons(entityB, fullAddress(entityB), entityA), flag.reason])]
       : [flag.reason];
     db.prepare(`UPDATE duplicate_flags SET status = 'bypassed', resolved_by = ?, resolved_at = datetime('now'), bypassed_reasons = ? WHERE id = ?`).run(resolvedByUserId, JSON.stringify(knownReasons), flagId);
-    db.prepare('UPDATE applicants SET is_paused = 0, duplicate_status = ? WHERE id IN (?, ?)').run('bypassed', flag.entity_id, flag.matched_entity_id);
-    // Either side may have been sitting paused mid-approval (account
-    // created, funds never loaded) or already-approved with its card_amount
-    // ahead of its real balance the whole time — see unpauseIfNoLongerFlagged's
-    // comment. Bypassing is exactly the same "now definitely not paused
-    // anymore" moment, so it gets the same check.
+    // is_paused only actually clears per side if THAT side has no OTHER
+    // open flag left — a 3+ person chain (A-B and B-C both open) bypassing
+    // A-B must leave B paused, since B is still a live, unresolved duplicate
+    // of C. Either side may also have been sitting paused mid-approval
+    // (account created, funds never loaded) or already-approved with its
+    // card_amount ahead of its real balance the whole time it sat paused —
+    // unpauseIfNoLongerFlagged schedules the same enforcer top-up for
+    // whichever side actually clears. duplicate_status is set AFTER, and
+    // unconditionally on both, since it just records how this particular
+    // pair was resolved — independent of whether one side is still paused
+    // over a separate, unrelated flag.
+    unpauseIfNoLongerFlagged('applicant', [flag.entity_id, flag.matched_entity_id]);
+    db.prepare('UPDATE applicants SET duplicate_status = ? WHERE id IN (?, ?)').run('bypassed', flag.entity_id, flag.matched_entity_id);
     scheduleProviderEnforceSoon(flag.org_id, 'duplicate flag bypassed');
     return { flag: db.prepare('SELECT * FROM duplicate_flags WHERE id = ?').get(flagId), undoSnapshot };
   }

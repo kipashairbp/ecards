@@ -3,7 +3,7 @@ import multer from 'multer';
 import { db, uuid, DEFAULT_ORG_ID } from '../db.js';
 import { auth, requireAdmin } from '../middleware/auth.js';
 import { requirePermission, redact } from '../middleware/permissions.js';
-import { detectAndFlag, resolveFlag, getMergeGroupIds, mergeApplicants, applicantsSharePhone, reconcileAccountsForGroup, reconcileAllMergedAccounts, recheckAllApplicantDuplicates, collapseAllMergedApplicantGroups } from '../services/duplicates.js';
+import { detectAndFlag, resolveFlag, getMergeGroupIds, mergeApplicants, applicantsSharePhone, reconcileAccountsForGroup, reconcileAllMergedAccounts, recheckAllApplicantDuplicates, collapseAllMergedApplicantGroups, unpauseIfNoLongerFlagged } from '../services/duplicates.js';
 import { sendMailChecked, renderSystemTemplate, escapeHtml } from '../services/mail.js';
 import { sendSmsChecked } from '../services/sms.js';
 import * as giftcard from '../services/giftcard.js';
@@ -2447,6 +2447,25 @@ router.post('/duplicates/:flagId/resolve', requirePermission('applicants', 'can_
     logAudit(req.user.org_id, req.user.id, 'resolve_duplicate', 'applicant', flag.entity_id, undoSnapshot, flag, req.ip);
     res.json({ flag });
   } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// Direct fix for an applicant stuck paused with no open duplicate flag left
+// against it — its duplicate flag was already resolved/bypassed elsewhere,
+// or its duplicate partner was deleted, but is_paused itself never got
+// cleared (the "orphaned pause" case recheckAllApplicantDuplicates already
+// sweeps for org-wide; this is the same check, scoped to one applicant, for
+// when an admin hits it on a single profile instead of running the whole
+// org-wide recheck). Refuses to touch anything if a genuinely open flag
+// still exists — that must go through View & Resolve, not a blind unpause.
+router.post('/:id/unpause', requirePermission('applicants', 'can_edit'), (req, res) => {
+  const applicant = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
+  if (!applicant) return res.status(404).json({ error: 'Not found' });
+  if (!applicant.is_paused) return res.json({ unpaused: false, alreadyActive: true });
+  const stillOpen = db.prepare(`SELECT 1 FROM duplicate_flags WHERE status = 'open' AND entity_type = 'applicant' AND (entity_id = ? OR matched_entity_id = ?)`).get(applicant.id, applicant.id);
+  if (stillOpen) return res.status(409).json({ error: 'This applicant still has an open duplicate flag — resolve it via View & Resolve first.' });
+  unpauseIfNoLongerFlagged('applicant', [applicant.id]);
+  logAudit(req.user.org_id, req.user.id, 'unpause_orphaned', 'applicant', applicant.id, { is_paused: 1 }, { is_paused: 0 }, req.ip);
+  res.json({ unpaused: true });
 });
 
 // Full merge group for a flag — every applicant confirmed (or provisionally,
