@@ -267,6 +267,31 @@ export function recheckAllApplicantDuplicates(orgId, seasonId) {
     cleared++;
   }
 
+  // A DIFFERENT stale-reference case than the orphanPaused sweep just below:
+  // an open flag row whose OTHER side no longer exists in `applicants` at
+  // all (a hard delete from before getDuplicatePartnerIds/
+  // unpauseIfNoLongerFlagged existed, or a direct DB edit, left the flag
+  // row itself behind). The surviving side still has a genuinely open
+  // duplicate_flags row referencing it, so every current check correctly
+  // treats it as "still flagged" and refuses to unpause — but there is
+  // nothing left anywhere to compare against or resolve; View & Resolve can
+  // never close it. Must run BEFORE orphanPaused below, which only catches
+  // an applicant with NO open flag at all — this is what removes the flag
+  // causing that NOT EXISTS check to still say "yes, one exists."
+  const staleFlags = db.prepare(`SELECT * FROM duplicate_flags WHERE org_id = ? AND entity_type = 'applicant' AND status = 'open'
+    AND (NOT EXISTS (SELECT 1 FROM applicants WHERE id = duplicate_flags.entity_id) OR NOT EXISTS (SELECT 1 FROM applicants WHERE id = duplicate_flags.matched_entity_id))`).all(orgId);
+  let staleCleared = 0;
+  for (const f of staleFlags) {
+    db.prepare(`UPDATE duplicate_flags SET status = 'resolved', resolved_at = datetime('now') WHERE id = ?`).run(f.id);
+    for (const id of [f.entity_id, f.matched_entity_id]) {
+      if (db.prepare('SELECT 1 FROM applicants WHERE id = ?').get(id)) {
+        unpauseIfNoLongerFlagged('applicant', [id]);
+        scheduleProviderEnforceSoon(orgId, 'stale duplicate flag (missing partner) cleared');
+      }
+    }
+    staleCleared++;
+  }
+
   // General safety net, not just the 'incomplete' case above: any applicant
   // still sitting is_paused=1 with no open flag pointing at it at all (most
   // commonly its duplicate partner was hard-deleted before
@@ -304,7 +329,7 @@ export function recheckAllApplicantDuplicates(orgId, seasonId) {
     pauseAccountsFor('applicant', a.id, match.matchedId);
     flagged++;
   }
-  return { cleared, unpaused, checked: rows.length, flagged };
+  return { cleared, staleCleared, unpaused, checked: rows.length, flagged };
 }
 
 // Which fields count as "a phone number" for the never-bypass-if-matched

@@ -921,7 +921,7 @@ async function recheckAllDuplicates() {
   if (!confirm('Recheck every applicant org-wide? This clears any duplicate flag caused by the incomplete-applicant bug, and freshly checks everyone else for anything that was missed. Safe to re-run.')) return;
   try {
     const r = await api('/applicants/duplicates/recheck-all', { method: 'POST', body: {} });
-    toast(`Checked ${r.checked}. Cleared ${r.cleared} spurious flag(s), unpaused ${r.unpaused} orphaned pause(s), found ${r.flagged} new one(s).`);
+    toast(`Checked ${r.checked}. Cleared ${r.cleared} spurious flag(s), ${r.staleCleared} stale flag(s) with a missing partner, unpaused ${r.unpaused} orphaned pause(s), found ${r.flagged} new one(s).`);
     showDuplicates();
   } catch (err) { toast(err.message, true); }
 }
@@ -1089,21 +1089,30 @@ async function renderMergeDone() {
   // part of this group) — that's a real remaining problem, not a no-op, so
   // it must not be reported as "cleared".
   let pauseNote = '';
+  let blockingFlagId = null;
   if (mergeViewReturnToApplicant) {
     try {
       const r = await api(`/applicants/${mergeViewReturnToApplicant}/unpause`, { method: 'POST', body: {} });
       if (r.unpaused) pauseNote = ' Its pause has been cleared.';
     } catch (err) {
       pauseNote = ` This record is still paused — ${err.message}`;
+      // The endpoint names the exact flag blocking it (see routes/
+      // applicants.js's POST /:id/unpause) — jump straight into resolving
+      // THAT one instead of making the admin close this, reopen the
+      // profile, and hunt for the right button themselves.
+      blockingFlagId = err.data?.flagId || null;
     }
   }
-  openModal('Compare & Merge Records', `<p>This duplicate group is fully resolved — nothing left to compare.${pauseNote}</p>`, mergeExitBtn().replace('btn-outline', 'btn-primary'));
+  const footer = blockingFlagId
+    ? `${mergeExitBtn()}<button class="btn btn-sm btn-primary" onclick="openMergeView('${blockingFlagId}','${mergeViewReturnToApplicant}')">Resolve It Now</button>`
+    : mergeExitBtn().replace('btn-outline', 'btn-primary');
+  openModal('Compare & Merge Records', `<p>This duplicate group is fully resolved — nothing left to compare.${pauseNote}</p>`, footer);
   load();
 }
 window.unpauseOrphanedApplicant = async (id) => {
   try {
     const r = await api(`/applicants/${id}/unpause`, { method: 'POST', body: {} });
-    toast(r.unpaused ? 'Unpaused.' : 'Already active.');
+    toast(r.unpaused ? `Unpaused.${r.staleCleared ? ` Cleared ${r.staleCleared} stale flag(s) whose other side no longer exists.` : ''}` : 'Already active.');
     openApplicant(id);
     load();
   } catch (err) { toast(err.message, true); }

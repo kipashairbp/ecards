@@ -2513,11 +2513,44 @@ router.post('/:id/unpause', requirePermission('applicants', 'can_edit'), (req, r
   const applicant = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!applicant) return res.status(404).json({ error: 'Not found' });
   if (!applicant.is_paused) return res.json({ unpaused: false, alreadyActive: true });
-  const stillOpen = db.prepare(`SELECT 1 FROM duplicate_flags WHERE status = 'open' AND entity_type = 'applicant' AND (entity_id = ? OR matched_entity_id = ?)`).get(applicant.id, applicant.id);
-  if (stillOpen) return res.status(409).json({ error: 'This applicant still has an open duplicate flag — resolve it via View & Resolve first.' });
+  // A flag whose OTHER side no longer exists in `applicants` at all (a hard
+  // delete from before getDuplicatePartnerIds/unpauseIfNoLongerFlagged
+  // existed, or a direct DB edit, left the flag row itself behind) is
+  // auto-resolved here rather than treated as a real block — there is
+  // nothing left anywhere to compare against or resolve via View & Resolve
+  // (its group would fetch zero members for the missing side), so no admin
+  // judgment call is actually needed. Without this, this endpoint — and the
+  // "Resolve It Now" button below that calls back into it — would otherwise
+  // loop forever on exactly the case they exist to fix.
+  const openFlags = db.prepare(`SELECT * FROM duplicate_flags WHERE status = 'open' AND entity_type = 'applicant' AND (entity_id = ? OR matched_entity_id = ?)`).all(applicant.id, applicant.id);
+  let staleCleared = 0;
+  for (const f of openFlags) {
+    const otherId = f.entity_id === applicant.id ? f.matched_entity_id : f.entity_id;
+    if (!db.prepare('SELECT 1 FROM applicants WHERE id = ?').get(otherId)) {
+      db.prepare(`UPDATE duplicate_flags SET status = 'resolved', resolved_at = datetime('now') WHERE id = ?`).run(f.id);
+      staleCleared++;
+    }
+  }
+  // Named and linked, not just "an open flag exists" — a generic refusal
+  // left the admin with no faster path than manually reopening the profile
+  // and hoping the right button was there; this lets the caller (see
+  // applicants.html's renderMergeDone) jump straight into resolving THIS
+  // flag instead. Safe to inner-join now — the stale (missing-partner) case
+  // was already cleared above, so anything still open here has a real
+  // partner row.
+  const stillOpen = db.prepare(`SELECT df.id, df.reason, a2.first_name AS other_first_name, a2.last_name AS other_last_name FROM duplicate_flags df
+    JOIN applicants a2 ON a2.id = (CASE WHEN df.entity_id = ? THEN df.matched_entity_id ELSE df.entity_id END)
+    WHERE df.status = 'open' AND df.entity_type = 'applicant' AND (df.entity_id = ? OR df.matched_entity_id = ?)
+    ORDER BY df.created_at LIMIT 1`).get(applicant.id, applicant.id, applicant.id);
+  if (stillOpen) {
+    return res.status(409).json({
+      error: `This applicant still has an open duplicate flag against ${stillOpen.other_first_name} ${stillOpen.other_last_name} (${stillOpen.reason}) — resolve it via View & Resolve first.`,
+      flagId: stillOpen.id,
+    });
+  }
   unpauseIfNoLongerFlagged('applicant', [applicant.id]);
   logAudit(req.user.org_id, req.user.id, 'unpause_orphaned', 'applicant', applicant.id, { is_paused: 1 }, { is_paused: 0 }, req.ip);
-  res.json({ unpaused: true });
+  res.json({ unpaused: true, staleCleared });
 });
 
 // Full merge group for a flag — every applicant confirmed (or provisionally,
