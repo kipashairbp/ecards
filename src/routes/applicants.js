@@ -487,10 +487,20 @@ router.get('/', (req, res) => {
   // / inactive / active / relinked / error / missing / cleared.
   if (provider_check) { where += ' AND a.provider_check_status = ?'; params.push(provider_check); }
   if (search) {
-    where += ` AND (a.first_name LIKE ? OR a.last_name LIKE ? OR a.email LIKE ? OR a.home_phone LIKE ? OR a.husband_cell LIKE ? OR a.wife_cell LIKE ? OR a.external_id LIKE ?
+    where += ` AND (a.first_name LIKE ? OR a.last_name LIKE ? OR a.email LIKE ? OR REPLACE(a.home_phone,'-','') LIKE ? OR REPLACE(a.husband_cell,'-','') LIKE ? OR REPLACE(a.wife_cell,'-','') LIKE ? OR a.external_id LIKE ?
       OR a.address LIKE ? OR a.city LIKE ? OR a.state LIKE ? OR a.zip LIKE ? OR a.comments LIKE ? OR a.permanent_comments LIKE ?)`;
     const like = `%${search}%`;
-    params.push(like, like, like, like, like, like, like, like, like, like, like, like, like);
+    // Phone fields are stored dash-formatted ("732-555-1234") — stripping
+    // dashes from both the column and the search term means a search works
+    // whether or not the admin types them, and whether a partial match
+    // happens to fall across where a dash would be.
+    // A search string that's ALL dashes (e.g. "-", "---") strips down to
+    // '', and '%%' would match every non-null phone value — an impossible
+    // sentinel here instead, so a dash-only search behaves like any other
+    // string nothing in the org's phone numbers contains, not "everything".
+    const strippedSearch = search.replace(/-/g, '');
+    const likeNoDash = strippedSearch ? `%${strippedSearch}%` : 'NEVER_MATCHES_ANY_PHONE_XYZ';
+    params.push(like, like, like, likeNoDash, likeNoDash, likeNoDash, like, like, like, like, like, like, like);
   }
   const allowedSort = ['created_at','last_name','approval_status','num_children','card_amount','external_id'];
   const sortCol = allowedSort.includes(sort) ? `a.${sort}` : 'a.created_at';
@@ -533,10 +543,20 @@ router.get('/export', requirePermission('applicants', 'can_export'), (req, res) 
   if (amount_min !== undefined && amount_min !== '') { where += ' AND a.card_amount >= ?'; params.push(+amount_min); }
   if (amount_max !== undefined && amount_max !== '') { where += ' AND a.card_amount <= ?'; params.push(+amount_max); }
   if (search) {
-    where += ` AND (a.first_name LIKE ? OR a.last_name LIKE ? OR a.email LIKE ? OR a.home_phone LIKE ? OR a.husband_cell LIKE ? OR a.wife_cell LIKE ? OR a.external_id LIKE ?
+    where += ` AND (a.first_name LIKE ? OR a.last_name LIKE ? OR a.email LIKE ? OR REPLACE(a.home_phone,'-','') LIKE ? OR REPLACE(a.husband_cell,'-','') LIKE ? OR REPLACE(a.wife_cell,'-','') LIKE ? OR a.external_id LIKE ?
       OR a.address LIKE ? OR a.city LIKE ? OR a.state LIKE ? OR a.zip LIKE ? OR a.comments LIKE ? OR a.permanent_comments LIKE ?)`;
     const like = `%${search}%`;
-    params.push(like, like, like, like, like, like, like, like, like, like, like, like, like);
+    // Phone fields are stored dash-formatted ("732-555-1234") — stripping
+    // dashes from both the column and the search term means a search works
+    // whether or not the admin types them, and whether a partial match
+    // happens to fall across where a dash would be.
+    // A search string that's ALL dashes (e.g. "-", "---") strips down to
+    // '', and '%%' would match every non-null phone value — an impossible
+    // sentinel here instead, so a dash-only search behaves like any other
+    // string nothing in the org's phone numbers contains, not "everything".
+    const strippedSearch = search.replace(/-/g, '');
+    const likeNoDash = strippedSearch ? `%${strippedSearch}%` : 'NEVER_MATCHES_ANY_PHONE_XYZ';
+    params.push(like, like, like, likeNoDash, likeNoDash, likeNoDash, like, like, like, like, like, like, like);
   }
   const rows = db.prepare(`SELECT a.*, s.name_en as shul_name FROM applicants a LEFT JOIN shuls s ON s.id = a.shul_id ${where} ORDER BY a.created_at DESC`).all(...params);
   sendXlsx(res, `applicants-${Date.now()}.xlsx`, redact(rows, req.permission.hidden_fields));
@@ -561,10 +581,20 @@ router.get('/ids', (req, res) => {
   if (amount_min !== undefined && amount_min !== '') { where += ' AND a.card_amount >= ?'; params.push(+amount_min); }
   if (amount_max !== undefined && amount_max !== '') { where += ' AND a.card_amount <= ?'; params.push(+amount_max); }
   if (search) {
-    where += ` AND (a.first_name LIKE ? OR a.last_name LIKE ? OR a.email LIKE ? OR a.home_phone LIKE ? OR a.husband_cell LIKE ? OR a.wife_cell LIKE ? OR a.external_id LIKE ?
+    where += ` AND (a.first_name LIKE ? OR a.last_name LIKE ? OR a.email LIKE ? OR REPLACE(a.home_phone,'-','') LIKE ? OR REPLACE(a.husband_cell,'-','') LIKE ? OR REPLACE(a.wife_cell,'-','') LIKE ? OR a.external_id LIKE ?
       OR a.address LIKE ? OR a.city LIKE ? OR a.state LIKE ? OR a.zip LIKE ? OR a.comments LIKE ? OR a.permanent_comments LIKE ?)`;
     const like = `%${search}%`;
-    params.push(like, like, like, like, like, like, like, like, like, like, like, like, like);
+    // Phone fields are stored dash-formatted ("732-555-1234") — stripping
+    // dashes from both the column and the search term means a search works
+    // whether or not the admin types them, and whether a partial match
+    // happens to fall across where a dash would be.
+    // A search string that's ALL dashes (e.g. "-", "---") strips down to
+    // '', and '%%' would match every non-null phone value — an impossible
+    // sentinel here instead, so a dash-only search behaves like any other
+    // string nothing in the org's phone numbers contains, not "everything".
+    const strippedSearch = search.replace(/-/g, '');
+    const likeNoDash = strippedSearch ? `%${strippedSearch}%` : 'NEVER_MATCHES_ANY_PHONE_XYZ';
+    params.push(like, like, like, likeNoDash, likeNoDash, likeNoDash, like, like, like, like, like, like, like);
   }
   const ids = db.prepare(`SELECT a.id FROM applicants a ${where}`).all(...params).map(r => r.id);
   res.json({ ids });
@@ -1348,6 +1378,28 @@ router.get('/:id', (req, res) => {
   }
   const requiresShulContribution = !!db.prepare('SELECT require_shul_contribution FROM seasons WHERE id = ?').get(applicant.season_id)?.require_shul_contribution;
   res.json({ applicant: maskForShul(redact(applicant, req.permission.hidden_fields), req.user.role, req.user.org_id), notes, cards, flags, mergeGroup, requiresShulContribution });
+});
+
+// Detaches one shul's contributing submission from a merged applicant (the
+// shul-pill-group shown above in GET /:id's own mergeGroup) — "this shul's
+// family isn't actually part of this merged record," without touching
+// anything else about the surviving applicant. The shul loses its own
+// applicant_submissions row entirely: their portal will no longer show this
+// applicant at all (see GET /:id's ownSubmission check and shuls.js's own
+// applicant-list queries, both of which read through this table). Refuses
+// to remove the PRIMARY submission — that's the shul the surviving record's
+// own shul_id/card actually belongs to, so removing it would orphan the
+// applicant rather than just correct a bad merge; picking a different
+// primary is a real merge decision, not a quick detach.
+router.delete('/:id/submissions/:shulId', requirePermission('applicants', 'can_edit'), (req, res) => {
+  const applicant = db.prepare('SELECT id FROM applicants WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
+  if (!applicant) return res.status(404).json({ error: 'Not found' });
+  const submission = db.prepare('SELECT * FROM applicant_submissions WHERE applicant_id = ? AND shul_id = ?').get(applicant.id, req.params.shulId);
+  if (!submission) return res.status(404).json({ error: 'This shul is not a contributor on this record' });
+  if (submission.is_primary) return res.status(400).json({ error: "Can't remove the primary shul this way — it holds the actual record and card. Merge again with a different primary if that shul shouldn't be the one to keep it." });
+  db.prepare('DELETE FROM applicant_submissions WHERE id = ?').run(submission.id);
+  logAudit(req.user.org_id, req.user.id, 'remove_submission', 'applicant', applicant.id, submission, null, req.ip);
+  res.json({ ok: true });
 });
 
 // Who edited this record and when — a shul viewing their own applicant
@@ -2477,17 +2529,26 @@ router.get('/duplicates/:flagId/group', requireAdmin, (req, res) => {
   const flag = db.prepare(`SELECT * FROM duplicate_flags WHERE id = ? AND org_id = ? AND entity_type='applicant'`).get(req.params.flagId, req.user.org_id);
   if (!flag) return res.status(404).json({ error: 'Not found' });
   // ?ids= lets a caller re-fetch the CURRENT state of an already-established
-  // working set instead of re-deriving the transitive closure from scratch
-  // (getMergeGroupIds always reseeds from this flag's own two original
-  // entities — once THEIR connecting flags close, one-by-one, during a
-  // multi-step pairwise merge, re-deriving from scratch can silently lose
+  // working set instead of re-deriving the transitive closure from just
+  // this flag's own two entities (which, on its own, can silently lose
   // members still connected to each other but no longer to the original
   // seed pair). The frontend's pairwise compare-and-merge flow captures the
   // full group once on first open and passes it back on every refresh so
-  // nobody it already surfaced ever quietly disappears mid-review. Always
-  // re-scoped to this org regardless of what the client sends.
+  // nobody it already surfaced ever quietly disappears mid-review.
+  //
+  // Passed through getMergeGroupIds as the SEED (not used verbatim) so it
+  // still grows to pick up anything newly connected to any of these ids
+  // since the working set was captured — e.g. a fresh duplicate check
+  // flagging one of these members against someone outside the original
+  // group while this compare view was already open. Without this, that new
+  // flag was invisible to the rest of this pairwise flow: the group could
+  // reach "nothing left to compare" while that member was, in fact, still
+  // genuinely paused over a real open flag this view never surfaced —
+  // exactly the "still paused, resolve it via View & Resolve first" dead
+  // end this closes. Always re-scoped to this org regardless of what the
+  // client sends.
   const explicitIds = typeof req.query.ids === 'string' ? req.query.ids.split(',').filter(Boolean) : null;
-  const ids = explicitIds && explicitIds.length ? explicitIds : getMergeGroupIds(req.user.org_id, [flag.entity_id, flag.matched_entity_id]);
+  const ids = getMergeGroupIds(req.user.org_id, explicitIds && explicitIds.length ? explicitIds : [flag.entity_id, flag.matched_entity_id]);
   const placeholders0 = ids.map(() => '?').join(',');
   const members = db.prepare(`SELECT a.*, s.name_en as shul_name, ps.name_en as previous_shul_name FROM applicants a
     LEFT JOIN shuls s ON s.id = a.shul_id LEFT JOIN shuls ps ON ps.id = a.previous_shul_id

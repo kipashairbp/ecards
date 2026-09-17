@@ -310,11 +310,20 @@ router.get('/', (req, res) => {
   if (season_id) { where += ' AND season_id = ?'; params.push(season_id); }
   if (search) {
     where += ` AND (name_en LIKE ? OR name_he LIKE ? OR address LIKE ? OR city LIKE ? OR state LIKE ? OR zip LIKE ?
-      OR ruv_first_name LIKE ? OR ruv_last_name LIKE ? OR ruv_phone LIKE ? OR ruv_address LIKE ? OR ruv_city LIKE ?
-      OR gabai_first_name LIKE ? OR gabai_last_name LIKE ? OR gabai_cell LIKE ? OR gabai_email LIKE ? OR gabai_address LIKE ? OR gabai_city LIKE ?
+      OR ruv_first_name LIKE ? OR ruv_last_name LIKE ? OR REPLACE(ruv_phone,'-','') LIKE ? OR ruv_address LIKE ? OR ruv_city LIKE ?
+      OR gabai_first_name LIKE ? OR gabai_last_name LIKE ? OR REPLACE(gabai_cell,'-','') LIKE ? OR gabai_email LIKE ? OR gabai_address LIKE ? OR gabai_city LIKE ?
       OR permanent_comments LIKE ?)`;
     const like = `%${search}%`;
-    params.push(like, like, like, like, like, like, like, like, like, like, like, like, like, like, like, like, like, like);
+    // Phone fields are stored dash-formatted ("732-555-1234") — stripping
+    // dashes from both the column and the search term means a search works
+    // whether or not the admin types them.
+    // A search string that's ALL dashes (e.g. "-", "---") strips down to
+    // '', and '%%' would match every non-null phone value — an impossible
+    // sentinel here instead, so a dash-only search behaves like any other
+    // string nothing in the org's phone numbers contains, not "everything".
+    const strippedSearch = search.replace(/-/g, '');
+    const likeNoDash = strippedSearch ? `%${strippedSearch}%` : 'NEVER_MATCHES_ANY_PHONE_XYZ';
+    params.push(like, like, like, like, like, like, like, like, likeNoDash, like, like, like, like, likeNoDash, like, like, like, like);
   }
   const allowedSort = ['created_at', 'name_en', 'status', 'city', 'slots_allocated'];
   const sortCol = allowedSort.includes(sort) ? sort : 'created_at';
@@ -351,11 +360,20 @@ router.get('/export', requirePermission('shuls', 'can_export'), (req, res) => {
   if (season_id) { where += ' AND season_id = ?'; params.push(season_id); }
   if (search) {
     where += ` AND (name_en LIKE ? OR name_he LIKE ? OR address LIKE ? OR city LIKE ? OR state LIKE ? OR zip LIKE ?
-      OR ruv_first_name LIKE ? OR ruv_last_name LIKE ? OR ruv_phone LIKE ? OR ruv_address LIKE ? OR ruv_city LIKE ?
-      OR gabai_first_name LIKE ? OR gabai_last_name LIKE ? OR gabai_cell LIKE ? OR gabai_email LIKE ? OR gabai_address LIKE ? OR gabai_city LIKE ?
+      OR ruv_first_name LIKE ? OR ruv_last_name LIKE ? OR REPLACE(ruv_phone,'-','') LIKE ? OR ruv_address LIKE ? OR ruv_city LIKE ?
+      OR gabai_first_name LIKE ? OR gabai_last_name LIKE ? OR REPLACE(gabai_cell,'-','') LIKE ? OR gabai_email LIKE ? OR gabai_address LIKE ? OR gabai_city LIKE ?
       OR permanent_comments LIKE ?)`;
     const like = `%${search}%`;
-    params.push(like, like, like, like, like, like, like, like, like, like, like, like, like, like, like, like, like, like);
+    // Phone fields are stored dash-formatted ("732-555-1234") — stripping
+    // dashes from both the column and the search term means a search works
+    // whether or not the admin types them.
+    // A search string that's ALL dashes (e.g. "-", "---") strips down to
+    // '', and '%%' would match every non-null phone value — an impossible
+    // sentinel here instead, so a dash-only search behaves like any other
+    // string nothing in the org's phone numbers contains, not "everything".
+    const strippedSearch = search.replace(/-/g, '');
+    const likeNoDash = strippedSearch ? `%${strippedSearch}%` : 'NEVER_MATCHES_ANY_PHONE_XYZ';
+    params.push(like, like, like, like, like, like, like, like, likeNoDash, like, like, like, like, likeNoDash, like, like, like, like);
   }
   const rows = db.prepare(`SELECT * FROM shuls ${where} ORDER BY created_at DESC`).all(...params);
   // Per-shul applicant counts by status — one grouped query across every
@@ -390,11 +408,20 @@ router.get('/ids', (req, res) => {
   if (season_id) { where += ' AND season_id = ?'; params.push(season_id); }
   if (search) {
     where += ` AND (name_en LIKE ? OR name_he LIKE ? OR address LIKE ? OR city LIKE ? OR state LIKE ? OR zip LIKE ?
-      OR ruv_first_name LIKE ? OR ruv_last_name LIKE ? OR ruv_phone LIKE ? OR ruv_address LIKE ? OR ruv_city LIKE ?
-      OR gabai_first_name LIKE ? OR gabai_last_name LIKE ? OR gabai_cell LIKE ? OR gabai_email LIKE ? OR gabai_address LIKE ? OR gabai_city LIKE ?
+      OR ruv_first_name LIKE ? OR ruv_last_name LIKE ? OR REPLACE(ruv_phone,'-','') LIKE ? OR ruv_address LIKE ? OR ruv_city LIKE ?
+      OR gabai_first_name LIKE ? OR gabai_last_name LIKE ? OR REPLACE(gabai_cell,'-','') LIKE ? OR gabai_email LIKE ? OR gabai_address LIKE ? OR gabai_city LIKE ?
       OR permanent_comments LIKE ?)`;
     const like = `%${search}%`;
-    params.push(like, like, like, like, like, like, like, like, like, like, like, like, like, like, like, like, like, like);
+    // Phone fields are stored dash-formatted ("732-555-1234") — stripping
+    // dashes from both the column and the search term means a search works
+    // whether or not the admin types them.
+    // A search string that's ALL dashes (e.g. "-", "---") strips down to
+    // '', and '%%' would match every non-null phone value — an impossible
+    // sentinel here instead, so a dash-only search behaves like any other
+    // string nothing in the org's phone numbers contains, not "everything".
+    const strippedSearch = search.replace(/-/g, '');
+    const likeNoDash = strippedSearch ? `%${strippedSearch}%` : 'NEVER_MATCHES_ANY_PHONE_XYZ';
+    params.push(like, like, like, like, like, like, like, like, likeNoDash, like, like, like, like, likeNoDash, like, like, like, like);
   }
   const ids = db.prepare(`SELECT id FROM shuls ${where}`).all(...params).map(r => r.id);
   res.json({ ids });

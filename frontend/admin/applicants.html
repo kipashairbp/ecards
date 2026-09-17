@@ -615,7 +615,7 @@ async function openApplicant(id) {
         ${a.approval_status === 'soft_rejected' && a.previous_shul_name ? `<div class="divider"></div><p class="small-muted">Previously at: <strong>${esc(a.previous_shul_name)}</strong></p>` : ''}
         ${mergeGroup && mergeGroup.length > 1 ? `<div class="divider"></div><div style="color:var(--text-muted);background:#f9efe0;padding:8px 12px;border-radius:6px">
           <strong>One shared record — submitted by ${mergeGroup.length} shuls:</strong>
-          <div class="shul-pill-group" style="margin-top:6px">${mergeGroup.map(m => `<span class="shul-pill${m.is_primary ? ' primary' : ''}">${esc(m.shul_name)}</span>`).join('')}</div>
+          <div class="shul-pill-group" style="margin-top:6px">${mergeGroup.map(m => `<span class="shul-pill${m.is_primary ? ' primary' : ''}">${esc(m.shul_name)}${m.is_primary ? '' : ` <button type="button" title="Remove ${esc(m.shul_name)} from this merged record" onclick="removeShulFromMerge('${id}','${m.id}')" style="border:none;background:none;cursor:pointer;color:inherit;font-weight:700;line-height:1;padding:0;margin-left:2px">&times;</button>`}</span>`).join('')}</div>
         </div>` : ''}
         <div class="divider"></div>
         <div class="grid-2">
@@ -1105,6 +1105,19 @@ window.unpauseOrphanedApplicant = async (id) => {
     const r = await api(`/applicants/${id}/unpause`, { method: 'POST', body: {} });
     toast(r.unpaused ? 'Unpaused.' : 'Already active.');
     openApplicant(id);
+    load();
+  } catch (err) { toast(err.message, true); }
+};
+// Detaches one contributing shul's submission from a merged applicant —
+// "this shul's family isn't actually part of this merged record," without
+// touching anything else. Only shown on non-primary pills (see openApplicant
+// above) — the backend itself also refuses to remove the primary.
+window.removeShulFromMerge = async (applicantId, shulId) => {
+  if (!confirm("Remove this shul from this merged record? They'll lose access to it entirely in their portal — this doesn't restore a separate applicant for them.")) return;
+  try {
+    await api(`/applicants/${applicantId}/submissions/${shulId}`, { method: 'DELETE' });
+    toast('Removed');
+    openApplicant(applicantId);
     load();
   } catch (err) { toast(err.message, true); }
 };
