@@ -1057,10 +1057,31 @@ window.openMergeView = async (flagId, fromApplicantId) => {
 function activeMergeMembers() {
   return mergeGroupCache.members.filter(m => !m.merge_group_id || m.merge_group_id === m.id);
 }
+function memberById(id) {
+  return mergeGroupCache.members.find(m => m.id === id);
+}
 // Dispatches to whichever screen the current group state calls for: fully
 // resolved, a plain pair (no picker needed — same as the original 2-record
 // flow), a pair already picked mid-flow, or the picker itself.
 function renderMergeView() {
+  // The flag this view was specifically opened for (a profile's own "View &
+  // Resolve" button, or renderMergeDone's "Resolve It Now") must always be
+  // directly resolvable as long as both its own two parties are still real,
+  // existing rows in this fetch — regardless of whether either one ALSO
+  // carries unrelated merge_group_id baggage from a separate, past
+  // resolution having nothing to do with this flag. Checked first, before
+  // the "active members of the whole transitive pull-in" logic below:
+  // that logic exists to catch two survivors with nothing left between
+  // them, but it can spuriously mark the very member this flag is about as
+  // "already folded away" over a completely different old merge, sending
+  // this view straight to a dead end for a flag that's still genuinely
+  // open and has never actually been looked at.
+  const originalFlag = mergeGroupCache.flag;
+  if (originalFlag && mergeGroupCache.flags.some(f => f.id === originalFlag.id)
+      && mergeGroupCache.members.some(m => m.id === originalFlag.entity_id) && mergeGroupCache.members.some(m => m.id === originalFlag.matched_entity_id)) {
+    mergePairSelection = [originalFlag.entity_id, originalFlag.matched_entity_id];
+    return renderPairCompare();
+  }
   const active = activeMergeMembers();
   // "Done" isn't just "down to 1 person" — it's also reached the moment
   // nothing among whoever's left is still an open question. Two survivors
@@ -1154,7 +1175,12 @@ window.togglePairPick = (id, checked) => {
 function renderPairCompare() {
   const active = activeMergeMembers();
   const [idA, idB] = mergePairSelection;
-  const a = active.find(m => m.id === idA), b = active.find(m => m.id === idB);
+  // Looked up from the FULL member list, not just `active` — the very pair
+  // renderMergeView's "original flag" shortcut selects can include a member
+  // that active's own merge_group_id filter would otherwise exclude (see
+  // that shortcut's comment); this pair is still fully resolvable as long
+  // as both rows genuinely exist, so it must render here regardless.
+  const a = memberById(idA), b = memberById(idB);
   if (!a || !b) { mergePairSelection = []; return renderMergeView(); } // stale selection safety net
   const members = [a, b];
   // Only a DIRECT flag between exactly these two can be bypassed — two
