@@ -51,6 +51,7 @@ window.runImport = async () => {
     const r = await api('/applicants/import', { method: 'POST', isForm: true, body: fd });
     qs('#import-result').innerHTML = `<p><strong>${r.success}</strong> new, <strong>${r.updated}</strong> updated, <strong>${r.duplicates}</strong> flagged as duplicates, <strong>${r.errors.length}</strong> errors.</p>` +
       (r.success ? `<p>New applicants aren't submitted yet — go to <a href="/shul-portal/dashboard">My Applicants</a> to review and select who to submit.</p>` : '') +
+      (r.mergedSkipped ? `<p class="small-muted">${r.mergedSkipped} row(s) turned out to be linked to another shul's record and couldn't be edited from here — contact your admin for changes to those.</p>` : '') +
       (r.errors.length ? `<ul>${r.errors.slice(0,20).map(e=>`<li>Row ${e.row}: ${esc(e.error)}</li>`).join('')}</ul>` : '');
   } catch (err) { toast(err.message, true); } finally {
     btn.disabled = false; btn.textContent = 'Upload';

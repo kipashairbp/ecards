@@ -1305,10 +1305,24 @@ router.post('/retry-provider-sync', requireAdmin, async (req, res) => {
 // over, awaiting re-enrollment) and 'draft' (uploaded but not yet submitted)
 // rows are left out — those have their own dedicated flows (complete-
 // reenrollment / mass-submit-drafts) with their own required-field rules.
+//
+// Includes every applicant this shul contributed to, not just the ones
+// where it's still the primary (a.shul_id) — an applicant that turned out
+// to be a duplicate and got merged into another shul's record was
+// disappearing from this export entirely, even though this shul is still a
+// real contributing submission on it (see applicant_submissions /
+// services/duplicates.js's mergeApplicants). Same OR clause scopeWhere uses
+// for the admin-side list/export. The shul's OWN submitted data is
+// overlaid on top (applySubmissionOverlay) so a merged row shows what THIS
+// shul entered, never the surviving record's — never learning it's part of
+// a merge at all, same shul-blind rule GET /:id already enforces on read.
 router.get('/my-export', (req, res) => {
   if (req.user.role !== 'shul') return res.status(403).json({ error: 'Not permitted' });
-  const rows = db.prepare(`SELECT * FROM applicants WHERE org_id = ? AND shul_id = ? AND approval_status IN ('pending','approved') ORDER BY created_at DESC`)
-    .all(req.user.org_id, req.user.shul_id);
+  const rows = db.prepare(`SELECT a.* FROM applicants a
+    WHERE a.org_id = ? AND (a.shul_id = ? OR a.id IN (SELECT applicant_id FROM applicant_submissions WHERE shul_id = ?))
+      AND a.approval_status IN ('pending','approved') ORDER BY a.created_at DESC`)
+    .all(req.user.org_id, req.user.shul_id, req.user.shul_id);
+  applySubmissionOverlay(rows, req.user.shul_id);
   const columns = ['id', ...APPLICANT_IMPORT_COLUMNS.filter(c => c !== 'shul_name')];
   const out = rows.map(r => Object.fromEntries(columns.map(c => {
     if (c === 'id') return [c, r.id];
@@ -2336,16 +2350,30 @@ router.post('/import', requirePermission('applicants', 'can_edit'), upload.singl
 
   // A row with a non-blank `id` column that matches an existing applicant
   // is an edit, not a new submission — the file Export Excel produces,
-  // edited in place and re-uploaded. A shul-portal upload can only match
-  // its own applicants (same boundary forcedShul already enforces on
-  // create) — a match against someone else's applicant is treated as not
-  // found rather than granting cross-shul edit access.
-  const rowExisting = rows.map(r => {
+  // edited in place and re-uploaded. A shul-portal upload can match its own
+  // primary applicant OR a record it's a contributing submission on (see
+  // applicant_submissions / services/duplicates.js's mergeApplicants) — the
+  // export includes both now (GET /my-export above). A merged contribution
+  // is recognized here (so re-uploading the sheet unchanged never fails the
+  // WHOLE batch — this route validates all-or-nothing) but this shul
+  // doesn't own the surviving record's actual data, so any edits ON that
+  // specific row are silently skipped further down rather than written
+  // anywhere; there's no write path for a non-primary contributor's
+  // overlay yet (only the read overlay GET /:id already has). A match
+  // against neither is treated as not found rather than granting cross-shul
+  // edit access.
+  const rowIsMergedContribution = [];
+  const rowExisting = rows.map((r, i) => {
+    rowIsMergedContribution[i] = false;
     const id = r.id ? String(r.id).trim() : '';
     if (!id) return null;
     const rec = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(id, req.user.org_id);
     if (!rec) return null;
-    if (forcedShul && rec.shul_id !== forcedShul.id) return null;
+    if (forcedShul && rec.shul_id !== forcedShul.id) {
+      const sub = db.prepare('SELECT 1 FROM applicant_submissions WHERE applicant_id = ? AND shul_id = ?').get(rec.id, forcedShul.id);
+      if (!sub) return null;
+      rowIsMergedContribution[i] = true;
+    }
     return rec;
   });
 
@@ -2384,7 +2412,7 @@ router.post('/import', requirePermission('applicants', 'can_edit'), upload.singl
     return res.status(400).json({ error: 'Some rows have errors. Nothing was imported — fix the sheet and re-upload.', errors: requiredErrors });
   }
 
-  let success = 0, dupes = 0, updated = 0; const errors = [];
+  let success = 0, dupes = 0, updated = 0, mergedSkipped = 0; const errors = [];
   const createdIds = [], createdNames = [], updatedIds = [], updatedNames = [];
   // Per-row "what did this column used to say" snapshot, captured right
   // before each UPDATE — this is what makes mass-import undo (see
@@ -2394,6 +2422,17 @@ router.post('/import', requirePermission('applicants', 'can_edit'), upload.singl
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
     const existing = rowExisting[i];
+    if (existing && rowIsMergedContribution[i]) {
+      // Recognized (see rowExisting above) so the row doesn't fail the
+      // whole batch, but nothing is actually written — this shul only
+      // contributed a submission to this merged record, it doesn't own the
+      // surviving applicants row, and there's no write path onto its own
+      // applicant_submissions overlay yet (only the read side, GET /:id,
+      // exists today). Counted separately so the response can say so
+      // rather than silently reporting it as a successful update.
+      mergedSkipped++;
+      continue;
+    }
     if (existing) {
       try {
         const sets = Object.keys(APPLICANT_UPDATABLE_FIELDS).filter(f => { const v = APPLICANT_UPDATABLE_FIELDS[f](r); return v !== undefined && v !== ''; });
@@ -2456,7 +2495,7 @@ router.post('/import', requirePermission('applicants', 'can_edit'), upload.singl
     .run(jobId, req.user.org_id, 'applicants', req.file.originalname, rows.length, success, errors.length, dupes, JSON.stringify(errors), req.user.id);
   logMassAudit(req.user.org_id, req.user.id, 'mass-import', 'applicant', [...createdIds, ...updatedIds],
     { created: createdIds.length, updated: updatedIds.length, duplicates: dupes, errors: errors.length, names: [...createdNames, ...updatedNames], createdIds, updatedIds, updatedDiffs }, req.ip);
-  res.json({ jobId, total: rows.length, success, updated, duplicates: dupes, errors });
+  res.json({ jobId, total: rows.length, success, updated, duplicates: dupes, errors, mergedSkipped });
 });
 
 // season_id (optional) scopes this to flags whose FLAGGED applicant
