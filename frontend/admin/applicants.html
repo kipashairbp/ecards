@@ -595,7 +595,8 @@ qs('#btn-mass-apply').addEventListener('click', async () => {
 
 async function openApplicant(id) {
   try {
-    const { applicant: a, notes, cards, flags, mergeGroup, requiresShulContribution } = await api(`/applicants/${id}`);
+    const { applicant: a, notes, cards, flags, mergeGroup, requiresShulContribution, mergedBy, bypassHistory } = await api(`/applicants/${id}`);
+    const resolverName = (r) => r.first_name ? `${r.first_name} ${r.last_name || ''}`.trim() : 'an admin (no longer on the account)';
     const body = `
       <div class="tabs" id="atabs"><button class="active" data-t="info">Info</button><button data-t="notes">Notes (${notes.length})</button><button data-t="cards">Card (${cards.length})</button><button data-t="documents">Documents</button><button data-t="messages">Messages</button><button data-t="history">History</button></div>
       <div id="atab-info">
@@ -616,6 +617,10 @@ async function openApplicant(id) {
         ${mergeGroup && mergeGroup.length > 1 ? `<div class="divider"></div><div style="color:var(--text-muted);background:#f9efe0;padding:8px 12px;border-radius:6px">
           <strong>One shared record — submitted by ${mergeGroup.length} shuls:</strong>
           <div class="shul-pill-group" style="margin-top:6px">${mergeGroup.map(m => `<span class="shul-pill${m.is_primary ? ' primary' : ''}">${esc(m.shul_name)}${m.is_primary ? '' : ` <button type="button" title="Remove ${esc(m.shul_name)} from this merged record" onclick="removeShulFromMerge('${id}','${m.id}')" style="border:none;background:none;cursor:pointer;color:inherit;font-weight:700;line-height:1;padding:0;margin-left:2px">&times;</button>`}</span>`).join('')}</div>
+        </div>` : ''}
+        ${mergedBy ? `<div class="divider"></div><p class="small-muted">This is a merged record — combined by <strong>${esc(resolverName(mergedBy))}</strong> on ${fmtDate(mergedBy.created_at)}.</p>` : ''}
+        ${bypassHistory && bypassHistory.length ? `<div class="divider"></div><div class="small-muted">
+          ${bypassHistory.map(b => `<div>Checked against a possible duplicate (${esc(b.reason)}) and confirmed as a different person by <strong>${esc(resolverName(b))}</strong> on ${fmtDate(b.resolved_at)}.</div>`).join('')}
         </div>` : ''}
         <div class="divider"></div>
         <div class="grid-2">
@@ -1293,13 +1298,20 @@ window.submitPairMerge = async (flagId, accountConflictResolution, presetArgs) =
 function openAccountConflictModal(flagId, conflicts, mergeArgs) {
   const fmt = v => v == null ? 'unknown (could not read live)' : `$${Number(v).toFixed(2)}`;
   const body = `
-    <p>Both accounts involved in this merge have real money on them. Choose what to do with each one before this merge can continue — nothing has been changed yet.</p>
+    <p>Both accounts involved in this merge have real money on them. Balances below were just read live from disccardpromos, not pulled from anything cached. Choose what to do with each one before this merge can continue — nothing has been changed yet.</p>
     ${conflicts.map((c, i) => `
       <div class="divider"></div>
-      <p><strong>Keeping:</strong> ${esc(c.primaryName)} — account ${esc(c.primaryAccountId)} (currently ${fmt(c.primaryBalance)})<br>
-      <strong>Would be closed:</strong> ${esc(c.secondaryName)} — account ${esc(c.secondaryAccountId)} (currently ${fmt(c.secondaryBalance)})</p>
-      <label><input type="radio" name="acr-${i}" value="transfer" checked> Combine balances — add ${fmt(c.secondaryBalance)} onto the kept account, then close this one</label><br>
-      <label><input type="radio" name="acr-${i}" value="delete"> Just close it — the ${fmt(c.secondaryBalance)} on it is not moved</label>
+      <table style="width:100%;font-size:13px;margin-bottom:8px">
+        <tr><th></th><th style="text-align:left;padding:2px 8px">Keeping</th><th style="text-align:left;padding:2px 8px">Would be closed</th></tr>
+        <tr><td class="small-muted">Name</td><td style="padding:2px 8px"><strong>${esc(c.primaryName)}</strong></td><td style="padding:2px 8px"><strong>${esc(c.secondaryName)}</strong></td></tr>
+        <tr><td class="small-muted">System ID</td><td style="padding:2px 8px">${esc(c.primaryExternalId || '—')}</td><td style="padding:2px 8px">${esc(c.secondaryExternalId || '—')}</td></tr>
+        <tr><td class="small-muted">disccard ID</td><td style="padding:2px 8px">${esc(c.primaryAccountId || '—')}</td><td style="padding:2px 8px">${esc(c.secondaryAccountId || '—')}</td></tr>
+        <tr><td class="small-muted">Husband's Cell</td><td style="padding:2px 8px">${esc(c.primaryHusbandCell || '—')}</td><td style="padding:2px 8px">${esc(c.secondaryHusbandCell || '—')}</td></tr>
+        <tr><td class="small-muted">Live Balance</td><td style="padding:2px 8px"><strong>${fmt(c.primaryBalance)}</strong></td><td style="padding:2px 8px"><strong>${fmt(c.secondaryBalance)}</strong></td></tr>
+      </table>
+      <label class="checkbox-row" style="margin-bottom:4px"><input type="radio" name="acr-${i}" value="transfer" checked> <span><strong>Merge the balances</strong> — write ${fmt((Number(c.primaryBalance)||0) + (Number(c.secondaryBalance)||0))} (the total of both) onto the kept account, then close the other</span></label>
+      <label class="checkbox-row" style="margin-bottom:4px"><input type="radio" name="acr-${i}" value="delete"> <span>Keep <strong>${esc(c.primaryName)}</strong>'s total — ${fmt(c.primaryBalance)} stays as-is on the kept account; ${fmt(c.secondaryBalance)} on the closed one is not moved</span></label>
+      <label class="checkbox-row"><input type="radio" name="acr-${i}" value="use_secondary"> <span>Keep <strong>${esc(c.secondaryName)}</strong>'s total instead — the kept account's balance is overwritten to ${fmt(c.secondaryBalance)}, then the other is closed</span></label>
     `).join('')}
   `;
   const footer = `

@@ -49,7 +49,7 @@ export const APPLICANT_APPLICATION_SCHEMA = [
   { key: 'first_name', label: 'First Name', type: 'text', required: true }, { key: 'last_name', label: 'Last Name', type: 'text', required: true },
   { key: 'marital_status', label: 'Marital Status', type: 'select', required: false, options: [
     { value: 'single', label: 'Single' }, { value: 'married', label: 'Married' }, { value: 'widowed', label: 'Widowed' }, { value: 'divorced', label: 'Divorced' } ] },
-  { key: 'home_phone', label: 'Home Phone', type: 'tel', required: false }, { key: 'email', label: 'Email', type: 'email', required: false },
+  { key: 'home_phone', label: 'Home Phone', type: 'tel', required: true }, { key: 'email', label: 'Email', type: 'email', required: false },
   { key: 'husband_cell', label: 'Husband Cell', type: 'tel', required: true }, { key: 'wife_cell', label: 'Wife Cell', type: 'tel', required: false },
   { key: 'preferred_contact_method', label: 'Preferred Contact Method', type: 'select', required: false, options: [
     { value: 'phone', label: 'Phone' }, { value: 'text', label: 'Text' }, { value: 'email', label: 'Email' } ] },

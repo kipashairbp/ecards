@@ -609,8 +609,10 @@ export async function mergeApplicants(orgId, userId, { primaryId, values, member
         err.conflicts = needsChoice.map((m) => {
           const i = unresolved.indexOf(m);
           return {
-            primaryId: holder.id, primaryName: `${holder.first_name} ${holder.last_name}`.trim(), primaryAccountId: holder.provider_account_id, primaryBalance,
-            secondaryId: m.id, secondaryName: `${m.first_name} ${m.last_name}`.trim(), secondaryAccountId: m.provider_account_id, secondaryBalance: secondaryBalances[i],
+            primaryId: holder.id, primaryExternalId: holder.external_id, primaryName: `${holder.first_name} ${holder.last_name}`.trim(), primaryHusbandCell: holder.husband_cell,
+            primaryAccountId: holder.provider_account_id, primaryBalance,
+            secondaryId: m.id, secondaryExternalId: m.external_id, secondaryName: `${m.first_name} ${m.last_name}`.trim(), secondaryHusbandCell: m.husband_cell,
+            secondaryAccountId: m.provider_account_id, secondaryBalance: secondaryBalances[i],
           };
         });
         throw err;
@@ -671,11 +673,15 @@ export async function mergeApplicants(orgId, userId, { primaryId, values, member
   // money). Applying it for real now: "transfer" adds the loser's current balance
   // onto the kept account first (addFunds SETS the absolute total — see
   // that function's own comment — so this reads both balances and writes
-  // their sum, never a bare add), then either way the loser's account is
-  // deleted for real on disccardpromos so nothing is ever left assigned to
-  // nothing here. Best-effort: a failure is recorded (surfaced same as any
-  // other provider error) but never blocks the merge itself — Provider
-  // Audit's orphan cleanup still catches it as a fallback.
+  // their sum, never a bare add). 'use_secondary' is the explicit third
+  // choice ("keep account B's total instead of A's") — same absolute-set
+  // call, just with the closing account's own balance instead of the sum;
+  // 'delete' (the implicit default) touches nothing, leaving the kept
+  // account's own balance exactly as it already was. Either way the
+  // loser's account is deleted for real on disccardpromos so nothing is
+  // ever left assigned to nothing here. Best-effort: a failure is recorded
+  // (surfaced same as any other provider error) but never blocks the merge
+  // itself — Provider Audit's orphan cleanup still catches it as a fallback.
   const accountConflictErrors = [];
   for (const m of conflictMembers) {
     const action = accountConflictResolution[m.provider_account_id];
@@ -688,6 +694,9 @@ export async function mergeApplicants(orgId, userId, { primaryId, values, member
         if (loserBalance > 0) {
           await giftcard.addFunds(holder.season_id, { customerId: holder.provider_account_id, externalId: holder.external_id, discountId, amount: survivorBalance + loserBalance });
         }
+      } else if (action === 'use_secondary' && discountId) {
+        const loserBalance = await giftcard.getCustomerPackageAmount(holder.season_id, m.provider_account_id, discountId);
+        await giftcard.addFunds(holder.season_id, { customerId: holder.provider_account_id, externalId: holder.external_id, discountId, amount: loserBalance });
       }
       await giftcard.deleteCustomer(holder.season_id, m.provider_account_id);
     } catch (e) {

@@ -1390,8 +1390,30 @@ router.get('/:id', (req, res) => {
     for (const f of SUBMISSION_OVERLAY_FIELDS) applicant[f] = ownSubmission[f];
     applicant._merged_readonly = true;
   }
+  // Who actually made the "these are the same person" or "these are
+  // different people" call, and when — admin-only, same gate as notes/
+  // flags/mergeGroup above. mergedBy reads the audit trail (logAudit's
+  // 'merge' entries are recorded under whichever id was primaryId at that
+  // step, which is this record's own current id for every merge it was
+  // ever the target of, even a multi-step chain), not duplicate_flags
+  // directly — a merge's connecting flags are tied to whichever two ids
+  // were being compared at that step, some of which may since have been
+  // hard-deleted, while the audit_log entry survives under the one id that
+  // never changes across the chain: the surviving primary. bypassHistory
+  // covers the other outcome (confirmed NOT the same person) directly from
+  // duplicate_flags, which is exactly what resolved_by/resolved_at already
+  // capture for every bypass this record was ever part of, old or new —
+  // this data was always being recorded, just never surfaced until now.
+  let mergedBy = null, bypassHistory = [];
+  if (req.user.role !== 'shul') {
+    mergedBy = db.prepare(`SELECT a.created_at, u.first_name, u.last_name FROM audit_log a LEFT JOIN users u ON u.id = a.user_id
+      WHERE a.org_id = ? AND a.entity_type = 'applicant' AND a.entity_id = ? AND a.action = 'merge' ORDER BY a.created_at DESC LIMIT 1`).get(req.user.org_id, applicant.id) || null;
+    bypassHistory = db.prepare(`SELECT df.resolved_at, df.reason, u.first_name, u.last_name FROM duplicate_flags df LEFT JOIN users u ON u.id = df.resolved_by
+      WHERE df.org_id = ? AND df.entity_type = 'applicant' AND df.status = 'bypassed' AND (df.entity_id = ? OR df.matched_entity_id = ?)
+      ORDER BY df.resolved_at DESC`).all(req.user.org_id, applicant.id, applicant.id);
+  }
   const requiresShulContribution = !!db.prepare('SELECT require_shul_contribution FROM seasons WHERE id = ?').get(applicant.season_id)?.require_shul_contribution;
-  res.json({ applicant: maskForShul(redact(applicant, req.permission.hidden_fields), req.user.role, req.user.org_id), notes, cards, flags, mergeGroup, requiresShulContribution });
+  res.json({ applicant: maskForShul(redact(applicant, req.permission.hidden_fields), req.user.role, req.user.org_id), notes, cards, flags, mergeGroup, requiresShulContribution, mergedBy, bypassHistory });
 });
 
 // Detaches one shul's contributing submission from a merged applicant (the
