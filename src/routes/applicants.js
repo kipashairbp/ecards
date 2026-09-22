@@ -572,6 +572,15 @@ router.get('/export', requirePermission('applicants', 'can_export'), (req, res) 
     params.push(like, like, like, likeNoDash, likeNoDash, likeNoDash, like, like, like, like, like, like, like);
   }
   const rows = db.prepare(`SELECT a.*, s.name_en as shul_name FROM applicants a LEFT JOIN shuls s ON s.id = a.shul_id ${where} ORDER BY a.created_at DESC`).all(...params);
+  // Same active-card count as the list view's own '# of Cards' column (see
+  // GET / above) — one grouped query for the whole export rather than N+1.
+  if (rows.length) {
+    const ids = rows.map(r => r.id);
+    const placeholders = ids.map(() => '?').join(',');
+    const cardCounts = db.prepare(`SELECT applicant_id, COUNT(*) c FROM cards WHERE applicant_id IN (${placeholders}) AND status = 'activated' GROUP BY applicant_id`).all(...ids);
+    const countById = new Map(cardCounts.map(c => [c.applicant_id, c.c]));
+    for (const r of rows) r.active_card_count = countById.get(r.id) || 0;
+  }
   sendXlsx(res, `applicants-${Date.now()}.xlsx`, redact(rows, req.permission.hidden_fields));
 });
 
