@@ -18,7 +18,7 @@ renderShell('/admin/cards', `
   <div id="mock-banner"></div>
   <div class="tabs"><button class="active" id="tab-cards-btn">Cards</button><button id="tab-txns-btn">All Transactions</button><button id="tab-byshul-btn">Spent by Shul</button></div>
   <div id="panel-cards">
-    <div class="toolbar"><input id="f-search" placeholder="Search applicant name or card number…"><select id="f-status"><option value="">All statuses</option><option value="unassigned">Unassigned</option><option value="assigned">Assigned</option><option value="activated">Activated</option><option value="deactivated">Deactivated</option></select><select id="f-pagesize"><option value="25">25 / page</option><option value="50">50 / page</option><option value="100">100 / page</option><option value="200">200 / page</option></select></div>
+    <div class="toolbar"><input id="f-search" placeholder="Search applicant name or card number…"><select id="f-status"><option value="">All statuses</option><option value="unassigned">Unassigned</option><option value="activated">Activated</option><option value="deactivated">Deactivated</option></select><select id="f-pagesize"><option value="25">25 / page</option><option value="50">50 / page</option><option value="100">100 / page</option><option value="200">200 / page</option></select></div>
     <div class="card" style="padding:0;overflow-x:auto">
       <table><thead><tr><th>Applicant</th><th>Shul</th><th>Card #</th><th>Status</th><th>Amount</th><th>Activated</th><th></th></tr></thead>
       <tbody id="tbody-cards"><tr><td colspan="7" class="empty-state">Loading…</td></tr></tbody></table>
@@ -33,7 +33,7 @@ renderShell('/admin/cards', `
     <div class="paginator" id="pager-txns"></div>
   </div>
   <div id="panel-byshul" style="display:none">
-    <p class="small-muted">Money loaded onto each shul's applicants' cards, and how much of it has been spent in stores so far. "Allocated" counts an applicant only once a physical card has actually been assigned to them — an approved applicant with money committed but no card yet won't appear here (see the Total row below for the org-wide sum).</p>
+    <p class="small-muted">Money loaded onto each shul's applicants' cards, and how much of it has been spent in stores so far. "Allocated" is every approved applicant's committed card_amount for that shul (same figure the Dashboard's "Total Loaded" sums org-wide) — counted once per applicant regardless of how many card rows they hold, so a replaced card or two cards sharing one disccardpromos account never double-counts them.</p>
     <div class="card" style="padding:0;overflow-x:auto">
       <table><thead><tr><th>Shul</th><th>Allocated</th><th>Spent</th><th>Remaining</th><th></th></tr></thead>
       <tbody id="tbody-byshul"><tr><td colspan="5" class="empty-state">Loading…</td></tr></tbody></table>
@@ -155,14 +155,14 @@ async function openCard(id) {
         <div><strong>Card Number</strong><br>${esc(card.card_number_masked||'')}</div>
         <div><strong>Amount</strong><br>${fmtMoney(card.amount)}</div>
       </div>
-      ${card.status === 'assigned' ? `<div class="divider"></div><label>Activation Phone <span class="small-muted">(defaults to the applicant's phone on file — change it if they want to activate with a different number)</span></label><input id="act-phone" placeholder="(555) 555-5555" value="${esc(card.husband_cell || card.wife_cell || card.home_phone || '')}">` : ''}
+      ${card.status === 'activated' && !card.activation_phone ? `<div class="divider"></div><label>Activation Phone <span class="small-muted">(defaults to the applicant's phone on file — change it if they want to activate with a different number)</span></label><input id="act-phone" placeholder="(555) 555-5555" value="${esc(card.husband_cell || card.wife_cell || card.home_phone || '')}">` : ''}
       <div class="divider"></div>
       <h4>Transaction History</h4>
       ${transactions.length ? `<table><thead><tr><th>Date</th><th>Type</th><th>Amount</th><th>Store</th></tr></thead><tbody>${transactions.map(t=>`<tr><td>${fmtDateTime(t.occurred_at)}</td><td>${badge(t.type,t.type)}</td><td>${fmtMoney(t.amount)}</td><td>${esc(t.store_name||'')}</td></tr>`).join('')}</tbody></table>` : '<p class="small-muted">No transactions synced yet.</p>'}
     `;
     const footer = `
       <button class="btn btn-outline btn-sm" onclick="syncCard('${id}')">Sync Now</button>
-      ${card.status === 'assigned' ? `<button class="btn btn-primary btn-sm" onclick="activateCard('${id}')">Activate</button>` : ''}
+      ${card.status === 'activated' && !card.activation_phone ? `<button class="btn btn-primary btn-sm" onclick="activateCard('${id}')">Activate</button>` : ''}
       ${card.status !== 'deactivated' ? `<button class="btn btn-danger btn-sm" onclick="deactivateCard('${id}')">Deactivate Account</button>` : ''}
     `;
     openModal('Card Details', body, footer);

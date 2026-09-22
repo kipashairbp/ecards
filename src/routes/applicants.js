@@ -526,6 +526,19 @@ router.get('/', (req, res) => {
       for (const r of rows) { const names = byId.get(r.id); if (names && names.length > 1) r.contributing_shuls = names; }
     }
   }
+  // How many of this applicant's cards are actually live right now — one
+  // grouped query for this page rather than N+1 per-row lookups (same
+  // pattern as contributing_shuls just above). 'activated' only: a card is
+  // already live the instant it's assigned (see db.js's boot migration —
+  // 'assigned' as a separate status is retired), so this counts everyone
+  // with a real, spendable card, excluding deactivated/lost/unassigned.
+  if (rows.length) {
+    const ids = rows.map(r => r.id);
+    const placeholders = ids.map(() => '?').join(',');
+    const cardCounts = db.prepare(`SELECT applicant_id, COUNT(*) c FROM cards WHERE applicant_id IN (${placeholders}) AND status = 'activated' GROUP BY applicant_id`).all(...ids);
+    const countById = new Map(cardCounts.map(c => [c.applicant_id, c.c]));
+    for (const r of rows) r.active_card_count = countById.get(r.id) || 0;
+  }
   res.json({ applicants: maskForShul(redact(rows, req.permission.hidden_fields), req.user.role, req.user.org_id), total, page: +page, pageSize: +pageSize });
 });
 

@@ -108,12 +108,13 @@ const APPLICANT_COLUMNS = [
   { key: 'approval_status', label: 'Status', sort: 'approval_status', render: a => badge(a.approval_status, a.approval_status)
     + (a.approval_status === 'rejected' && a.rejection_reason ? `<div class="rejection-reason" title="${esc(a.rejection_reason)}">${esc(a.rejection_reason)}</div>` : '') },
   { key: 'card_amount', label: 'Card $', sort: 'card_amount', render: a => a.card_amount != null ? fmtMoney(a.card_amount) : '' },
+  { key: 'active_card_count', label: '# of Cards', render: a => a.active_card_count || 0 },
   { key: 'provider_sync', label: 'Disccardpromos', render: a => providerSyncBadge(a.provider_sync) },
   { key: 'provider_check_status', label: 'Disccardpromos Says', render: a => providerCheckBadge(a.provider_check_status) },
   { key: 'comments', label: 'Comments', render: a => esc(a.comments||'') },
   { key: 'created_at', label: 'Submitted', sort: 'created_at', render: a => fmtDate(a.created_at) },
 ];
-const DEFAULT_APPLICANT_COLUMNS = ['external_id','name','shul','marital_status','contact','num_children','home_for_yomtov','approval_status','card_amount','created_at'];
+const DEFAULT_APPLICANT_COLUMNS = ['external_id','name','shul','marital_status','contact','num_children','home_for_yomtov','approval_status','card_amount','active_card_count','created_at'];
 let activeColumns = DEFAULT_APPLICANT_COLUMNS;
 
 function renderThead() {

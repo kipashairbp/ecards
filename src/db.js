@@ -339,7 +339,7 @@ CREATE TABLE IF NOT EXISTS cards (
   season_id TEXT REFERENCES seasons(id),
   card_number_masked TEXT,     -- last 4 only, ever displayed
   provider_card_id TEXT,       -- disccardpromos internal id/token
-  status TEXT NOT NULL DEFAULT 'unassigned', -- unassigned | assigned | activated | deactivated | lost
+  status TEXT NOT NULL DEFAULT 'unassigned', -- unassigned | activated | deactivated | lost ('assigned' retired — a card is already live the moment it's assigned, see the boot migration below)
   amount REAL DEFAULT 0,
   activation_phone TEXT,       -- phone used to activate, written to account
   activated_at TEXT,
@@ -1205,6 +1205,20 @@ db.exec(`CREATE TABLE IF NOT EXISTS library_documents (
 // than a column per page, since the set of pages that offer a page-size
 // control grows over time and a new one shouldn't need its own migration.
 safeAlter(`ALTER TABLE users ADD COLUMN page_size_prefs TEXT`);
+
+// A card is already live and spendable the moment it's assigned — per
+// disccardpromos' own Customer API docs, the PATCH that links a card number
+// to a customer (routes/cards.js's POST /assign) IS what their own docs
+// call "activate a card number for this customer." The separate 'assigned'
+// status (distinct from 'activated') never reflected a real difference in
+// disccardpromos' own record — the only thing the old "Activate" step ever
+// added locally was recording an activation phone number, nothing
+// disccardpromos-side. "It's either deactivated or active" — so every
+// existing 'assigned' row is bumped to 'activated' here, once
+// (idempotently — nothing left to touch once this has run), and
+// POST /assign now inserts new cards as 'activated' directly instead of
+// 'assigned', so this status is never created again going forward.
+db.exec(`UPDATE cards SET status = 'activated', activated_at = COALESCE(activated_at, assigned_at, created_at) WHERE status = 'assigned'`);
 
 export const DEFAULT_ORG_ID = defaultOrgId;
 export function uuid() { return randomUUID(); }

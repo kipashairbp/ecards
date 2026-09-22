@@ -211,13 +211,26 @@ function renderFields() {
         <input type="file" accept="image/*" onchange="uploadFieldImage(${i}, this)">
         ${f.url ? `<img src="${esc(f.url)}" style="max-width:200px;max-height:120px;display:block;margin-top:8px;border-radius:6px">` : '<p class="small-muted">No image uploaded yet.</p>'}
       </div>` : ''}
-      <button type="button" class="btn btn-sm btn-outline" style="margin-top:6px" onclick="removeField(${i})">Remove</button>
+      <div style="margin-top:6px;display:flex;gap:6px">
+        <button type="button" class="btn btn-sm btn-outline" ${i===0?'disabled':''} onclick="moveField(${i},-1)" title="Move up">&uarr;</button>
+        <button type="button" class="btn btn-sm btn-outline" ${i===fieldDraft.length-1?'disabled':''} onclick="moveField(${i},1)" title="Move down">&darr;</button>
+        <button type="button" class="btn btn-sm btn-outline" onclick="removeField(${i})">Remove</button>
+      </div>
     </div>`;
   }).join('');
 }
 window.updateFieldOptions = (i, text) => { fieldDraft[i].options = parseOptionsText(text); renderFields(); };
 window.addField = () => { fieldDraft.push({ key: '', label: '', type: 'text', required: false }); renderFields(); };
 window.removeField = (i) => { fieldDraft.splice(i, 1); renderFields(); };
+// Swaps this question with its neighbor — order in fieldDraft IS the order
+// the form renders and saves in, so this is the whole feature; nothing else
+// (a field's own key/type/etc.) needs to change when it moves.
+window.moveField = (i, dir) => {
+  const j = i + dir;
+  if (j < 0 || j >= fieldDraft.length) return;
+  [fieldDraft[i], fieldDraft[j]] = [fieldDraft[j], fieldDraft[i]];
+  renderFields();
+};
 window.uploadFieldImage = async (i, input) => {
   const file = input.files[0];
   if (!file) return;

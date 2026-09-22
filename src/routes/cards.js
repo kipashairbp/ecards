@@ -128,9 +128,15 @@ router.post('/assign', requirePermission('cards', 'can_edit'), async (req, res) 
   // unrecognized shape).
   const last4 = String(card_number).slice(-4);
   const maskedNumber = (result.active_cards || []).find(c => c.endsWith(last4)) || `****${last4}`;
+  // Inserted as 'activated' directly, not 'assigned' — disccardpromos
+  // itself already treats this exact write as activation (see this route's
+  // own comment above), so there's no real interim state to represent.
+  // activated_at is set now too; the separate Activate action (below) still
+  // exists purely to record an activation phone number, not to change
+  // status — it's already activated by the time that ever happens.
   const id = uuid();
-  db.prepare(`INSERT INTO cards (id, org_id, applicant_id, season_id, card_number_masked, provider_card_id, status, amount, assigned_at)
-    VALUES (?,?,?,?,?,?,'assigned',?,datetime('now'))`)
+  db.prepare(`INSERT INTO cards (id, org_id, applicant_id, season_id, card_number_masked, provider_card_id, status, amount, assigned_at, activated_at)
+    VALUES (?,?,?,?,?,?,'activated',?,datetime('now'),datetime('now'))`)
     .run(id, req.user.org_id, applicant.id, applicant.season_id, maskedNumber, null, finalAmount);
   db.prepare(`INSERT INTO card_transactions (id, card_id, type, amount, occurred_at) VALUES (?,?,?,?,datetime('now'))`)
     .run(uuid(), id, 'load', finalAmount);

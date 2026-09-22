@@ -61,8 +61,11 @@ router.get('/stats', (req, res) => {
   const cards = {
     total: cardsTotal,
     unassigned: cardStatusCount('unassigned'),
-    assigned: cardStatusCount('assigned'),
-    activated: cardStatusCount('activated'),
+    // 'assigned' is a retired status (see db.js's boot migration) — a card
+    // is already live the moment it's assigned, so it's folded in here.
+    // Included defensively rather than assumed gone: harmless once the
+    // migration has run (always 0), correct either way if it somehow hasn't.
+    activated: cardStatusCount('activated') + cardStatusCount('assigned'),
     // deactivated + lost grouped together (both mean "no longer a live
     // card"), same reasoning as applicants.other above.
     deactivated: cardStatusCount('deactivated') + cardStatusCount('lost'),
