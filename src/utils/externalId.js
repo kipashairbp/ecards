@@ -10,3 +10,17 @@ export function generateApplicantExternalId(db) {
   }
   throw new Error('Could not generate a unique 4-digit applicant ID — the pool of 10,000 IDs may be exhausted.');
 }
+
+// Same idea for shuls: a random 4-digit ID an admin can hand a shul (or put
+// in a mass-upload sheet's shul_id column) to identify it unambiguously —
+// unlike name_en, which isn't guaranteed unique and can't reliably survive
+// a round trip through Excel (whitespace, punctuation, Hebrew vs. English
+// spelling, etc.).
+export function generateShulExternalId(db) {
+  const exists = db.prepare('SELECT 1 FROM shuls WHERE external_id = ?');
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const candidate = String(Math.floor(Math.random() * 10000)).padStart(4, '0');
+    if (!exists.get(candidate)) return candidate;
+  }
+  throw new Error('Could not generate a unique 4-digit shul ID — the pool of 10,000 IDs may be exhausted.');
+}

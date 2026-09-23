@@ -15,7 +15,7 @@ import { getActiveSeasonId } from '../utils/formSchedule.js';
 import { validateBySchema, shulInfoErrors, getEffectiveSchema } from '../utils/formValidation.js';
 import { logAudit, logMassAudit, getEntityHistory } from '../services/audit.js';
 import { hardDeleteShul, captureShulSnapshot } from '../utils/entityDelete.js';
-import { generateApplicantExternalId } from '../utils/externalId.js';
+import { generateApplicantExternalId, generateShulExternalId } from '../utils/externalId.js';
 
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -139,12 +139,12 @@ router.post('/apply', async (req, res) => {
   // lat/lng/place_id (Places autocomplete) are technical fields the JS
   // widget fills in directly, not one of the fixed questions — read
   // straight off the body regardless.
-  db.prepare(`INSERT INTO shuls (id, org_id, season_id, name_en, name_he, address, city, state, zip, lat, lng, place_id,
+  db.prepare(`INSERT INTO shuls (id, org_id, season_id, external_id, name_en, name_he, address, city, state, zip, lat, lng, place_id,
       ruv_first_name, ruv_last_name, ruv_phone, ruv_address, ruv_city, ruv_state, ruv_zip, ruv_place_id,
       gabai_first_name, gabai_last_name, gabai_cell, gabai_email, gabai_address, gabai_city, gabai_state, gabai_zip, gabai_place_id,
       status, source)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?, 'submitted', 'form')`)
-    .run(id, orgId, seasonId, b.name_en, b.name_he || '', b.address, b.city, b.state, b.zip, b.lat || null, b.lng || null, b.place_id || null,
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?, 'submitted', 'form')`)
+    .run(id, orgId, seasonId, generateShulExternalId(db), b.name_en, b.name_he || '', b.address, b.city, b.state, b.zip, b.lat || null, b.lng || null, b.place_id || null,
       b.ruv_first_name, b.ruv_last_name, b.ruv_phone, b.ruv_address || '', b.ruv_city || '', b.ruv_state || '', b.ruv_zip || '', b.ruv_place_id || null,
       b.gabai_first_name, b.gabai_last_name, b.gabai_cell, b.gabai_email, b.gabai_address || '', b.gabai_city || '', b.gabai_state || '', b.gabai_zip || '', b.gabai_place_id || null);
 
@@ -571,12 +571,17 @@ async function carryForwardShul(orgId, userId, source, targetSeason, { slotsAllo
     // explicitly mass-invites / mass-sends-contracts / approves them when
     // ready, rather than every carry-forward silently emailing the shul the
     // moment it's created.
-    db.prepare(`INSERT INTO shuls (id, org_id, season_id, name_en, name_he, address, city, state, zip,
+    db.prepare(`INSERT INTO shuls (id, org_id, season_id, external_id, name_en, name_he, address, city, state, zip,
         ruv_first_name, ruv_last_name, ruv_phone, ruv_address, ruv_city, ruv_state, ruv_zip,
         gabai_first_name, gabai_last_name, gabai_cell, gabai_email, gabai_address, gabai_city, gabai_state, gabai_zip,
         status, source, slots_allocated, permanent_comments)
-      VALUES (?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?, 'submitted','carried_forward', ?, ?)`)
-      .run(id, orgId, targetSeason.id, source.name_en, source.name_he || '', source.address || '', source.city || '', source.state || '', source.zip || '',
+      VALUES (?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?, 'submitted','carried_forward', ?, ?)`)
+      // Same 4-digit ID as the shul it was carried forward from — this is
+      // the same real-world shul re-enrolling, not a new one, so its ID
+      // should stay stable across seasons (source.external_id is only
+      // missing for a source row that itself predates this column, which
+      // the boot-time backfill in db.js should already have filled in).
+      .run(id, orgId, targetSeason.id, source.external_id || generateShulExternalId(db), source.name_en, source.name_he || '', source.address || '', source.city || '', source.state || '', source.zip || '',
         source.ruv_first_name || '', source.ruv_last_name || '', source.ruv_phone || '', source.ruv_address || '', source.ruv_city || '', source.ruv_state || '', source.ruv_zip || '',
         source.gabai_first_name || '', source.gabai_last_name || '', source.gabai_cell || '', source.gabai_email || '', source.gabai_address || '', source.gabai_city || '', source.gabai_state || '', source.gabai_zip || '',
         slotsAllocated, source.permanent_comments || null);
@@ -693,10 +698,10 @@ router.post('/', requirePermission('shuls', 'can_edit'), (req, res) => {
   for (const f of REQUIRED_SHUL_FIELDS) if (!b[f]) return res.status(400).json({ error: `Missing required field: ${f}` });
   const id = uuid();
   const season = db.prepare('SELECT * FROM seasons WHERE org_id = ? AND is_active = 1 ORDER BY created_at DESC LIMIT 1').get(req.user.org_id);
-  db.prepare(`INSERT INTO shuls (id, org_id, season_id, name_en, name_he, address, city, state, zip,
+  db.prepare(`INSERT INTO shuls (id, org_id, season_id, external_id, name_en, name_he, address, city, state, zip,
       ruv_first_name, ruv_last_name, ruv_phone, gabai_first_name, gabai_last_name, gabai_cell, gabai_email, status, source, slots_allocated)
-    VALUES (?,?,?,?,?,?,?,?,?, ?,?,?, ?,?,?,?, 'submitted','admin', ?)`)
-    .run(id, req.user.org_id, season?.id || null, b.name_en, b.name_he || '', b.address, b.city, b.state, b.zip,
+    VALUES (?,?,?,?,?,?,?,?,?,?, ?,?,?, ?,?,?,?, 'submitted','admin', ?)`)
+    .run(id, req.user.org_id, season?.id || null, generateShulExternalId(db), b.name_en, b.name_he || '', b.address, b.city, b.state, b.zip,
       b.ruv_first_name, b.ruv_last_name, b.ruv_phone, b.gabai_first_name, b.gabai_last_name, b.gabai_cell, b.gabai_email, b.slots_allocated || 0);
   const shul = db.prepare('SELECT * FROM shuls WHERE id = ?').get(id);
   const flag = detectAndFlag(req.user.org_id, 'shul', shul);
@@ -1396,12 +1401,12 @@ router.post('/import', requirePermission('shuls', 'can_edit'), upload.single('fi
     if (!r.name_en || !r.gabai_email) { errors.push({ row: i + 2, error: 'Missing name_en or gabai_email' }); continue; }
     try {
       const id = uuid();
-      db.prepare(`INSERT INTO shuls (id, org_id, season_id, name_en, name_he, address, city, state, zip,
+      db.prepare(`INSERT INTO shuls (id, org_id, season_id, external_id, name_en, name_he, address, city, state, zip,
           ruv_first_name, ruv_last_name, ruv_phone, ruv_address, ruv_city, ruv_state, ruv_zip,
           gabai_first_name, gabai_last_name, gabai_cell, gabai_email, gabai_address, gabai_city, gabai_state, gabai_zip,
           status, source, slots_allocated)
-        VALUES (?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?, 'submitted','mass_upload', ?)`)
-        .run(id, req.user.org_id, season?.id || null, r.name_en, r.name_he || '', r.address || '', r.city || '', r.state || '', r.zip || '',
+        VALUES (?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?, 'submitted','mass_upload', ?)`)
+        .run(id, req.user.org_id, season?.id || null, generateShulExternalId(db), r.name_en, r.name_he || '', r.address || '', r.city || '', r.state || '', r.zip || '',
           r.ruv_first_name || '', r.ruv_last_name || '', normalizePhone(r.ruv_phone || ''), r.ruv_address || '', r.ruv_city || '', r.ruv_state || '', r.ruv_zip || '',
           r.gabai_first_name || '', r.gabai_last_name || '', normalizePhone(r.gabai_cell || ''), r.gabai_email, r.gabai_address || '', r.gabai_city || '', r.gabai_state || '', r.gabai_zip || '',
           Number(r.slots_allocated) || 0);

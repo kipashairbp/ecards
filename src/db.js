@@ -4,7 +4,7 @@ import { existsSync, mkdirSync } from 'fs';
 import { randomUUID } from 'crypto';
 import bcrypt from 'bcryptjs';
 import { normalizePhone } from './utils/phone.js';
-import { generateApplicantExternalId } from './utils/externalId.js';
+import { generateApplicantExternalId, generateShulExternalId } from './utils/externalId.js';
 
 export const DATA_DIR = process.env.DATA_DIR || join(process.cwd(), 'data');
 if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
@@ -707,6 +707,11 @@ safeAlter(`ALTER TABLE stores ADD COLUMN discount TEXT`);
 safeAlter(`ALTER TABLE seasons ADD COLUMN max_accepted_applicants INTEGER`);
 safeAlter(`ALTER TABLE shuls ADD COLUMN is_locked INTEGER DEFAULT 0`);
 safeAlter(`ALTER TABLE applicants ADD COLUMN external_id TEXT`);
+// A shul's own 4-digit ID (see utils/externalId.js's generateShulExternalId)
+// — assigned on every new shul create, and used as the mass-upload sheet's
+// unambiguous shul_id column instead of matching by name_en (not guaranteed
+// unique, and doesn't reliably round-trip through Excel).
+safeAlter(`ALTER TABLE shuls ADD COLUMN external_id TEXT`);
 // The disccardpromos account created for this applicant on approval (see
 // services/giftcard.js's upsertAccountForApproval) — distinct from
 // cards.provider_card_id, which is the actual gift card assigned later.
@@ -964,6 +969,14 @@ normalizePhoneColumn('organizations', 'support_phone');
   const missing = db.prepare(`SELECT id FROM applicants WHERE external_id IS NULL OR external_id = ''`).all();
   const setExternalId = db.prepare('UPDATE applicants SET external_id = ? WHERE id = ?');
   for (const row of missing) setExternalId.run(generateApplicantExternalId(db), row.id);
+}
+
+// Same backfill for shuls that predate the external_id column (see
+// routes/shuls.js, which assigns one on every new create).
+{
+  const missing = db.prepare(`SELECT id FROM shuls WHERE external_id IS NULL OR external_id = ''`).all();
+  const setExternalId = db.prepare('UPDATE shuls SET external_id = ? WHERE id = ?');
+  for (const row of missing) setExternalId.run(generateShulExternalId(db), row.id);
 }
 
 // ---------------------------------------------------------------------------

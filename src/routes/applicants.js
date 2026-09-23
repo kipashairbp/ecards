@@ -571,7 +571,11 @@ router.get('/export', requirePermission('applicants', 'can_export'), (req, res) 
     const likeNoDash = strippedSearch ? `%${strippedSearch}%` : 'NEVER_MATCHES_ANY_PHONE_XYZ';
     params.push(like, like, like, likeNoDash, likeNoDash, likeNoDash, like, like, like, like, like, like, like);
   }
-  const rows = db.prepare(`SELECT a.*, s.name_en as shul_name FROM applicants a LEFT JOIN shuls s ON s.id = a.shul_id ${where} ORDER BY a.created_at DESC`).all(...params);
+  // shul_name is kept purely for a human reading the sheet; shul_id (the
+  // shul's 4-digit external_id, NOT the internal UUID a.shul_id below it
+  // overwrites — see mass-upload's shul lookup) is the column re-upload
+  // actually reads to place a brand-new row under the right shul.
+  const rows = db.prepare(`SELECT a.*, s.name_en as shul_name, s.external_id as shul_id FROM applicants a LEFT JOIN shuls s ON s.id = a.shul_id ${where} ORDER BY a.created_at DESC`).all(...params);
   // Same active-card count as the list view's own '# of Cards' column (see
   // GET / above) — one grouped query for the whole export rather than N+1.
   if (rows.length) {
@@ -1345,7 +1349,7 @@ router.get('/my-export', (req, res) => {
       AND a.approval_status IN ('pending','approved') ORDER BY a.created_at DESC`)
     .all(req.user.org_id, req.user.shul_id, req.user.shul_id);
   applySubmissionOverlay(rows, req.user.shul_id);
-  const columns = ['id', ...APPLICANT_IMPORT_COLUMNS.filter(c => c !== 'shul_name')];
+  const columns = ['id', ...APPLICANT_IMPORT_COLUMNS.filter(c => c !== 'shul_id')];
   const out = rows.map(r => Object.fromEntries(columns.map(c => {
     if (c === 'id') return [c, r.id];
     if (c === 'home_for_yomtov') return [c, r.home_for_yomtov ? 'Yes' : 'No'];
@@ -2350,7 +2354,7 @@ router.post('/:id/notes', (req, res) => {
 // it from the template they download entirely. An admin's own template
 // still has it, since an admin's upload can span many shuls.
 router.get('/import/template', (req, res) => {
-  const columns = req.user.role === 'shul' ? APPLICANT_IMPORT_COLUMNS.filter(c => c !== 'shul_name') : APPLICANT_IMPORT_COLUMNS;
+  const columns = req.user.role === 'shul' ? APPLICANT_IMPORT_COLUMNS.filter(c => c !== 'shul_id') : APPLICANT_IMPORT_COLUMNS;
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.setHeader('Content-Disposition', 'attachment; filename="applicant_import_template.xlsx"');
   res.send(buildXlsxTemplate(['id', ...columns]));
@@ -2440,7 +2444,7 @@ router.post('/import', requirePermission('applicants', 'can_edit'), upload.singl
   const bypassRequired = isAdminSubmitter && (req.body.bypass_required === 'true' || req.body.bypass_required === true);
   const schemaErrors = bypassRequired ? [] : validateRowsBySchema(getEffectiveSchema('applicant_application'), rows, { isAdmin: isAdminSubmitter, skipKeys: ['shul_id'] })
     .filter(e => !rowExisting[e.row - 2]);
-  const shulNameErrors = forcedShul ? [] : rows.map((r, i) => (!rowExisting[i] && !r.shul_name) ? { row: i + 2, error: 'Missing required field: shul_name' } : null).filter(Boolean);
+  const shulNameErrors = forcedShul ? [] : rows.map((r, i) => (!rowExisting[i] && !r.shul_id) ? { row: i + 2, error: 'Missing required field: shul_id' } : null).filter(Boolean);
   const idNotFoundErrors = rows.map((r, i) => (r.id && String(r.id).trim() && !rowExisting[i]) ? { row: i + 2, error: `No existing applicant found with id "${r.id}"` } : null).filter(Boolean);
   // Update rows (matched by id) skip validateRowsBySchema entirely (see
   // rowExisting above) since a blank cell there means "leave alone," not
@@ -2503,8 +2507,16 @@ router.post('/import', requirePermission('applicants', 'can_edit'), upload.singl
     if (!r.first_name || !r.last_name) { errors.push({ row: i + 2, error: 'Missing first_name or last_name' }); continue; }
     let shul = forcedShul;
     if (!shul) {
-      shul = r.shul_name ? db.prepare('SELECT * FROM shuls WHERE org_id = ? AND name_en = ?').get(req.user.org_id, r.shul_name) : null;
-      if (!shul) { errors.push({ row: i + 2, error: `Shul not found: "${r.shul_name || ''}" (must match an existing shul name exactly)` }); continue; }
+      // Matched by the shul's 4-digit external_id, not its name — a name
+      // match was fragile (whitespace, punctuation, Hebrew vs. English
+      // spelling all broke it silently) and this is unambiguous. Excel
+      // strips a leading zero off a plain numeric cell (0042 -> 42) unless
+      // it's formatted as text, so a purely-numeric cell shorter than 4
+      // digits is zero-padded back out before matching.
+      const rawShulId = String(r.shul_id ?? '').trim();
+      const shulExternalId = /^\d+$/.test(rawShulId) ? rawShulId.padStart(4, '0') : rawShulId;
+      shul = shulExternalId ? db.prepare('SELECT * FROM shuls WHERE org_id = ? AND external_id = ?').get(req.user.org_id, shulExternalId) : null;
+      if (!shul) { errors.push({ row: i + 2, error: `Shul not found: no shul with ID "${r.shul_id || ''}" (check the shul's 4-digit ID on its profile)` }); continue; }
     }
     if (shul.is_paused) { errors.push({ row: i + 2, error: `Shul "${shul.name_en}" is paused` }); continue; }
     const capError = seasonCapacityError(shul.season_id);

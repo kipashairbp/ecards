@@ -98,6 +98,7 @@ function statusCell(s) {
 }
 const SHUL_COLUMNS = [
   { key: 'name', label: 'Shul', sort: 'name_en', render: s => `<strong>${esc(s.name_en)}</strong>${s.name_he ? `<br><span dir="rtl" class="small-muted">${esc(s.name_he)}</span>` : ''}${s.is_paused ? ' ' + badge('paused','paused') : ''}` },
+  { key: 'shul_id', label: 'Shul ID', render: s => `<code>${esc(s.external_id||'')}</code>` },
   { key: 'state_city', label: 'State / City', render: s => `${esc(s.state)}, ${esc(s.city)}` },
   { key: 'address', label: 'Address', render: s => esc(s.address||'') },
   { key: 'zip', label: 'Zip', render: s => esc(s.zip||'') },
@@ -119,7 +120,7 @@ const SHUL_COLUMNS = [
   // saves immediately on toggle, no separate Save step.
   { key: 'follow_up', label: 'Follow Up?', render: s => `<input type="checkbox" ${s.needs_follow_up_call ? 'checked' : ''} onclick="event.stopPropagation()" onchange="saveShulFollowUp('${s.id}', this.checked)">` },
 ];
-const DEFAULT_SHUL_COLUMNS = ['name','state_city','rav','gabai','status','slots_allocated','applicant_count','applicants_pending','applicants_rejected','comments','follow_up','created_at'];
+const DEFAULT_SHUL_COLUMNS = ['name','shul_id','state_city','rav','gabai','status','slots_allocated','applicant_count','applicants_pending','applicants_rejected','comments','follow_up','created_at'];
 let activeColumns = DEFAULT_SHUL_COLUMNS;
 
 function renderThead() {
@@ -383,6 +384,8 @@ async function openShul(id) {
           <div><strong>Status</strong><br>${badge(shul.status, shul.status)} ${shul.is_paused ? badge('paused','paused') : ''}${shul.status === 'skipped' && shul.skip_reason ? `<div class="small-muted" style="margin-top:4px">Reason: ${esc(shul.skip_reason)}</div>` : ''}</div>
           <div><label>Slots Allocated</label><input id="e-slots_allocated" type="number" value="${shul.slots_allocated ?? 0}"></div>
         </div>
+        <div class="divider"></div>
+        <div><strong>Shul ID</strong> <code>${esc(shul.external_id||'')}</code><br><span class="small-muted">Use this in the <code>shul_id</code> column when mass-uploading applicants for this shul.</span></div>
         <div class="divider"></div>
         <div class="grid-2">
           <div><label>Shul Name (English)</label><input id="e-name_en" value="${esc(shul.name_en||'')}"></div>

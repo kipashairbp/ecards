@@ -1,4 +1,5 @@
 import { db, uuid } from '../db.js';
+import { generateShulExternalId } from './externalId.js';
 
 // "Ezras Habayis" applicants don't go through a shul — they self-apply
 // directly. Rather than requiring a real shul record for every submission,
@@ -14,11 +15,11 @@ export function getOrCreateEzrasHabayisShul(orgId, seasonId) {
   if (existing) return existing;
 
   const id = uuid();
-  db.prepare(`INSERT INTO shuls (id, org_id, season_id, name_en, name_he, address, city, state, zip,
+  db.prepare(`INSERT INTO shuls (id, org_id, season_id, external_id, name_en, name_he, address, city, state, zip,
       ruv_first_name, ruv_last_name, ruv_phone, gabai_first_name, gabai_last_name, gabai_cell, gabai_email,
       status, source, slots_allocated, is_locked)
-    VALUES (?,?,?,'Ezras Habayis','','N/A','N/A','NA','00000', 'N/A','N/A','000-000-0000', 'N/A','N/A','000-000-0000','ezras-habayis@system.local',
+    VALUES (?,?,?,?,'Ezras Habayis','','N/A','N/A','NA','00000', 'N/A','N/A','000-000-0000', 'N/A','N/A','000-000-0000','ezras-habayis@system.local',
       'approved','admin', 0, 1)`)
-    .run(id, orgId, seasonId || null);
+    .run(id, orgId, seasonId || null, generateShulExternalId(db));
   return db.prepare('SELECT * FROM shuls WHERE id = ?').get(id);
 }

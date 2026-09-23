@@ -7,7 +7,7 @@ import { auth } from '../middleware/auth.js';
 import { requirePermission } from '../middleware/permissions.js';
 import { detectAndFlag } from '../services/duplicates.js';
 import { normalizePhone } from '../utils/phone.js';
-import { generateApplicantExternalId } from '../utils/externalId.js';
+import { generateApplicantExternalId, generateShulExternalId } from '../utils/externalId.js';
 import { isZipAllowed } from './applicants.js';
 import { formWindowError } from '../utils/formSchedule.js';
 import { validateBySchema, recordFormResponse, splitKnown, getEffectiveSchema, APPLICANT_FIELDS, SHUL_FIELDS, STORE_FIELDS } from '../utils/formValidation.js';
@@ -98,10 +98,10 @@ router.post('/public/:slug/submit', (req, res) => {
     // now — a link someone already has open shouldn't silently start
     // landing in a different season if the active one changes underneath it.
     const id = uuid();
-    db.prepare(`INSERT INTO shuls (id, org_id, season_id, name_en, name_he, address, city, state, zip,
+    db.prepare(`INSERT INTO shuls (id, org_id, season_id, external_id, name_en, name_he, address, city, state, zip,
         ruv_first_name, ruv_last_name, ruv_phone, gabai_first_name, gabai_last_name, gabai_cell, gabai_email, status, source)
-      VALUES (?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?, 'submitted', 'form')`)
-      .run(id, form.org_id, form.season_id, shul.name_en, shul.name_he || '', shul.address, shul.city, shul.state, shul.zip,
+      VALUES (?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?, 'submitted', 'form')`)
+      .run(id, form.org_id, form.season_id, generateShulExternalId(db), shul.name_en, shul.name_he || '', shul.address, shul.city, shul.state, shul.zip,
         shul.ruv_first_name, shul.ruv_last_name, normalizePhone(shul.ruv_phone), shul.gabai_first_name, shul.gabai_last_name, normalizePhone(shul.gabai_cell), shul.gabai_email);
     const created = db.prepare('SELECT * FROM shuls WHERE id = ?').get(id);
     if (extra) db.prepare('INSERT INTO shul_notes (id, shul_id, note) VALUES (?,?,?)').run(uuid(), id, extra);

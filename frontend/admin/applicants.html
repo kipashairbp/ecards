@@ -856,7 +856,7 @@ window.createApplicant = async () => {
 };
 
 function openImportModal() {
-  const body = `<p class="small-muted">Upload an Excel (.xlsx) file using the template — CSV isn't accepted, since it doesn't reliably support Hebrew text. The <code>shul_name</code> column must match an existing shul name exactly. To mass-edit existing applicants, export first, edit cells in Excel, and re-upload — a row with a filled-in <code>id</code> column updates that applicant (only the cells you actually changed), instead of creating a new one.</p>
+  const body = `<p class="small-muted">Upload an Excel (.xlsx) file using the template — CSV isn't accepted, since it doesn't reliably support Hebrew text. The <code>shul_id</code> column must be that shul's 4-digit ID (shown on the shul's profile), not its name. To mass-edit existing applicants, export first, edit cells in Excel, and re-upload — a row with a filled-in <code>id</code> column updates that applicant (only the cells you actually changed), instead of creating a new one.</p>
     <input type="file" id="import-file" accept=".xlsx">
     <div class="checkbox-row" style="margin-top:12px"><input type="checkbox" id="import-bypass"><label style="margin:0">Bypass missing required fields (admin only — rows with blanks are still imported; first/last name still required)</label></div>
     <div class="checkbox-row" style="margin-top:8px"><input type="checkbox" id="import-provider-exempt"><label style="margin:0">One-time backfill for another season — never send these to disccardpromos (permanent, even if later approved/rejected)</label></div>
