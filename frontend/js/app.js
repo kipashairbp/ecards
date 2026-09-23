@@ -1216,6 +1216,51 @@ window.sendQuickEmail = async (entityType, entityId, containerId, defaultPhone, 
 // (each record's own name/shul/etc., resolved server-side) — the hint below
 // has no resolved values to show since it's a mixed batch of records, but
 // the placeholders themselves still work exactly like the single quick-send.
+// Status values each entity's own list page filters by (see shuls.html/
+// stores.html/applicants.html's #f-status) — mirrored here so the Email/SMS
+// Center can broadcast to "all approved shuls" etc. directly, without first
+// going to that entity's own list page to filter + Select All Matching
+// Filters + Email/SMS the way this used to be the only way to do it.
+const BROADCAST_STATUS_OPTIONS = {
+  shul: [['', 'Any status'], ['submitted', 'Submitted'], ['contract_sent', 'Contract Sent'], ['contract_signed', 'Contract Signed'], ['approved', 'Approved (Active)'], ['rejected', 'Rejected'], ['skipped', "X'd This Season"]],
+  store: [['', 'Any status'], ['pending', 'Pending'], ['in_progress', 'In Progress'], ['active', 'Active'], ['inactive', 'Inactive'], ['rejected', 'Rejected']],
+  applicant: [['', 'Any status'], ['pending', 'Pending'], ['approved', 'Approved'], ['rejected', 'Rejected'], ['soft_rejected', 'Soft Reject'], ['incomplete', 'Incomplete'], ['draft', 'Draft']],
+};
+const BROADCAST_ENTITY_LABEL = { shul: 'Shuls', store: 'Stores', applicant: 'Applicants' };
+const BROADCAST_IDS_PATH = { shul: '/shuls/ids', store: '/stores/ids', applicant: '/applicants/ids' };
+// Opens a small "who" picker (entity type + status), resolves matching ids
+// server-side (the exact same /ids endpoints "Select All Matching Filters"
+// on each entity's own list page already uses), then hands off to the
+// existing openMassMessageModal for the actual compose+send — reusing
+// every bit of that flow (templates, per-recipient variables, store role
+// picker) rather than duplicating it here.
+function openBroadcastByFilterModal(kind) {
+  const body = `
+    <label>Send To</label><select id="bc-type">${Object.entries(BROADCAST_ENTITY_LABEL).map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join('')}</select>
+    <label>Status Filter</label><select id="bc-status"></select>
+    <p class="small-muted">Matches org-wide (every season), same as this entity's own "Select All Matching Filters" — not just what's on screen right now.</p>
+  `;
+  openModal('Broadcast to a Group', body, `<button class="btn btn-primary btn-sm" id="bc-next">Next</button>`);
+  const fillStatus = () => {
+    qs('#bc-status').innerHTML = BROADCAST_STATUS_OPTIONS[qs('#bc-type').value].map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join('');
+  };
+  fillStatus();
+  qs('#bc-type').addEventListener('change', fillStatus);
+  qs('#bc-next').addEventListener('click', async () => {
+    const type = qs('#bc-type').value;
+    const status = qs('#bc-status').value;
+    const statusParam = type === 'store' ? 'setup_status' : 'status';
+    try {
+      const qsStr = status ? `?${statusParam}=${encodeURIComponent(status)}` : '';
+      const { ids } = await api(BROADCAST_IDS_PATH[type] + qsStr);
+      if (!ids.length) return toast('No records match that filter', true);
+      closeModal();
+      const r = await openMassMessageModal(type, kind, ids);
+      if (r) toast(r.failed ? `Sent ${r.sent}, failed ${r.failed} — see the ${kind === 'email' ? 'Email' : 'SMS'} log for details` : `Sent to ${r.sent}`, !!r.failed);
+    } catch (err) { toast(err.message, true); }
+  });
+}
+
 function openMassMessageModal(entityType, kind, ids) {
   return new Promise(async (resolve) => {
     let templates = [];

@@ -371,6 +371,11 @@ function maskForShul(records, role, orgId) {
   // Organization > Shul Portal) — defaults to visible, same as before the
   // toggle existed, unless explicitly turned off.
   const cardVisible = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'shul_card_amount_visible'`).get(orgId)?.value !== '0';
+  // Separate toggle, off by default (opt-in): whether a shul can see if an
+  // applicant's card is active AT ALL — never the count, per spec. Only
+  // ever a plain yes/no; the real active_card_count computed by GET /
+  // above is stripped below regardless of this setting.
+  const cardStatusVisible = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'shul_card_status_visible'`).get(orgId)?.value === '1';
   // Cache season lookups across a whole list-page mask pass rather than
   // re-querying per row.
   const seasonReqCache = new Map();
@@ -392,6 +397,9 @@ function maskForShul(records, role, orgId) {
     // never the number it's being checked against.
     delete rec.min_contribution_override;
     rec.requiresShulContribution = requiresContribution(r.season_id);
+    // Yes/no only, opt-in, never the underlying count — see cardStatusVisible above.
+    if (cardStatusVisible) rec.has_active_card = (r.active_card_count || 0) > 0;
+    delete rec.active_card_count;
     return rec;
   };
   return Array.isArray(records) ? records.map(mask) : mask(records);
@@ -477,10 +485,11 @@ function scopeWhere(req) {
 }
 
 router.get('/', (req, res) => {
-  const { search, status, shul_id, season_id, home_for_yomtov, marital_status, paused, provider_sync, provider_check, amount_min, amount_max, sort = 'created_at', dir = 'DESC', page = 1, pageSize = 50 } = req.query;
+  const { search, status, shul_id, season_id, home_for_yomtov, marital_status, paused, will_not_activate, provider_sync, provider_check, amount_min, amount_max, sort = 'created_at', dir = 'DESC', page = 1, pageSize = 50 } = req.query;
   let { where, params } = scopeWhere(req);
   if (status) { where += ' AND a.approval_status = ?'; params.push(status); }
   if (paused === '1' || paused === '0') { where += ' AND a.is_paused = ?'; params.push(+paused); }
+  if (will_not_activate === '1' || will_not_activate === '0') { where += ' AND a.will_not_activate = ?'; params.push(+will_not_activate); }
   // A merged record's shul_id column only names the primary shul — match a
   // shul filter against every contributing shul (see applicant_submissions)
   // so a merged applicant still shows up when filtering for a non-primary
@@ -564,10 +573,11 @@ router.get('/', (req, res) => {
 // Full-detail CSV export — every field, no pagination, respects the same
 // filters as the list view. Must be registered before /:id.
 router.get('/export', requirePermission('applicants', 'can_export'), (req, res) => {
-  const { search, status, shul_id, season_id, home_for_yomtov, marital_status, paused, amount_min, amount_max } = req.query;
+  const { search, status, shul_id, season_id, home_for_yomtov, marital_status, paused, will_not_activate, amount_min, amount_max } = req.query;
   let { where, params } = scopeWhere(req);
   if (status) { where += ' AND a.approval_status = ?'; params.push(status); }
   if (paused === '1' || paused === '0') { where += ' AND a.is_paused = ?'; params.push(+paused); }
+  if (will_not_activate === '1' || will_not_activate === '0') { where += ' AND a.will_not_activate = ?'; params.push(+will_not_activate); }
   if (shul_id) { where += ' AND (a.shul_id = ? OR a.id IN (SELECT applicant_id FROM applicant_submissions WHERE shul_id = ?))'; params.push(shul_id, shul_id); }
   if (season_id) { where += ' AND a.season_id = ?'; params.push(season_id); }
   if (marital_status) { where += ' AND a.marital_status = ?'; params.push(marital_status); }
@@ -615,10 +625,11 @@ router.get('/export', requirePermission('applicants', 'can_export'), (req, res) 
 // /:id. Same filters as GET / and /export — kept in sync by hand, same as
 // those two already are with each other.
 router.get('/ids', (req, res) => {
-  const { search, status, shul_id, season_id, home_for_yomtov, marital_status, paused, amount_min, amount_max } = req.query;
+  const { search, status, shul_id, season_id, home_for_yomtov, marital_status, paused, will_not_activate, amount_min, amount_max } = req.query;
   let { where, params } = scopeWhere(req);
   if (status) { where += ' AND a.approval_status = ?'; params.push(status); }
   if (paused === '1' || paused === '0') { where += ' AND a.is_paused = ?'; params.push(+paused); }
+  if (will_not_activate === '1' || will_not_activate === '0') { where += ' AND a.will_not_activate = ?'; params.push(+will_not_activate); }
   if (shul_id) { where += ' AND (a.shul_id = ? OR a.id IN (SELECT applicant_id FROM applicant_submissions WHERE shul_id = ?))'; params.push(shul_id, shul_id); }
   if (season_id) { where += ' AND a.season_id = ?'; params.push(season_id); }
   if (marital_status) { where += ' AND a.marital_status = ?'; params.push(marital_status); }
@@ -1458,6 +1469,10 @@ router.get('/:id', (req, res) => {
       ORDER BY df.resolved_at DESC`).all(req.user.org_id, applicant.id, applicant.id);
   }
   const requiresShulContribution = !!db.prepare('SELECT require_shul_contribution FROM seasons WHERE id = ?').get(applicant.season_id)?.require_shul_contribution;
+  // Same active-card signal the list view computes (see GET / above) — set
+  // here too so maskForShul's has_active_card is accurate on the single-
+  // applicant view, not just the list.
+  applicant.active_card_count = cards.filter(c => c.status === 'activated').length;
   res.json({ applicant: maskForShul(redact(applicant, req.permission.hidden_fields), req.user.role, req.user.org_id), notes, cards, flags, mergeGroup, requiresShulContribution, mergedBy, bypassHistory });
 });
 
@@ -2777,6 +2792,26 @@ router.post('/:id/appeal', (req, res) => {
 // to go search for it. Same access rule as /appeal above — the requesting
 // shul must actually be a contributor (owner or, for a merged record, an
 // applicant_submissions row), not just any shul in the org.
+// A shul declaring its applicant will never activate the card being held
+// for them — real-owner-only (a merged/contributing-only shul has no card
+// of its own to declare anything about — see applySubmissionOverlay).
+// Refuses if a card is already active: this is a "stop expecting this"
+// signal, not something to click reflexively on an already-active account.
+// One-way from the shul side (see frontend confirm text) — an admin can
+// still clear it directly if it was a mistake.
+router.post('/:id/will-not-activate', (req, res) => {
+  if (req.user.role !== 'shul') return res.status(403).json({ error: 'Not permitted' });
+  const applicant = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
+  if (!applicant) return res.status(404).json({ error: 'Not found' });
+  if (applicant.shul_id !== req.user.shul_id) return res.status(403).json({ error: 'Not your applicant' });
+  if (applicant.will_not_activate) return res.json({ ok: true });
+  const hasActiveCard = db.prepare(`SELECT 1 FROM cards WHERE applicant_id = ? AND status = 'activated'`).get(applicant.id);
+  if (hasActiveCard) return res.status(400).json({ error: 'This applicant already has an active card.' });
+  db.prepare(`UPDATE applicants SET will_not_activate = 1, will_not_activate_at = datetime('now') WHERE id = ?`).run(applicant.id);
+  logAudit(req.user.org_id, req.user.id, 'will-not-activate', 'applicant', applicant.id, { will_not_activate: 0 }, { will_not_activate: 1 }, req.ip);
+  res.json({ ok: true });
+});
+
 router.post('/:id/contact-admin', async (req, res) => {
   if (req.user.role !== 'shul') return res.status(403).json({ error: 'Not permitted' });
   const applicant = db.prepare('SELECT * FROM applicants WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);

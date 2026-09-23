@@ -13,7 +13,7 @@
 <script>
 Auth.requireAdmin();
 renderShell('/admin/emails', `
-  <div class="flex-between"><h2>Email Center</h2><button class="btn btn-primary btn-sm" id="btn-compose">Compose Email</button></div>
+  <div class="flex-between"><h2>Email Center</h2><div class="pill-row"><button class="btn btn-outline btn-sm" id="btn-broadcast">Broadcast to a Group</button><button class="btn btn-primary btn-sm" id="btn-compose">Compose Email</button></div></div>
   <div class="tabs" id="etabs">
     <button class="active" data-t="sent">Sent Emails</button>
     <button data-t="templates">Templates</button>
@@ -163,6 +163,7 @@ window.deleteTemplate = async (id) => {
 
 let composeEditor = null;
 const RECIPIENT_TYPE_LABEL = { shul: 'Shul', store: 'Store', applicant: 'Applicant', user: 'Admin' };
+qs('#btn-broadcast').addEventListener('click', () => openBroadcastByFilterModal('email'));
 qs('#btn-compose').addEventListener('click', async () => {
   if (!templatesCache.length) { try { ({ templates: templatesCache } = await api('/emails/templates/all')); } catch { /* compose still works without templates */ } }
   const options = `<option value="">Start from scratch</option>` + templatesCache.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('');

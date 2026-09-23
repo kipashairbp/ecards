@@ -217,6 +217,12 @@ window.saveShulComments = async (id, input) => {
     input.dataset.orig = input.value;
   } catch (err) { toast(err.message, true); input.value = input.dataset.orig; }
 };
+window.sendNoActiveCardList = async (id, via) => {
+  try {
+    const r = await api(`/shuls/${id}/no-active-card-notify`, { method: 'POST', body: { via } });
+    toast(`Sent — ${r.count} name(s)`);
+  } catch (err) { toast(err.message, true); }
+};
 window.saveShulFollowUp = async (id, checked) => {
   try { await api(`/shuls/${id}`, { method: 'PUT', body: { needs_follow_up_call: checked ? 1 : 0 } }); }
   catch (err) { toast(err.message, true); }
@@ -386,6 +392,14 @@ async function openShul(id) {
         </div>
         <div class="divider"></div>
         <div><strong>Shul ID</strong> <code>${esc(shul.external_id||'')}</code><br><span class="small-muted">Use this in the <code>shul_id</code> column when mass-uploading applicants for this shul.</span></div>
+        <div class="divider"></div>
+        <div><strong>No Active Card List</strong><br><span class="small-muted">This shul's approved applicants who still have no active card (excludes anyone marked "Will Not Activate").</span>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+            <button class="btn btn-sm btn-outline" onclick="downloadAuthed('/shuls/${id}/no-active-card-export', 'no-active-card-${esc(shul.name_en).replace(/[^a-z0-9]+/gi,'-')}.xlsx')">Download List</button>
+            <button class="btn btn-sm btn-outline" onclick="sendNoActiveCardList('${id}','email')">Email This Shul</button>
+            <button class="btn btn-sm btn-outline" onclick="sendNoActiveCardList('${id}','sms')">Text This Shul</button>
+          </div>
+        </div>
         <div class="divider"></div>
         <div class="grid-2">
           <div><label>Shul Name (English)</label><input id="e-name_en" value="${esc(shul.name_en||'')}"></div>

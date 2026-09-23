@@ -891,6 +891,15 @@ safeAlter(`ALTER TABLE applicants ADD COLUMN previous_shul_id TEXT REFERENCES sh
 // through — overwritten fresh each time an appeal is answered regardless.
 safeAlter(`ALTER TABLE applicants ADD COLUMN rejection_reason TEXT`);
 
+// "Will Not Activate" — a shul-portal self-declaration that this family
+// will never use the card being held for them (moved away, no longer
+// needs it, etc.), so the admin doesn't have to keep chasing them for an
+// activation that's never coming. Shul-clicked only (requires confirmation
+// client-side — see routes/applicants.js POST /:id/will-not-activate),
+// admin-visible and filterable so a "who clicked this" list is answerable.
+safeAlter(`ALTER TABLE applicants ADD COLUMN will_not_activate INTEGER DEFAULT 0`);
+safeAlter(`ALTER TABLE applicants ADD COLUMN will_not_activate_at TEXT`);
+
 // Internal-only admin flag, same visibility boundary as permanent_comments
 // — a shul is never shown this or told it exists.
 safeAlter(`ALTER TABLE shuls ADD COLUMN needs_follow_up_call INTEGER DEFAULT 0`);

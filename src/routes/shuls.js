@@ -5,7 +5,7 @@ import { auth, requireAdmin } from '../middleware/auth.js';
 import { requirePermission, redact } from '../middleware/permissions.js';
 import { detectAndFlag, resolveFlag, getShulMergeGroupIds, mergeShuls } from '../services/duplicates.js';
 import { generateContractPdf, stampSignatureFields, getSignatureFields, resolveSignatureValues } from '../services/pdf.js';
-import { sendMailChecked, renderSystemTemplate, notifyNewSignup, notifyDocSigned, renderSignupDetails } from '../services/mail.js';
+import { sendMailChecked, renderSystemTemplate, notifyNewSignup, notifyDocSigned, renderSignupDetails, escapeHtml } from '../services/mail.js';
 import { sendSmsChecked } from '../services/sms.js';
 import { parseSpreadsheet, buildXlsxTemplate, SHUL_IMPORT_COLUMNS } from '../services/importer.js';
 import { sendXlsx } from '../services/xlsx.js';
@@ -425,6 +425,77 @@ router.get('/ids', (req, res) => {
   }
   const ids = db.prepare(`SELECT id FROM shuls ${where}`).all(...params).map(r => r.id);
   res.json({ ids });
+});
+
+// Every one of this shul's own APPROVED applicants that still has no active
+// card — excludes anyone the shul already declared "Will Not Activate" (see
+// routes/applicants.js), since there's nothing to chase there. Scoped to
+// shul_id ownership only, not merged-in contributions (see
+// applicant_submissions) — a contributing shul doesn't own the card
+// decision on a record it doesn't primarily hold.
+function noActiveCardApplicants(orgId, shulId) {
+  return db.prepare(`SELECT a.id, a.first_name, a.last_name FROM applicants a
+    WHERE a.org_id = ? AND a.shul_id = ? AND a.approval_status = 'approved' AND a.will_not_activate = 0
+      AND NOT EXISTS (SELECT 1 FROM cards c WHERE c.applicant_id = a.id AND c.status = 'activated')
+    ORDER BY a.last_name COLLATE NOCASE, a.first_name COLLATE NOCASE`).all(orgId, shulId);
+}
+// Admin-only, per-shul download (Excel) of the list above — "generate this
+// list as a download from the shul profile itself."
+router.get('/:id/no-active-card-export', requireAdmin, (req, res) => {
+  const shul = db.prepare('SELECT * FROM shuls WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
+  if (!shul) return res.status(404).json({ error: 'Not found' });
+  const rows = noActiveCardApplicants(req.user.org_id, shul.id).map(a => ({ first_name: a.first_name, last_name: a.last_name }));
+  sendXlsx(res, `no-active-card-${shul.name_en.replace(/[^a-z0-9]+/gi, '-')}.xlsx`, rows, ['first_name', 'last_name']);
+});
+// Admin-only, per-shul send — emails or texts THIS shul its own no-active-
+// card list directly from its profile ("allow sending this email... via
+// email or sms, direct from the shul's profile").
+router.post('/:id/no-active-card-notify', requireAdmin, async (req, res) => {
+  const shul = db.prepare('SELECT * FROM shuls WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
+  if (!shul) return res.status(404).json({ error: 'Not found' });
+  const via = req.body?.via === 'sms' ? 'sms' : 'email';
+  const names = noActiveCardApplicants(req.user.org_id, shul.id).map(a => `${a.first_name} ${a.last_name}`.trim());
+  if (!names.length) return res.status(400).json({ error: 'Every one of this shul\'s approved applicants already has an active card (or is marked Will Not Activate) — nothing to send.' });
+  if (via === 'sms') {
+    if (!shul.gabai_cell) return res.status(400).json({ error: 'This shul has no Gabai cell number on file.' });
+    const body = `The following approved applicant(s) do not yet have an active card:\n${names.join('\n')}`;
+    const { emailError } = await sendSmsChecked(req.user.org_id, shul.gabai_cell, body, { relatedEntityType: 'shul', relatedEntityId: shul.id, sentBy: req.user.id });
+    return res.json({ ok: !emailError, error: emailError, count: names.length });
+  }
+  if (!shul.gabai_email) return res.status(400).json({ error: 'This shul has no Gabai email on file.' });
+  const subject = `Applicants without an active card — ${shul.name_en}`;
+  const bodyHtml = `<p>The following approved applicant(s) do not yet have an active card:</p><p>${names.map(n => escapeHtml(n)).join('<br>')}</p>`;
+  const { emailError } = await sendMailChecked(req.user.org_id, shul.gabai_email, subject, bodyHtml, { relatedEntityType: 'shul', relatedEntityId: shul.id, sentBy: req.user.id });
+  res.json({ ok: !emailError, error: emailError, count: names.length });
+});
+// Settings-driven bulk version — every approved shul (org-wide, active
+// season) gets its OWN list; a shul with nothing outstanding is silently
+// skipped rather than getting an empty "you're all good" message.
+router.post('/no-active-card-notify-all', requireAdmin, async (req, res) => {
+  const via = req.body?.via === 'sms' ? 'sms' : 'email';
+  const seasonId = req.body?.season_id || getActiveSeasonId(req.user.org_id);
+  const shuls = seasonId
+    ? db.prepare(`SELECT * FROM shuls WHERE org_id = ? AND status = 'approved' AND is_locked = 0 AND season_id = ?`).all(req.user.org_id, seasonId)
+    : db.prepare(`SELECT * FROM shuls WHERE org_id = ? AND status = 'approved' AND is_locked = 0`).all(req.user.org_id);
+  let sent = 0, skippedEmpty = 0, skippedNoContact = 0, failed = 0;
+  const failedDetails = [];
+  for (const shul of shuls) {
+    const names = noActiveCardApplicants(req.user.org_id, shul.id).map(a => `${a.first_name} ${a.last_name}`.trim());
+    if (!names.length) { skippedEmpty++; continue; }
+    if (via === 'sms') {
+      if (!shul.gabai_cell) { skippedNoContact++; continue; }
+      const body = `The following approved applicant(s) do not yet have an active card:\n${names.join('\n')}`;
+      const { emailError } = await sendSmsChecked(req.user.org_id, shul.gabai_cell, body, { relatedEntityType: 'shul', relatedEntityId: shul.id, sentBy: req.user.id });
+      if (emailError) { failed++; failedDetails.push(`${shul.name_en}: ${emailError}`); } else sent++;
+    } else {
+      if (!shul.gabai_email) { skippedNoContact++; continue; }
+      const subject = `Applicants without an active card — ${shul.name_en}`;
+      const bodyHtml = `<p>The following approved applicant(s) do not yet have an active card:</p><p>${names.map(n => escapeHtml(n)).join('<br>')}</p>`;
+      const { emailError } = await sendMailChecked(req.user.org_id, shul.gabai_email, subject, bodyHtml, { relatedEntityType: 'shul', relatedEntityId: shul.id, sentBy: req.user.id });
+      if (emailError) { failed++; failedDetails.push(`${shul.name_en}: ${emailError}`); } else sent++;
+    }
+  }
+  res.json({ ok: true, sent, skippedEmpty, skippedNoContact, failed, failedDetails, checked: shuls.length });
 });
 
 router.get('/:id', (req, res) => {

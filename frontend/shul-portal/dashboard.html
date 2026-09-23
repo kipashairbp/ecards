@@ -26,8 +26,8 @@ renderShell('/shul-portal/dashboard', `
   <div id="draft-banner"></div>
   <div class="toolbar"><input id="f-search" placeholder="Search name…"></div>
   <div class="card" style="padding:0;overflow-x:auto">
-    <table><thead><tr><th></th><th>ID</th><th>Name</th><th>Marital</th><th>Contact</th><th>Children</th><th>Home Yom Tov</th><th>Status</th><th>Card $</th></tr></thead>
-    <tbody id="tbody"><tr><td colspan="9" class="empty-state">Loading…</td></tr></tbody></table>
+    <table><thead><tr><th></th><th>ID</th><th>Name</th><th>Marital</th><th>Contact</th><th>Children</th><th>Home Yom Tov</th><th>Status</th><th>Card $</th><th id="th-card-status" style="display:none">Active Card</th></tr></thead>
+    <tbody id="tbody"><tr><td colspan="10" class="empty-state">Loading…</td></tr></tbody></table>
   </div>
 `);
 
@@ -135,6 +135,13 @@ async function load() {
           </div>
         </div>`
       : '';
+    // has_active_card only exists on a row at all when the admin-controlled
+    // "Shuls can see whether a card is active" setting is on (see
+    // routes/applicants.js's maskForShul) — its mere presence is what tells
+    // this page whether to show the column, since a shul portal login has
+    // no access to /settings to ask directly. Yes/No only, never a count.
+    const showCardStatus = applicants.some(a => a.has_active_card !== undefined);
+    qs('#th-card-status').style.display = showCardStatus ? '' : 'none';
     qs('#tbody').innerHTML = applicants.length ? applicants.map(a => `<tr onclick="openApplicant('${a.id}')" style="cursor:pointer${a.approval_status==='incomplete'?';background:rgba(183,28,28,.06)':a.approval_status==='draft'?';background:rgba(183,121,28,.08)':''}">
         <td onclick="event.stopPropagation()">${a.approval_status==='incomplete' ? `<input type="checkbox" class="reenroll-check" data-id="${a.id}" ${selectedReenroll.has(a.id)?'checked':''} onchange="toggleReenrollSelect('${a.id}', this.checked)">`
           : a.approval_status==='draft' ? `<input type="checkbox" class="draft-check" data-id="${a.id}" ${selectedDrafts.has(a.id)?'checked':''} onchange="toggleDraftSelect('${a.id}', this.checked)">` : ''}</td>
@@ -142,7 +149,8 @@ async function load() {
         <td><strong>${esc(a.first_name)} ${esc(a.last_name)}</strong>${a.is_paused?' '+badge('paused','paused'):''}</td>
         <td>${esc(a.marital_status||'')}</td><td>${contactLine(a)}</td><td>${a.num_children??0}</td>
         <td>${a.home_for_yomtov?'Yes':'No'}</td><td>${badge(a.approval_status,a.approval_status)}</td><td>${a.card_amount!=null?fmtMoney(a.card_amount):''}</td>
-      </tr>`).join('') : '<tr><td colspan="9" class="empty-state">No applicants submitted yet.</td></tr>';
+        ${showCardStatus ? `<td>${a.has_active_card ? 'Yes' : 'No'}</td>` : ''}
+      </tr>`).join('') : '<tr><td colspan="10" class="empty-state">No applicants submitted yet.</td></tr>';
   } catch (err) { toast(err.message, true); }
 }
 window.toggleReenrollSelect = (id, checked) => {
@@ -311,10 +319,31 @@ function openApplicantReadOnly(a) {
     <p><strong>Comments</strong><br>${esc(a.comments||'')||'<span class="small-muted">None</span>'}</p>
     ${'card_amount' in a ? `<div class="divider"></div><p><strong>Card Amount</strong><br>${a.card_amount!=null?fmtMoney(a.card_amount):'Not yet set'}</p>` : ''}
     ${a.requiresShulContribution && !a._merged_readonly ? `<div class="divider"></div><p><strong>Amount Your Shul Gave This Family</strong><br>${a.shul_contribution_amount!=null?fmtMoney(a.shul_contribution_amount):'Not entered'}</p>` : ''}
-    <p class="small-muted">${a.approval_status === 'rejected' ? 'This applicant was rejected; contact your admin for details.' : a._merged_readonly ? 'Account locked, please contact the admin.' : 'This applicant has been approved and is locked; contact your admin for changes.'}</p>
-    ${a._merged_readonly ? `<button class="btn btn-outline btn-sm" id="btn-contact-admin" onclick="contactAdminAboutApplicant('${a.id}')">Contact Admin</button>` : ''}
+    <p class="small-muted">${a.approval_status === 'rejected' ? 'This applicant was rejected; contact your admin for details.' : 'This applicant has been approved and is locked; contact your admin for changes.'}</p>
+    ${a.approval_status !== 'rejected' ? `<button class="btn btn-outline btn-sm" id="btn-contact-admin" onclick="contactAdminAboutApplicant('${a.id}')">Contact Admin</button>` : ''}
+    ${willNotActivateHtml(a)}
   `, '');
 }
+// "Will Not Activate" self-declaration: a shul telling the admin this
+// family will never use the card being held for them (moved away, no
+// longer needs it, etc.) — a merged/non-owning submission has no card of
+// its own to declare anything about, and a rejected applicant never gets
+// one either way, so neither gets the button. Already-declared shows a
+// plain label instead of a re-clickable button — this is a one-way
+// declaration, not a toggle, from the shul side.
+function willNotActivateHtml(a) {
+  if (a._merged_readonly || !['pending', 'approved'].includes(a.approval_status)) return '';
+  if (a.will_not_activate) return `<div class="divider"></div><p class="small-muted"><strong>Marked: Will Not Activate</strong> — the admin has been informed this card won't be used.</p>`;
+  return `<div class="divider"></div><button class="btn btn-outline btn-sm" onclick="confirmWillNotActivate('${a.id}')">Will Not Activate</button>`;
+}
+window.confirmWillNotActivate = async (id) => {
+  if (!confirm("Confirm this family will NOT be activating their card. This tells the admin to stop expecting an activation from this applicant. This can't be undone from here — contact your admin if you need it reversed.")) return;
+  try {
+    await api(`/applicants/${id}/will-not-activate`, { method: 'POST' });
+    toast('Marked — the admin has been informed.');
+    closeModal(); load();
+  } catch (err) { toast(err.message, true); }
+};
 window.contactAdminAboutApplicant = (id) => {
   openModal('Contact Admin', `
     <p class="small-muted">Describe what you need help with regarding this locked applicant record. The admin can reply directly to your shul's email on file.</p>
@@ -369,6 +398,7 @@ async function openApplicantEdit(a) {
     <div class="checkbox-row" style="margin-top:10px"><input type="checkbox" id="e-shul-contrib-confirmed" ${a.shul_contribution_confirmed?'checked':''}>
       <label for="e-shul-contrib-confirmed" style="margin:0">I confirm this amount is accurate</label></div>
     <p class="small-muted">This must be entered and confirmed before this applicant can be approved.</p>` : ''}
+    ${willNotActivateHtml(a)}
   `, `${!a.approved_at ? `<button class="btn btn-danger btn-sm" onclick="removeApplicantShul('${a.id}')">Remove</button>` : ''}<button class="btn btn-primary btn-sm" onclick="saveApplicantEdit('${a.id}')">Save</button>`);
   loadGoogleMaps().then(() => { attachPlacesAutocomplete('address', { address: 'address', city: 'city', state: 'state', zip: 'zip' }); });
   for (const f of schema) {

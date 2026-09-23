@@ -100,6 +100,18 @@ renderShell('/admin/settings', `
       <div class="checkbox-row"><input type="checkbox" id="shul-card-amount-visible"><label style="margin:0">Shuls can see the card amount on their own applicants</label></div>
       <p class="small-muted">When off, the "Card $" column and field are hidden from the shul portal (list and applicant detail) but remain fully visible to admins.</p>
       <button class="btn btn-sm btn-primary" style="margin-top:14px" onclick="saveShulCardAmountVisible()">Save</button>
+      <div class="divider"></div>
+      <div class="checkbox-row"><input type="checkbox" id="shul-card-status-visible"><label style="margin:0">Shuls can see whether a card is active on their own applicants</label></div>
+      <p class="small-muted">Adds an "Active Card" Yes/No column to the shul portal's applicant list. Only ever shows yes/no — never how many cards, or any dollar amount. Off by default.</p>
+      <button class="btn btn-sm btn-primary" style="margin-top:14px" onclick="saveShulCardStatusVisible()">Save</button>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <h3>No Active Card Reminders</h3>
+      <p class="small-muted">Sends every currently-approved shul (this season) its OWN list of approved applicants who still have no active card — anyone marked "Will Not Activate" is left off. A shul with nothing outstanding is skipped, not sent an empty "all clear" message. One name per line.</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn btn-sm btn-outline" onclick="notifyAllShulsNoActiveCard('email')">Email Approved Shuls</button>
+        <button class="btn btn-sm btn-outline" onclick="notifyAllShulsNoActiveCard('sms')">Text Approved Shuls</button>
+      </div>
     </div>
     <div class="card" style="margin-top:16px">
       <h3>Homepage Popup</h3>
@@ -325,6 +337,22 @@ async function loadShulCardAmountVisible() {
 window.saveShulCardAmountVisible = async () => {
   try { await api('/settings', { method: 'PUT', body: { shul_card_amount_visible: qs('#shul-card-amount-visible').checked ? '1' : '0' } }); toast('Saved'); } catch (err) { toast(err.message, true); }
 };
+async function loadShulCardStatusVisible() {
+  const { settings } = await api('/settings');
+  // Off by default, unlike the card-amount toggle above — this is a new
+  // disclosure, not a pre-existing behavior being made optional.
+  qs('#shul-card-status-visible').checked = settings.shul_card_status_visible === '1';
+}
+window.saveShulCardStatusVisible = async () => {
+  try { await api('/settings', { method: 'PUT', body: { shul_card_status_visible: qs('#shul-card-status-visible').checked ? '1' : '0' } }); toast('Saved'); } catch (err) { toast(err.message, true); }
+};
+window.notifyAllShulsNoActiveCard = async (via) => {
+  if (!confirm(`Send a "no active card" ${via === 'sms' ? 'text' : 'email'} to every approved shul that has one or more applicants without an active card?`)) return;
+  try {
+    const r = await api('/shuls/no-active-card-notify-all', { method: 'POST', body: { via } });
+    toast(`Sent to ${r.sent} shul(s). ${r.skippedEmpty} had nothing outstanding. ${r.skippedNoContact} had no ${via === 'sms' ? 'Gabai cell' : 'Gabai email'} on file.${r.failed ? ` ${r.failed} failed to send.` : ''}`, !!r.failed);
+  } catch (err) { toast(err.message, true); }
+};
 window.downloadFullExport = () => downloadAuthed('/system-export', 'ecards-full-export.xlsx');
 
 window.saveOrg = async () => {
@@ -402,7 +430,7 @@ window.uploadFullImport = async (input) => {
   input.value = '';
 };
 
-loadOrg(); loadZipRestriction(); loadDefaultReplyTo(); loadNewSignupNotifyEmails(); loadDocSignedNotifyEmail(); loadSmsOwnNumber(); loadDiscountId(); loadPushFields(); loadPopup(); loadShulCardAmountVisible(); loadRequiredFields(); loadStoreLinks();
+loadOrg(); loadZipRestriction(); loadDefaultReplyTo(); loadNewSignupNotifyEmails(); loadDocSignedNotifyEmail(); loadSmsOwnNumber(); loadDiscountId(); loadPushFields(); loadPopup(); loadShulCardAmountVisible(); loadShulCardStatusVisible(); loadRequiredFields(); loadStoreLinks();
 </script>
 </body>
 </html>
