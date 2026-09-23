@@ -315,17 +315,24 @@ function openApplicantReadOnly(a) {
     ${a._merged_readonly ? `<button class="btn btn-outline btn-sm" id="btn-contact-admin" onclick="contactAdminAboutApplicant('${a.id}')">Contact Admin</button>` : ''}
   `, '');
 }
-window.contactAdminAboutApplicant = async (id) => {
-  const btn = qs('#btn-contact-admin');
-  if (btn?.disabled) return;
+window.contactAdminAboutApplicant = (id) => {
+  openModal('Contact Admin', `
+    <p class="small-muted">Describe what you need help with regarding this locked applicant record. The admin can reply directly to your shul's email on file.</p>
+    <textarea id="contact-admin-message" rows="5" placeholder="Type your message…" style="width:100%"></textarea>
+  `, `<button class="btn btn-primary btn-sm" id="btn-send-contact-admin" onclick="sendContactAdminMessage('${id}')">Send</button>`);
+};
+window.sendContactAdminMessage = async (id) => {
+  const message = qs('#contact-admin-message').value.trim();
+  if (!message) return toast('Please write a message first', true);
+  const btn = qs('#btn-send-contact-admin');
   if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
   try {
-    const r = await api(`/applicants/${id}/contact-admin`, { method: 'POST' });
-    if (btn) { btn.textContent = 'Sent'; }
-    toast(r.emailError ? `Request logged, but the email failed: ${r.emailError}` : 'Sent — the admin has been emailed a link to this record.', !!r.emailError);
+    const r = await api(`/applicants/${id}/contact-admin`, { method: 'POST', body: { message } });
+    toast(r.emailError ? `Request logged, but the email failed: ${r.emailError}` : 'Sent — the admin has been emailed your message and a link to this record.', !!r.emailError);
+    closeModal();
   } catch (err) {
     toast(err.message, true);
-    if (btn) { btn.disabled = false; btn.textContent = 'Contact Admin'; }
+    if (btn) { btn.disabled = false; btn.textContent = 'Send'; }
   }
 };
 window.askRejectionReason = async (id) => {

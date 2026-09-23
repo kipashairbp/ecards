@@ -608,7 +608,9 @@ async function openApplicant(id) {
         </div>
         ${flags.length ? `<div class="divider"></div><div style="color:var(--danger)">
           <strong>&#9888; Duplicate flag open.</strong>
-          ${flags.map(f => `<div style="margin-top:6px">Matches another applicant — reason: ${esc(f.reason)}.
+          ${flags.map(f => f.entity_id === f.matched_entity_id ? `<div style="margin-top:6px">Own phone numbers look like a duplicate — reason: ${esc(f.reason)}.
+            <button class="btn btn-sm btn-outline" onclick="resolvePhoneCollision('${f.id}','${id}')">Confirm Correct as Entered</button></div>`
+            : `<div style="margin-top:6px">Matches another applicant — reason: ${esc(f.reason)}.
             <button class="btn btn-sm btn-outline" onclick="openMergeView('${f.id}','${id}')">View &amp; Resolve</button></div>`).join('')}
         </div>` : (a.is_paused ? `<div class="divider"></div><div style="color:var(--danger)">
           <strong>&#9888; Paused, but no open duplicate flag was found.</strong> The flag that caused this was likely already resolved elsewhere.
@@ -937,11 +939,11 @@ function renderDupListOnly() {
     ? dupFlagsCache.filter(f => [f.entity?.first_name, f.entity?.last_name, f.entity?.shul_name, f.matched?.first_name, f.matched?.last_name, f.matched?.shul_name, f.reason]
         .some(v => (v || '').toLowerCase().includes(term)))
     : dupFlagsCache;
-  return flags.length ? flags.map(f => f.entity_id === f.matched_entity_id ? `<div class="card" style="margin-bottom:10px">
+  return flags.length ? flags.map(f => f.entity_id === f.matched_entity_id ? `<div class="card" style="margin-bottom:10px;cursor:pointer" onclick="openApplicantFromDupFlag('${f.entity_id}')" title="Click to open this applicant's profile and edit the numbers">
       <strong>${esc(f.entity?.first_name)} ${esc(f.entity?.last_name)}</strong> (${esc(f.entity?.shul_name||'')}) — own phone numbers look like a duplicate<br>
       <span class="small-muted">Reason: ${esc(f.reason)}</span>
       <div style="margin-top:10px">
-        <button class="btn btn-sm btn-primary" onclick="resolvePhoneCollision('${f.id}')">Confirm Correct as Entered</button>
+        <button class="btn btn-sm btn-primary" onclick="event.stopPropagation(); resolvePhoneCollision('${f.id}')">Confirm Correct as Entered</button>
       </div>
     </div>` : `<div class="card" style="margin-bottom:10px">
       <strong>${esc(f.entity?.first_name)} ${esc(f.entity?.last_name)}</strong> (${esc(f.entity?.shul_name||'')}) may duplicate
@@ -955,13 +957,24 @@ function renderDupListOnly() {
 // A self-flag (see services/duplicates.js's detectOwnPhoneCollision) has no
 // second applicant to compare against — just confirms the two numbers
 // really are what was entered, same 'bypass' action the API already
-// supports, and clears the pause.
-window.resolvePhoneCollision = async (flagId) => {
+// supports, and clears the pause. Callable from either the plain
+// Duplicates list (#dup-list present) or the applicant's own profile
+// (applicantId passed, re-opens the profile so the cleared pause shows
+// immediately) — guarded so calling it from one doesn't error out looking
+// for the other's DOM.
+// Clicking a phone-collision entry in the plain Duplicates list opens the
+// applicant so an admin can actually edit the numbers, not just confirm
+// blindly. closeModal() first — same reason openMergeView does it before
+// its own modal transition (see its comment): without it, the Duplicates
+// list modal is left underneath, stacking backdrops.
+window.openApplicantFromDupFlag = (applicantId) => { closeModal(); openApplicant(applicantId); };
+window.resolvePhoneCollision = async (flagId, applicantId) => {
   try {
     await api(`/applicants/duplicates/${flagId}/resolve`, { method: 'POST', body: { action: 'bypass' } });
     toast('Confirmed — unpaused');
     dupFlagsCache = dupFlagsCache.filter(f => f.id !== flagId);
-    qs('#dup-list').innerHTML = renderDupListOnly();
+    if (qs('#dup-list')) qs('#dup-list').innerHTML = renderDupListOnly();
+    if (applicantId) openApplicant(applicantId);
     load();
   } catch (err) { toast(err.message, true); }
 };

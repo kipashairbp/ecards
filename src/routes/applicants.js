@@ -268,6 +268,25 @@ function providerIndexCache() {
   };
 }
 
+// Approval notice goes to the shul that submitted the applicant, never the
+// applicant themselves — the shul is the one managing this applicant's
+// status, and the applicant already hears from the shul directly. Skips a
+// locked system shul (e.g. Ezras Habayis' self-apply placeholder), which
+// has no real gabai to notify and no portal of its own. Best-effort, same
+// as every other side-effect on approval — a mail failure here must never
+// undo or block the approval itself. Shared by both the single /:id/approve
+// route and mass-approve so a batch approval notifies shuls exactly the
+// same way a one-off approval does.
+async function notifyShulOfApproval(orgId, applicant, sentBy) {
+  if (!applicant.shul_id) return null;
+  const shul = db.prepare('SELECT gabai_email, is_locked FROM shuls WHERE id = ?').get(applicant.shul_id);
+  if (!shul || shul.is_locked || !shul.gabai_email) return null;
+  const tmpl = renderSystemTemplate(orgId, 'applicantApproved', { name: `${applicant.first_name} ${applicant.last_name}` });
+  const { emailError } = await sendMailChecked(orgId, shul.gabai_email, tmpl.subject, tmpl.body, { replyTo: tmpl.replyTo, relatedEntityType: 'applicant', relatedEntityId: applicant.id, sentBy });
+  if (emailError) console.error('[mail] shul approval-notice email failed:', emailError);
+  return emailError;
+}
+
 // Season setting "require_shul_contribution": before an applicant can be
 // approved/carded, the shul must have confirmed how much they personally
 // gave the family, and that amount must meet the effective minimum bar
@@ -2026,12 +2045,7 @@ router.post('/:id/approve', requirePermission('applicants', 'can_edit'), async (
     // was loaded before the UPDATE above, so without this it would still be
     // handing ensureProviderAccount the PRE-approval amount.
     applicant.card_amount = amount;
-    let emailError = null;
-    if (applicant.email) {
-      const tmpl = renderSystemTemplate(req.user.org_id, 'applicantApproved', { name: `${applicant.first_name} ${applicant.last_name}` });
-      ({ emailError } = await sendMailChecked(req.user.org_id, applicant.email, tmpl.subject, tmpl.body, { replyTo: tmpl.replyTo, sentBy: req.user.id }));
-      if (emailError) console.error('[mail] applicant approval email failed:', emailError);
-    }
+    const emailError = await notifyShulOfApproval(req.user.org_id, applicant, req.user.id);
     // A merged-duplicate secondary (see services/duplicates.js's
     // mergeApplicants — confirmed the same real person as another shul's
     // applicant) never gets its own disccardpromos account/card, no matter
@@ -2274,6 +2288,7 @@ router.post('/mass-approve', requirePermission('applicants', 'can_edit'), async 
     // disccardpromos balance to, and this in-memory object was loaded
     // before the UPDATE above.
     applicant.card_amount = amount;
+    await notifyShulOfApproval(req.user.org_id, applicant, req.user.id);
     // Same best-effort account-write + fund-load as the single /:id/approve
     // route — see the comments there. A disccardpromos hiccup on one
     // applicant never stops the rest of the batch. A merged-duplicate
@@ -2769,15 +2784,24 @@ router.post('/:id/contact-admin', async (req, res) => {
   const isOwner = applicant.shul_id === req.user.shul_id;
   const hasSubmission = isOwner || db.prepare('SELECT 1 FROM applicant_submissions WHERE applicant_id = ? AND shul_id = ?').get(applicant.id, req.user.shul_id);
   if (!hasSubmission) return res.status(403).json({ error: 'Not your applicant' });
+  // A message is required — a bare "view this record" link with no actual
+  // question gave the admin nothing to act on, and the shul no way to
+  // explain what it actually needed.
+  const message = (req.body?.message || '').trim();
+  if (!message) return res.status(400).json({ error: 'Please write a message describing what you need.' });
   const adminEmail = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'email_reply_to'`).get(req.user.org_id)?.value;
   if (!adminEmail) return res.status(400).json({ error: 'No admin contact email is configured for this organization yet — ask your admin to set one under Settings > Organization.' });
-  const shul = db.prepare('SELECT name_en FROM shuls WHERE id = ?').get(req.user.shul_id);
+  const shul = db.prepare('SELECT name_en, gabai_email FROM shuls WHERE id = ?').get(req.user.shul_id);
   const link = `${process.env.APP_URL || ''}/admin/applicants?id=${applicant.id}`;
   const subject = `Locked applicant record — ${applicant.first_name} ${applicant.last_name}`.trim();
   const body = `<p>${escapeHtml(shul?.name_en || 'A shul')} is asking about a locked applicant record.</p>
     <p><strong>Applicant:</strong> ${escapeHtml(`${applicant.first_name} ${applicant.last_name}`.trim())}</p>
+    <p><strong>Message:</strong><br>${escapeHtml(message).replace(/\n/g, '<br>')}</p>
     <p><a href="${link}">View this applicant in the admin portal</a></p>`;
-  const { emailError } = await sendMailChecked(req.user.org_id, adminEmail, subject, body, { relatedEntityType: 'applicant', relatedEntityId: applicant.id, sentBy: null });
+  // Reply-To is the shul's own gabai email, not the org's default — a
+  // reply to this notice should go straight back to the shul that asked,
+  // not wherever the org's general support address happens to be.
+  const { emailError } = await sendMailChecked(req.user.org_id, adminEmail, subject, body, { replyTo: shul?.gabai_email || null, relatedEntityType: 'applicant', relatedEntityId: applicant.id, sentBy: null });
   res.json({ ok: !emailError, emailError });
 });
 
