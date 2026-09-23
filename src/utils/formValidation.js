@@ -68,6 +68,12 @@ export function validateBySchema(schema, values, { isAdmin = false } = {}) {
       errors.push(`${f.label || f.key} must be a valid phone number (10 digits, or 11 digits starting with 1)`);
     }
   }
+  // A home phone that's identical to, or barely off from, a husband/wife
+  // cell (likely the same real number retyped with a typo) is NOT rejected
+  // here — it's allowed through and instead flagged+paused as a duplicate,
+  // same as any other applicant duplicate. See services/duplicates.js's
+  // detectAndFlag/ownPhoneCollisionReason, which every creation path
+  // (manual add, mass upload, public apply, reenrollment) already calls.
   return errors;
 }
 

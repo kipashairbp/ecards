@@ -15,7 +15,12 @@ import { db } from '../db.js';
 // linked anything yet keeps behaving as before.
 export function resolveStoreId(orgId, storeName) {
   if (!storeName) return null;
-  const linked = db.prepare('SELECT store_id FROM store_provider_links WHERE org_id = ? AND vendor_name = ?').get(orgId, storeName);
+  // Case/whitespace-insensitive: disccardpromos doesn't always report the
+  // exact same vendor name string byte-for-byte between syncs (casing,
+  // stray leading/trailing spaces), and an exact match here silently left
+  // some of a linked store's own transactions unattributed forever — the
+  // store looked "not linking" even though a link genuinely existed.
+  const linked = db.prepare('SELECT store_id FROM store_provider_links WHERE org_id = ? AND LOWER(TRIM(vendor_name)) = LOWER(TRIM(?))').get(orgId, storeName);
   if (linked) return linked.store_id;
   const exact = db.prepare('SELECT id FROM stores WHERE org_id = ? AND LOWER(name) = LOWER(?)').get(orgId, storeName);
   if (exact) return exact.id;

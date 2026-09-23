@@ -1,6 +1,7 @@
 import { db, uuid } from '../db.js';
 import { captureApplicantSnapshot, hardDeleteApplicant, restoreApplicantSnapshot } from '../utils/entityDelete.js';
 import { scheduleProviderEnforceSoon } from './providerEnforce.js';
+import { phoneDigitDistance } from '../utils/phone.js';
 import * as giftcard from './giftcard.js';
 
 const norm = (s) => (s || '').toString().trim().toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -80,13 +81,31 @@ const fullAddress = (a) => norm([a.address, a.city, a.state, a.zip].filter(Boole
 // below can report "reasonsNow[0]" for plain creation-time checks (identical
 // behavior to before) while also being able to diff the full set against a
 // prior state for the continuous re-check case.
+const PHONE_FIELDS = ['home_phone', 'husband_cell', 'wife_cell'];
+const PHONE_FIELD_LABELS = { home_phone: 'home phone', husband_cell: 'husband cell', wife_cell: 'wife cell' };
 function matchReasons(a, aAddress, c) {
   const reasons = [];
   const sameName = norm(a.first_name) && norm(a.last_name) && norm(c.first_name) === norm(a.first_name) && norm(c.last_name) === norm(a.last_name);
   if (sameName) reasons.push('Same first and last name');
-  if (a.home_phone && norm(c.home_phone) === norm(a.home_phone)) reasons.push('Same home phone number');
-  if (a.husband_cell && norm(c.husband_cell) === norm(a.husband_cell)) reasons.push('Same husband cell number');
-  if (a.wife_cell && norm(c.wife_cell) === norm(a.wife_cell)) reasons.push('Same wife cell number');
+  // Cross-field phone match: check every phone field on `a` against every
+  // phone field on `c`, not just the same field on both sides — the same
+  // real-world number can legitimately land in a different field on a
+  // second submission (e.g. entered as a home phone here, a cell there),
+  // and that's still the exact same duplicate signal. Same-field matches
+  // keep their original wording (so previously-bypassed reasons still
+  // dismiss correctly); a genuine cross-field match gets its own message.
+  const seen = new Set();
+  for (const fA of PHONE_FIELDS) {
+    if (!a[fA]) continue;
+    for (const fC of PHONE_FIELDS) {
+      if (!c[fC] || norm(c[fC]) !== norm(a[fA])) continue;
+      const reason = fA === fC ? `Same ${PHONE_FIELD_LABELS[fA]} number`
+        : `Phone number match: this record's ${PHONE_FIELD_LABELS[fA]} = candidate's ${PHONE_FIELD_LABELS[fC]}`;
+      if (seen.has(reason)) continue;
+      seen.add(reason);
+      reasons.push(reason);
+    }
+  }
   if (a.email && norm(c.email) === norm(a.email)) reasons.push('Same email address');
   if (a.address && aAddress === fullAddress(c)) reasons.push('Same address');
   return reasons;
@@ -169,6 +188,60 @@ function checkAgainst(applicant, candidates, previousApplicant) {
   return null;
 }
 
+// An applicant's OWN home phone matching (or nearly matching — identical,
+// or off by only 1-2 of the 10 digits) their OWN husband/wife cell — almost
+// always the same real number retyped with a typo, not two different lines
+// the household actually has. Returns a plain-English reason, or null.
+function ownPhoneCollisionReason(a) {
+  if (!a.home_phone) return null;
+  for (const [key, label] of [['husband_cell', 'Husband Cell'], ['wife_cell', 'Wife Cell']]) {
+    if (!a[key]) continue;
+    const dist = phoneDigitDistance(a.home_phone, a[key]);
+    if (dist === Infinity) continue;
+    if (dist === 0) return `Home Phone and ${label} are the same number`;
+    if (dist <= 2) return `Home Phone and ${label} are nearly identical (differ by only ${dist} digit${dist > 1 ? 's' : ''})`;
+  }
+  return null;
+}
+
+// Flags (and pauses) an applicant against ITSELF — entity_id and
+// matched_entity_id both point at the same row — when its own home phone
+// collides with its own cell number (see ownPhoneCollisionReason). Handled
+// through the exact same duplicate_flags/is_paused machinery as an
+// applicant-vs-applicant duplicate (so it shows up in the same Duplicates
+// queue, "make it like a duplicate" per spec) except there's no second
+// person to merge with — resolveFlag has a dedicated branch for that.
+// Self-contained: called from detectAndFlag below AND the recheck-all
+// sweep, covers new creates, edits (including mass-upload), and also
+// auto-clears an open self-flag the moment the data no longer collides.
+function detectOwnPhoneCollision(orgId, applicant) {
+  const reason = ownPhoneCollisionReason(applicant);
+  const openSelf = db.prepare(`SELECT * FROM duplicate_flags WHERE org_id = ? AND entity_type = 'applicant' AND status = 'open' AND entity_id = ? AND matched_entity_id = ?`)
+    .get(orgId, applicant.id, applicant.id);
+  if (!reason) {
+    if (openSelf) {
+      db.prepare(`UPDATE duplicate_flags SET status = 'resolved', resolved_at = datetime('now') WHERE id = ?`).run(openSelf.id);
+      unpauseIfNoLongerFlagged('applicant', [applicant.id]);
+    }
+    return null;
+  }
+  if (openSelf) {
+    if (openSelf.reason !== reason) db.prepare(`UPDATE duplicate_flags SET reason = ? WHERE id = ?`).run(reason, openSelf.id);
+    return db.prepare('SELECT * FROM duplicate_flags WHERE id = ?').get(openSelf.id);
+  }
+  // Already confirmed once as correct-as-entered for this exact collision —
+  // don't re-flag (and re-pause) the same thing an admin already resolved.
+  const alreadyBypassed = db.prepare(`SELECT 1 FROM duplicate_flags WHERE org_id = ? AND entity_type = 'applicant' AND status = 'bypassed' AND entity_id = ? AND matched_entity_id = ? AND reason = ?`)
+    .get(orgId, applicant.id, applicant.id, reason);
+  if (alreadyBypassed) return null;
+  const id = uuid();
+  db.prepare(`INSERT INTO duplicate_flags (id, org_id, entity_type, entity_id, matched_entity_id, reason, status) VALUES (?,?,?,?,?,?,'open')`)
+    .run(id, orgId, 'applicant', applicant.id, applicant.id, reason);
+  db.prepare(`UPDATE applicants SET duplicate_status = 'flagged' WHERE id = ?`).run(applicant.id);
+  pauseAccountsFor('applicant', applicant.id, applicant.id);
+  return db.prepare('SELECT * FROM duplicate_flags WHERE id = ?').get(id);
+}
+
 // Runs the appropriate check, and if found: flags it, pauses both accounts, returns the flag row.
 // If not found: returns null and leaves the record active. excludeIds (shul only,
 // see checkShulDuplicate) lets a caller rule out a record known to be the same
@@ -177,8 +250,17 @@ function checkAgainst(applicant, candidates, previousApplicant) {
 // checkApplicantDuplicate's matching comment — passed by callers that
 // re-check on every edit rather than just at first-time creation.
 export function detectAndFlag(orgId, entityType, entity, excludeIds = [], previousEntity) {
+  // Own-phone-collision is independent of, and checked before, the normal
+  // cross-applicant match below — a record can have either problem, both,
+  // or neither. Every caller of detectAndFlag (create, edit, mass-upload,
+  // reenrollment) gets this for free with no changes on their end; the
+  // truthy return only matters for "was something new flagged just now"
+  // (dupes counters, duplicate:true in create responses), so when the
+  // cross-applicant check below also finds something, that takes priority
+  // as the returned value — the self-flag has still been raised either way.
+  const selfFlag = entityType === 'applicant' ? detectOwnPhoneCollision(orgId, entity) : null;
   const match = entityType === 'shul' ? checkShulDuplicate(orgId, entity, excludeIds) : checkApplicantDuplicate(orgId, entity, previousEntity);
-  if (!match) return null;
+  if (!match) return selfFlag;
   // Never stack a second open flag on the same pair — an edit that
   // introduces one newly-matching field on top of an already-open flag
   // (from an earlier, different reason) doesn't need its own separate row;
@@ -315,8 +397,12 @@ export function recheckAllApplicantDuplicates(orgId, seasonId) {
     : db.prepare(`SELECT * FROM applicants WHERE org_id = ? AND approval_status NOT IN ('draft', 'incomplete') AND is_paused = 0`).all(orgId);
   const bySeasonAndOrg = new Map();
   for (const r of rows) { const k = r.season_id; if (!bySeasonAndOrg.has(k)) bySeasonAndOrg.set(k, db.prepare(`SELECT * FROM applicants WHERE org_id = ? AND season_id = ? AND approval_status NOT IN ('draft', 'incomplete')`).all(orgId, k)); }
-  let flagged = 0;
+  let flagged = 0, phoneCollisions = 0;
   for (const a of rows) {
+    // Own-phone-collision, same as detectAndFlag — catches data that
+    // predates this feature (or was mass-uploaded before this sweep ran)
+    // without needing a fresh edit to trigger it.
+    if (detectOwnPhoneCollision(orgId, a)) phoneCollisions++;
     const candidates = bySeasonAndOrg.get(a.season_id).filter(c => c.id !== a.id);
     const match = checkAgainst(a, candidates, null);
     if (!match) continue;
@@ -329,7 +415,7 @@ export function recheckAllApplicantDuplicates(orgId, seasonId) {
     pauseAccountsFor('applicant', a.id, match.matchedId);
     flagged++;
   }
-  return { cleared, staleCleared, unpaused, checked: rows.length, flagged };
+  return { cleared, staleCleared, unpaused, checked: rows.length, flagged, phoneCollisions };
 }
 
 // Which fields count as "a phone number" for the never-bypass-if-matched
@@ -337,7 +423,6 @@ export function recheckAllApplicantDuplicates(orgId, seasonId) {
 // matching the OTHER side's home phone (not just the same field) still
 // counts; only an actual phone-to-phone match blocks bypass, never an
 // address/name coincidence.
-const PHONE_FIELDS = ['home_phone', 'husband_cell', 'wife_cell'];
 function phoneSet(a) { return new Set(PHONE_FIELDS.map(f => norm(a[f])).filter(Boolean)); }
 export function applicantsSharePhone(a, b) {
   const setA = phoneSet(a);
@@ -383,6 +468,23 @@ export function resolveFlag(flagId, resolvedByUserId, action) {
     flagBefore: { status: flag.status, resolved_by: flag.resolved_by, resolved_at: flag.resolved_at },
     entityA, entityB, usersBefore,
   };
+
+  // Self-referential flag (an applicant's own home phone vs. cell phone
+  // collision — see detectOwnPhoneCollision — not a match against a
+  // DIFFERENT applicant). entity_id === matched_entity_id here, so the
+  // normal applicant branch below would wrongly refuse this: applicantsSharePhone
+  // of a record against itself is trivially always true, and there's no
+  // second person to merge with anyway. Bypassing just confirms the numbers
+  // really are what was entered and clears the pause.
+  if (flag.entity_type === 'applicant' && flag.entity_id === flag.matched_entity_id) {
+    if (action !== 'bypass') throw new Error('This can only be confirmed as correct — there\'s no second applicant to merge with');
+    db.prepare(`UPDATE duplicate_flags SET status = 'bypassed', resolved_by = ?, resolved_at = datetime('now'), bypassed_reasons = ? WHERE id = ?`)
+      .run(resolvedByUserId, JSON.stringify([flag.reason]), flagId);
+    unpauseIfNoLongerFlagged('applicant', [flag.entity_id]);
+    if (entityA) db.prepare(`UPDATE applicants SET duplicate_status = 'bypassed' WHERE id = ?`).run(flag.entity_id);
+    scheduleProviderEnforceSoon(flag.org_id, 'phone-collision flag confirmed correct');
+    return { flag: db.prepare('SELECT * FROM duplicate_flags WHERE id = ?').get(flagId), undoSnapshot };
+  }
 
   if (flag.entity_type === 'applicant') {
     if (action !== 'bypass') throw new Error('Applicant duplicates can only be bypassed here — resolving one as the same person is done through the merge action instead');

@@ -217,15 +217,23 @@ router.get('/ids', (req, res) => {
 // be registered before /:id.
 router.get('/provider-vendors', requirePermission('stores', 'can_view'), (req, res) => {
   const orgId = req.user.org_id;
-  const rows = db.prepare(`SELECT t.store_name AS vendor_name, COUNT(*) txn_count,
+  // Grouped case/whitespace-insensitively — disccardpromos doesn't always
+  // send the exact same vendor name string for the same real store (stray
+  // spaces, inconsistent casing across syncs), which used to split one
+  // store's history across multiple "different" rows here: linking just
+  // one of them backfilled only that variant's transactions, so the
+  // store's total looked wrong/missing even after linking. MIN() picks one
+  // consistent representative string to display and to send back as
+  // vendor_name when linking.
+  const rows = db.prepare(`SELECT MIN(TRIM(t.store_name)) AS vendor_name, COUNT(*) txn_count,
       COALESCE(SUM(CASE WHEN t.type='refund' THEN -t.amount WHEN t.amount < 0 THEN -t.amount ELSE 0 END),0) total_spend
     FROM card_transactions t JOIN cards c ON c.id = t.card_id
     WHERE c.org_id = ? AND t.store_name IS NOT NULL AND t.store_name != ''
-    GROUP BY t.store_name ORDER BY t.store_name COLLATE NOCASE`).all(orgId);
+    GROUP BY LOWER(TRIM(t.store_name)) ORDER BY vendor_name COLLATE NOCASE`).all(orgId);
   const links = db.prepare(`SELECT l.vendor_name, l.store_id, s.name AS store_name FROM store_provider_links l JOIN stores s ON s.id = l.store_id WHERE l.org_id = ?`).all(orgId);
-  const linkByVendor = new Map(links.map(l => [l.vendor_name.toLowerCase(), l]));
+  const linkByVendor = new Map(links.map(l => [l.vendor_name.trim().toLowerCase(), l]));
   res.json({ vendors: rows.map(r => {
-    const link = linkByVendor.get(r.vendor_name.toLowerCase());
+    const link = linkByVendor.get(r.vendor_name.trim().toLowerCase());
     return { ...r, linkedStoreId: link?.store_id || null, linkedStoreName: link?.store_name || null };
   }) });
 });
@@ -274,18 +282,25 @@ router.post('/:id/provider-links', requirePermission('stores', 'can_edit'), (req
   if (!store) return res.status(404).json({ error: 'Not found' });
   const vendorName = (req.body?.vendor_name || '').trim();
   if (!vendorName) return res.status(400).json({ error: 'vendor_name is required' });
-  const existing = db.prepare(`SELECT l.*, s.name AS store_name FROM store_provider_links l JOIN stores s ON s.id = l.store_id WHERE l.org_id = ? AND l.vendor_name = ?`).get(req.user.org_id, vendorName);
+  // Case/whitespace-insensitive (see storeMatch.js's resolveStoreId) so
+  // "already linked to a different store" actually catches a near-duplicate
+  // spelling instead of letting the same real vendor get linked twice under
+  // two different casings/spacings.
+  const existing = db.prepare(`SELECT l.*, s.name AS store_name FROM store_provider_links l JOIN stores s ON s.id = l.store_id WHERE l.org_id = ? AND LOWER(TRIM(l.vendor_name)) = LOWER(TRIM(?))`).get(req.user.org_id, vendorName);
   if (existing && existing.store_id !== store.id) return res.status(409).json({ error: `"${vendorName}" is already linked to ${existing.store_name}` });
   if (!existing) {
     db.prepare(`INSERT INTO store_provider_links (id, org_id, store_id, vendor_name) VALUES (?,?,?,?)`).run(uuid(), req.user.org_id, store.id, vendorName);
     logAudit(req.user.org_id, req.user.id, 'link-provider-vendor', 'store', store.id, null, { vendor_name: vendorName }, req.ip);
   }
-  // Backfill: every already-synced transaction under this exact vendor name
-  // now counts toward this store, retroactively — not just new ones from
-  // the next sync. Re-points it even if a past fuzzy-name match had already
-  // (possibly wrongly) attributed it elsewhere; an explicit link always wins.
+  // Backfill: every already-synced transaction under this vendor name (case/
+  // whitespace variants included — see cardSync.js/storeMatch.js, the same
+  // real vendor doesn't always come back byte-for-byte identical from
+  // disccardpromos) now counts toward this store, retroactively — not just
+  // new ones from the next sync. Re-points it even if a past fuzzy-name
+  // match had already (possibly wrongly) attributed it elsewhere; an
+  // explicit link always wins.
   const backfilled = db.prepare(`UPDATE card_transactions SET store_id = ?
-    WHERE store_name = ? AND card_id IN (SELECT id FROM cards WHERE org_id = ?) AND (store_id IS NULL OR store_id != ?)`)
+    WHERE LOWER(TRIM(store_name)) = LOWER(TRIM(?)) AND card_id IN (SELECT id FROM cards WHERE org_id = ?) AND (store_id IS NULL OR store_id != ?)`)
     .run(store.id, vendorName, req.user.org_id, store.id).changes;
   res.json({ ok: true, backfilled });
 });
@@ -300,7 +315,7 @@ router.delete('/:id/provider-links/:linkId', requirePermission('stores', 'can_ed
   // than leaving them silently pointed at a store nothing here says they
   // belong to anymore — they go back to showing as unmatched, same as
   // before the link ever existed, until re-linked or fuzzy-matched.
-  const unlinked = db.prepare(`UPDATE card_transactions SET store_id = NULL WHERE store_name = ? AND store_id = ?`).run(link.vendor_name, store.id).changes;
+  const unlinked = db.prepare(`UPDATE card_transactions SET store_id = NULL WHERE LOWER(TRIM(store_name)) = LOWER(TRIM(?)) AND store_id = ?`).run(link.vendor_name, store.id).changes;
   logAudit(req.user.org_id, req.user.id, 'unlink-provider-vendor', 'store', store.id, { vendor_name: link.vendor_name }, null, req.ip);
   res.json({ ok: true, unlinked });
 });

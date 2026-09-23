@@ -1588,7 +1588,12 @@ router.post('/', requirePermission('applicants', 'can_edit'), (req, res) => {
   const applicant = db.prepare('SELECT * FROM applicants WHERE id = ?').get(id);
   const flag = detectAndFlag(req.user.org_id, 'applicant', applicant);
   logAudit(req.user.org_id, req.user.id, 'create', 'applicant', id, null, applicant, req.ip);
-  res.status(201).json({ applicant: maskForShul(applicant, req.user.role), duplicate: req.user.role === 'shul' ? false : !!flag });
+  // Re-fetch: detectAndFlag may have just paused this exact row (a same-
+  // record phone collision, or a cross-applicant match) — the `applicant`
+  // object above was read before that write and would otherwise report a
+  // stale is_paused=0 on a row that's actually paused as of this response.
+  const final = flag ? db.prepare('SELECT * FROM applicants WHERE id = ?').get(id) : applicant;
+  res.status(201).json({ applicant: maskForShul(final, req.user.role), duplicate: req.user.role === 'shul' ? false : !!flag });
 });
 
 router.put('/:id', requirePermission('applicants', 'can_edit'), async (req, res) => {
@@ -2690,8 +2695,12 @@ router.get('/duplicates/:flagId/group', requireAdmin, (req, res) => {
   // that are only transitively related through a third have nothing to
   // bypass — see mergeApplicants/getMergeGroupIds in services/duplicates.js).
   const placeholders = ids.map(() => '?').join(',');
+  // entity_id != matched_entity_id excludes a member's own phone-collision
+  // self-flag (see services/duplicates.js's detectOwnPhoneCollision) —
+  // that's a one-applicant data-quality issue, not a connection between two
+  // members of this group, and has no place in cross-applicant merge logic.
   const flags = db.prepare(`SELECT * FROM duplicate_flags WHERE org_id = ? AND entity_type='applicant' AND status='open'
-    AND entity_id IN (${placeholders}) AND matched_entity_id IN (${placeholders})`).all(req.user.org_id, ...ids, ...ids);
+    AND entity_id IN (${placeholders}) AND matched_entity_id IN (${placeholders}) AND entity_id != matched_entity_id`).all(req.user.org_id, ...ids, ...ids);
   res.json({ flag, members, flags, sharesPhone: !!(e && m && applicantsSharePhone(e, m)) });
 });
 

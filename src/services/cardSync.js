@@ -250,7 +250,12 @@ export async function syncApplicantCards(orgId, applicant, index) {
         console.error(`[cardSync] transaction ${t.id ?? t.transaction_id ?? '(no id)'} on customer ${customer.id ?? applicant.external_id} doesn't match any known shape (missing amount and/or date) — raw entry: ${JSON.stringify(t)}`);
         continue;
       }
-      const storeName = t.vendor || t.store_name || t.merchant || '';
+      // Trimmed — disccardpromos has sent the same real vendor with stray
+      // leading/trailing whitespace on some transactions and not others,
+      // which used to split one store's history into multiple "different"
+      // vendor names (see storeMatch.js's now case/whitespace-insensitive
+      // resolveStoreId, and routes/stores.js's provider-vendors grouping).
+      const storeName = (t.vendor || t.store_name || t.merchant || '').trim();
       // Stringified explicitly — the real id is a bare JSON number (320972),
       // and binding a raw JS integer into this TEXT column lets SQLite coerce
       // it through REAL first, silently storing "320972.0" instead (the same

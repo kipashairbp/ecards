@@ -16,7 +16,7 @@ renderShell('/admin/cards', `
   <div class="flex-between"><h2>Cards & Transactions</h2><div class="pill-row"><button class="btn btn-outline btn-sm" id="btn-sync-all">Sync All Now</button><button class="btn btn-outline btn-sm" id="btn-reconcile" title="Break down why Total spent may differ from disccardpromos' own number">Reconcile</button><button class="btn btn-outline btn-sm" id="btn-export-cards">Export Cards CSV</button><button class="btn btn-outline btn-sm" id="btn-export-txns">Export Transactions CSV</button></div></div>
   <p class="small-muted">Cards auto-sync with disccardpromos every 15 minutes in the background. Use Sync All Now for an immediate refresh.</p>
   <div id="mock-banner"></div>
-  <div class="tabs"><button class="active" id="tab-cards-btn">Cards</button><button id="tab-txns-btn">All Transactions</button><button id="tab-byshul-btn">Spent by Shul</button></div>
+  <div class="tabs"><button class="active" id="tab-cards-btn">Cards</button><button id="tab-txns-btn">All Transactions</button><button id="tab-byshul-btn">Spent by Shul</button><button id="tab-bystore-btn">Spent by Store</button></div>
   <div id="panel-cards">
     <div class="toolbar"><input id="f-search" placeholder="Search applicant name or card number…"><select id="f-status"><option value="">All statuses</option><option value="unassigned">Unassigned</option><option value="activated">Activated</option><option value="deactivated">Deactivated</option></select><select id="f-pagesize"><option value="25">25 / page</option><option value="50">50 / page</option><option value="100">100 / page</option><option value="200">200 / page</option></select></div>
     <div class="card" style="padding:0;overflow-x:auto">
@@ -26,6 +26,7 @@ renderShell('/admin/cards', `
     <div class="paginator" id="pager-cards"></div>
   </div>
   <div id="panel-txns" style="display:none">
+    <div class="toolbar"><select id="f-txn-store"><option value="">All stores</option></select></div>
     <div class="card" style="padding:0;overflow-x:auto">
       <table><thead><tr><th>Date</th><th>Applicant</th><th>Card #</th><th>Type</th><th>Amount</th><th>Store</th></tr></thead>
       <tbody id="tbody-txns"><tr><td colspan="6" class="empty-state">Loading…</td></tr></tbody></table>
@@ -39,20 +40,46 @@ renderShell('/admin/cards', `
       <tbody id="tbody-byshul"><tr><td colspan="5" class="empty-state">Loading…</td></tr></tbody></table>
     </div>
   </div>
+  <div id="panel-bystore" style="display:none">
+    <p class="small-muted">Purchases and refunds recorded against each participating store, from disccardpromos transactions linked to it (Stores &gt; a store's own profile &gt; Linked disccardpromos store name(s)). A store showing 0 here either has no linked disccardpromos vendor name yet, or genuinely no spend synced so far.</p>
+    <div class="card" style="padding:0;overflow-x:auto">
+      <table><thead><tr><th>Store</th><th>Transactions</th><th>Purchases</th><th>Refunds</th><th></th></tr></thead>
+      <tbody id="tbody-bystore"><tr><td colspan="5" class="empty-state">Loading…</td></tr></tbody></table>
+    </div>
+  </div>
 `);
 
 let state = { search:'', status:'', page:1, pageSize:Auth.pageSize('cards') };
 let txnPage = 1;
+let txnStoreFilter = '';
 
-const cardsTabs = ['cards', 'txns', 'byshul'];
+const cardsTabs = ['cards', 'txns', 'byshul', 'bystore'];
 function showCardsTab(name) {
   cardsTabs.forEach(t => { qs('#tab-'+t+'-btn').classList.toggle('active', t === name); qs('#panel-'+t).style.display = t === name ? 'block' : 'none'; });
   if (name === 'txns') loadTxns();
   if (name === 'byshul') loadByShul();
+  if (name === 'bystore') loadByStore();
 }
 qs('#tab-cards-btn').addEventListener('click', () => showCardsTab('cards'));
 qs('#tab-txns-btn').addEventListener('click', () => showCardsTab('txns'));
 qs('#tab-byshul-btn').addEventListener('click', () => showCardsTab('byshul'));
+qs('#tab-bystore-btn').addEventListener('click', () => showCardsTab('bystore'));
+qs('#f-txn-store').addEventListener('change', () => { txnStoreFilter = qs('#f-txn-store').value; txnPage = 1; loadTxns(); });
+// Populated once, up front, from /cards/by-store (not /stores — this page
+// only requires the 'cards' permission, and a narrower admin role might not
+// also have 'stores') so the filter dropdown is ready the first time the
+// Transactions tab (or a "View Transactions" jump from Spent by Store) is
+// opened, not just after that tab's own first load.
+api('/cards/by-store').then(({ stores }) => {
+  qs('#f-txn-store').insertAdjacentHTML('beforeend', stores.map(s => `<option value="${s.store_id}">${esc(s.store_name)}</option>`).join(''));
+}).catch(() => {});
+// Jumps to the All Transactions tab pre-filtered to one store — used by the
+// "View Transactions" button on each Spent by Store row.
+window.viewStoreTransactions = (storeId) => {
+  txnStoreFilter = storeId; txnPage = 1;
+  showCardsTab('txns');
+  qs('#f-txn-store').value = storeId;
+};
 qs('#btn-export-cards').addEventListener('click', () => downloadAuthed('/cards/export?' + new URLSearchParams({ search: state.search, status: state.status }), 'cards.xlsx'));
 qs('#btn-sync-all').addEventListener('click', async () => {
   const btn = qs('#btn-sync-all'); btn.disabled = true; btn.textContent = 'Syncing…';
@@ -105,13 +132,17 @@ qs('#f-pagesize').value = state.pageSize;
 qs('#f-pagesize').addEventListener('change', () => { state.pageSize = +qs('#f-pagesize').value; state.page = 1; Auth.savePageSize('cards', state.pageSize); loadCards(); });
 function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
 
+function changeTxnPage(d) { txnPage += d; loadTxns(); }
 async function loadTxns() {
   try {
-    const { transactions, total } = await api('/cards/transactions/all?page=' + txnPage);
+    const params = new URLSearchParams({ page: txnPage, ...(txnStoreFilter ? { store_id: txnStoreFilter } : {}) });
+    const { transactions, total, pageSize } = await api('/cards/transactions/all?' + params);
     qs('#tbody-txns').innerHTML = transactions.length ? transactions.map(t => `<tr>
         <td>${fmtDateTime(t.occurred_at)}</td><td>${esc(t.first_name||'')} ${esc(t.last_name||'')}</td><td>${esc(t.card_number_masked||'')}</td>
         <td>${badge(t.type,t.type)}</td><td>${fmtMoney(t.amount)}</td><td>${esc(t.store_name||'')}</td>
       </tr>`).join('') : '<tr><td colspan="6" class="empty-state">No transactions yet.</td></tr>';
+    const pages = Math.max(1, Math.ceil(total / (pageSize || 100)));
+    qs('#pager-txns').innerHTML = `<button class="btn btn-sm btn-outline" ${txnPage<=1?'disabled':''} onclick="changeTxnPage(-1)">Prev</button> Page ${txnPage} of ${pages} <button class="btn btn-sm btn-outline" ${txnPage>=pages?'disabled':''} onclick="changeTxnPage(1)">Next</button>`;
   } catch (err) { toast(err.message, true); }
 }
 
@@ -139,6 +170,16 @@ async function loadByShul() {
         <td>Total (${shuls.length} shul${shuls.length===1?'':'s'})</td><td>${fmtMoney(totalAllocated)}</td><td>${fmtMoney(totalSpent)}</td><td>${fmtMoney(totalRemaining)}</td><td></td>
       </tr>` : '';
     qs('#tbody-byshul').innerHTML = shuls.length ? rows + totalRow : '<tr><td colspan="5" class="empty-state">No cards loaded yet.</td></tr>';
+  } catch (err) { toast(err.message, true); }
+}
+
+async function loadByStore() {
+  try {
+    const { stores } = await api('/cards/by-store');
+    qs('#tbody-bystore').innerHTML = stores.length ? stores.map(s => `<tr>
+        <td>${esc(s.store_name)}</td><td>${s.txn_count}</td><td>${fmtMoney(s.total_purchases)}</td><td>${fmtMoney(s.total_refunds)}</td>
+        <td><button class="btn btn-sm btn-outline" onclick="viewStoreTransactions('${s.store_id}')">View Transactions</button></td>
+      </tr>`).join('') : '<tr><td colspan="5" class="empty-state">No stores yet.</td></tr>';
   } catch (err) { toast(err.message, true); }
 }
 

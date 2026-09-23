@@ -937,7 +937,13 @@ function renderDupListOnly() {
     ? dupFlagsCache.filter(f => [f.entity?.first_name, f.entity?.last_name, f.entity?.shul_name, f.matched?.first_name, f.matched?.last_name, f.matched?.shul_name, f.reason]
         .some(v => (v || '').toLowerCase().includes(term)))
     : dupFlagsCache;
-  return flags.length ? flags.map(f => `<div class="card" style="margin-bottom:10px">
+  return flags.length ? flags.map(f => f.entity_id === f.matched_entity_id ? `<div class="card" style="margin-bottom:10px">
+      <strong>${esc(f.entity?.first_name)} ${esc(f.entity?.last_name)}</strong> (${esc(f.entity?.shul_name||'')}) — own phone numbers look like a duplicate<br>
+      <span class="small-muted">Reason: ${esc(f.reason)}</span>
+      <div style="margin-top:10px">
+        <button class="btn btn-sm btn-primary" onclick="resolvePhoneCollision('${f.id}')">Confirm Correct as Entered</button>
+      </div>
+    </div>` : `<div class="card" style="margin-bottom:10px">
       <strong>${esc(f.entity?.first_name)} ${esc(f.entity?.last_name)}</strong> (${esc(f.entity?.shul_name||'')}) may duplicate
       <strong>${esc(f.matched?.first_name)} ${esc(f.matched?.last_name)}</strong> (${esc(f.matched?.shul_name||'')})<br>
       <span class="small-muted">Reason: ${esc(f.reason)}</span>
@@ -946,6 +952,19 @@ function renderDupListOnly() {
       </div>
     </div>`).join('') : `<p class="small-muted">${dupFlagsCache.length ? 'No flags match your search.' : 'No open duplicate flags.'}</p>`;
 }
+// A self-flag (see services/duplicates.js's detectOwnPhoneCollision) has no
+// second applicant to compare against — just confirms the two numbers
+// really are what was entered, same 'bypass' action the API already
+// supports, and clears the pause.
+window.resolvePhoneCollision = async (flagId) => {
+  try {
+    await api(`/applicants/duplicates/${flagId}/resolve`, { method: 'POST', body: { action: 'bypass' } });
+    toast('Confirmed — unpaused');
+    dupFlagsCache = dupFlagsCache.filter(f => f.id !== flagId);
+    qs('#dup-list').innerHTML = renderDupListOnly();
+    load();
+  } catch (err) { toast(err.message, true); }
+};
 
 // ============================= Rejection Appeals =============================
 // A shul asked "why was this rejected" (one click from their own portal —

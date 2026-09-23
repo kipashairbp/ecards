@@ -89,6 +89,22 @@ router.get('/by-shul', (req, res) => {
   res.json({ shuls: rows.map(r => ({ ...r, remaining: r.allocated - r.spent })) });
 });
 
+// Same idea as /by-shul above, but for stores — "see transactions per
+// store" needs an at-a-glance list, not just the per-store total buried in
+// each store's own profile popup one at a time. Kept here (not routes/
+// stores.js) so it's gated by this router's own 'cards' permission rather
+// than requiring 'stores' too. txn_count included so a $0/no-history row is
+// obviously "nothing synced here yet" rather than "linked but broken."
+router.get('/by-store', (req, res) => {
+  const rows = db.prepare(`SELECT s.id AS store_id, s.name AS store_name, COUNT(t.id) txn_count,
+      COALESCE(SUM(CASE WHEN t.type='refund' THEN -t.amount WHEN t.amount < 0 THEN -t.amount ELSE 0 END),0) total_purchases,
+      COALESCE(SUM(CASE WHEN t.type='refund' THEN t.amount ELSE 0 END),0) total_refunds
+    FROM stores s LEFT JOIN card_transactions t ON t.store_id = s.id
+    WHERE s.org_id = ?
+    GROUP BY s.id ORDER BY total_purchases DESC`).all(req.user.org_id);
+  res.json({ stores: rows });
+});
+
 router.get('/:id', (req, res) => {
   const card = db.prepare(`SELECT c.*, a.first_name, a.last_name, a.husband_cell, a.wife_cell, a.home_phone
     FROM cards c LEFT JOIN applicants a ON a.id=c.applicant_id WHERE c.id = ? AND c.org_id = ?`).get(req.params.id, req.user.org_id);

@@ -27,3 +27,17 @@ export function isValidPhone(raw) {
   const digits = str.replace(/\D/g, '');
   return digits.length === 10 || (digits.length === 11 && digits.startsWith('1'));
 }
+
+// Last-10-digit, position-by-position difference count between two phone
+// numbers — used to catch a home phone and a cell number that are the same
+// real line retyped with a typo (identical, or off by only 1-2 digits),
+// as opposed to two genuinely different numbers. Infinity if either side
+// doesn't have exactly 10 digits to compare.
+export function phoneDigitDistance(a, b) {
+  const da = String(a || '').replace(/\D/g, '').slice(-10);
+  const db_ = String(b || '').replace(/\D/g, '').slice(-10);
+  if (da.length !== 10 || db_.length !== 10) return Infinity;
+  let diff = 0;
+  for (let i = 0; i < 10; i++) if (da[i] !== db_[i]) diff++;
+  return diff;
+}

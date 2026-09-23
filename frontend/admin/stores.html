@@ -237,7 +237,7 @@ async function openStore(id) {
         ? `<p class="small-muted"><strong>Agreement:</strong> ${badge('signed','active')} Signed ${fmtDateTime(latestAgreement.signed_at)} by ${esc(latestAgreement.signer_name||'')}</p>`
         : `<p class="small-muted"><strong>Agreement:</strong> ${badge(latestAgreement.status,'pending')} Sent ${fmtDateTime(latestAgreement.sent_at)}, awaiting signature — <button type="button" class="btn btn-sm btn-outline" onclick="sendStoreContractQuick('${id}')">Resend</button></p>`;
     const body = `
-      <div class="tabs" id="stabs"><button class="active" data-t="info">Info</button><button data-t="billing">Billing (${submittedBills.length})</button><button data-t="documents">Documents</button><button data-t="history">History</button></div>
+      <div class="tabs" id="stabs"><button class="active" data-t="info">Info</button><button data-t="billing">Billing (${submittedBills.length})</button><button data-t="transactions">Transactions${transactionTotals.count !== undefined ? ` (${transactionTotals.count})` : ''}</button><button data-t="documents">Documents</button><button data-t="history">History</button></div>
       <div id="stab-info">
         <div class="grid-2">
           <div><label>Store Name</label><input id="e-name" value="${esc(s.name)}"></div>
@@ -294,6 +294,13 @@ async function openStore(id) {
             </div>
           </div>`).join('') : '<p class="small-muted">No bills submitted yet.</p>'}</div>
       </div>
+      <div id="stab-transactions" style="display:none">
+        <div class="card" style="padding:0;overflow-x:auto">
+          <table><thead><tr><th>Date</th><th>Applicant</th><th>Card #</th><th>Type</th><th>Amount</th></tr></thead>
+          <tbody id="stab-transactions-list"><tr><td colspan="5" class="empty-state">Loading…</td></tr></tbody></table>
+        </div>
+        <div class="paginator" id="stab-transactions-pager"></div>
+      </div>
       <div id="stab-documents" style="display:none">
         <div id="stab-documents-list"><p class="small-muted">Loading…</p></div>
       </div>
@@ -305,7 +312,8 @@ async function openStore(id) {
     openModal(s.name, body, footer);
     qsa('#stabs button').forEach(b => b.addEventListener('click', () => {
       qsa('#stabs button').forEach(x => x.classList.remove('active')); b.classList.add('active');
-      ['info','billing','documents','history'].forEach(t => qs('#stab-'+t).style.display = t === b.dataset.t ? 'block' : 'none');
+      ['info','billing','transactions','documents','history'].forEach(t => qs('#stab-'+t).style.display = t === b.dataset.t ? 'block' : 'none');
+      if (b.dataset.t === 'transactions') loadStoreTransactionsTab(id);
     }));
     loadDocumentsTab('store', id, 'stab-documents-list', s.owner_email || s.manager_email || '', [
       { label: 'Owner', email: s.owner_email }, { label: 'Manager', email: s.manager_email },
@@ -339,6 +347,19 @@ window.unlinkStoreVendor = async (id, linkId) => {
     toast('Unlinked'); openStore(id); load();
   } catch (err) { toast(err.message, true); }
 };
+let storeTxnPage = 1;
+async function loadStoreTransactionsTab(storeId, page = 1) {
+  storeTxnPage = page;
+  try {
+    const { transactions, total } = await api(`/cards/transactions/all?store_id=${storeId}&page=${page}&pageSize=50`);
+    qs('#stab-transactions-list').innerHTML = transactions.length ? transactions.map(t => `<tr>
+        <td>${fmtDateTime(t.occurred_at)}</td><td>${esc(t.first_name||'')} ${esc(t.last_name||'')}</td><td>${esc(t.card_number_masked||'')}</td>
+        <td>${badge(t.type,t.type)}</td><td>${fmtMoney(t.amount)}</td>
+      </tr>`).join('') : '<tr><td colspan="5" class="empty-state">No transactions linked to this store yet.</td></tr>';
+    const pages = Math.max(1, Math.ceil(total / 50));
+    qs('#stab-transactions-pager').innerHTML = `<button class="btn btn-sm btn-outline" ${page<=1?'disabled':''} onclick="loadStoreTransactionsTab('${storeId}',${page-1})">Prev</button> Page ${page} of ${pages} <button class="btn btn-sm btn-outline" ${page>=pages?'disabled':''} onclick="loadStoreTransactionsTab('${storeId}',${page+1})">Next</button>`;
+  } catch (err) { toast(err.message, true); }
+}
 window.inviteStore = async (id) => {
   try {
     const r = await api(`/stores/${id}/invite`, { method: 'POST' });
