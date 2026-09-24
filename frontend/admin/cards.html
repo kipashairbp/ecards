@@ -99,6 +99,7 @@ qs('#btn-reconcile').addEventListener('click', async () => {
         <tr><td>Purchases (gross)</td><td>${r.purchases.count}</td><td>${fmtMoney(r.purchases.amount)}</td></tr>
         ${row('Refunds / money back (subtracted)', r.refunds)}
         <tr><td><strong>Total spent, net of refunds (what the dashboard shows)</strong></td><td></td><td><strong>${fmtMoney(r.totalSpent)}</strong></td></tr>
+        ${row('Real money disccardpromos reported that could NOT be matched to a local card (not counted above at all)', r.unattributed, 'Org-wide, every season — usually an applicant holding more than one card whose transaction mask didn\'t clearly match either one. THIS is the most likely reason our total reads lower than disccardpromos\' own number.')}
         ${row('Purchases dated outside this season\'s window', r.outOfSeasonWindow, 'Older history on the same disccardpromos customer, counted under this season\'s card')}
         ${row('Purchases where disccardpromos sent no disccardPaid (cart total used instead)', r.disccardPaidMissing)}
         ${row('Purchases where cart total differs from what the card paid (difference shown)', r.cartAmountDiffersFromPaid, 'Informational — the total already uses what the card paid')}

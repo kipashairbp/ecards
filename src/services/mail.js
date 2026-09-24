@@ -235,6 +235,17 @@ export const SYSTEM_EMAIL_TEMPLATES = {
       <p><strong>Signed by:</strong> {{signerName}}<br><strong>Signed at:</strong> {{signedAt}}</p>
       <p><a href="{{entityUrl}}">View in the admin portal</a></p>`,
   },
+  // Internal notice, not sent to whoever texted in — see Settings > SMS's
+  // "Notify on Incoming Text". accountLabel is blank when the number didn't
+  // match any known shul/store/applicant.
+  incomingSms: {
+    label: 'Internal Notice: Incoming Text Message', vars: ['phone', 'accountLabel', 'body', 'threadUrl'],
+    subject: 'New text message{{accountLabel}}',
+    body: `<p>A new text message just came in{{accountLabel}}.</p>
+      <p><strong>From:</strong> {{phone}}</p>
+      <p><strong>Message:</strong><br>{{body}}</p>
+      <p><a href="{{threadUrl}}">Reply in the admin portal</a></p>`,
+  },
 };
 
 // Renders every field the shul/store just submitted as a plain label/value

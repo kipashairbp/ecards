@@ -53,17 +53,64 @@ router.get('/config', (req, res) => res.json({ mockMode: isSmsMockMode() }));
 // an ISO string against created_at would silently misclassify same-day
 // messages as already-seen.
 function sqliteNow() { return new Date().toISOString().slice(0, 19).replace('T', ' '); }
+// `latest` (the most recent still-unread inbound message, with its resolved
+// account) powers the global floating notice in renderShell() — a plain
+// count alone can't show who texted or a preview of what they said.
 router.get('/inbox/unread-count', (req, res) => {
   const pref = db.prepare(`SELECT value FROM user_preferences WHERE user_id = ? AND key = 'sms_inbox_seen_at'`).get(req.user.id);
   const seenAt = pref ? JSON.parse(pref.value) : '1970-01-01 00:00:00';
   const c = db.prepare(`SELECT COUNT(*) c FROM sms_messages WHERE org_id = ? AND direction = 'inbound' AND created_at > ?`).get(req.user.org_id, seenAt);
-  res.json({ count: c.c });
+  const latestRow = c.c ? db.prepare(`SELECT id, phone, body, created_at FROM sms_messages WHERE org_id = ? AND direction = 'inbound' AND created_at > ? ORDER BY created_at DESC LIMIT 1`).get(req.user.org_id, seenAt) : null;
+  const latest = latestRow ? { ...latestRow, account: findAccountByPhone(req.user.org_id, latestRow.phone) } : null;
+  res.json({ count: c.c, latest });
 });
 router.post('/inbox/mark-seen', (req, res) => {
   db.prepare(`INSERT INTO user_preferences (user_id, key, value) VALUES (?, 'sms_inbox_seen_at', ?)
     ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`)
     .run(req.user.id, JSON.stringify(sqliteNow()));
   res.json({ ok: true });
+});
+
+// ============================= Chats (2-way threads) =============================
+// The same real phone number doesn't always land in sms_messages.phone in
+// the same textual format — an outbound send stores whatever the caller
+// passed (a shul's gabai_cell, dash-formatted per utils/phone.js), an
+// inbound one stores whatever the provider sent (typically E.164,
+// "+15555550123"). Grouping by the exact string would silently split one
+// real conversation into two "threads". Normalizing to the last 10 digits
+// before grouping/matching fixes that regardless of which formats either
+// side happens to use.
+const phoneKey = (p) => String(p || '').replace(/\D/g, '').slice(-10) || p;
+
+// Every distinct number this org has ever exchanged a message with, most-
+// recently-active first, each with its latest message and a resolved
+// account (shul/store/applicant/staff) when the number matches one on
+// file. "Unread" per thread reuses the same global seen-at cutoff the
+// unread-count badge already uses (see /inbox/unread-count above) rather
+// than a separate per-thread read-tracking table.
+router.get('/threads', (req, res) => {
+  const pref = db.prepare(`SELECT value FROM user_preferences WHERE user_id = ? AND key = 'sms_inbox_seen_at'`).get(req.user.id);
+  const seenAt = pref ? JSON.parse(pref.value) : '1970-01-01 00:00:00';
+  const rows = db.prepare(`SELECT direction, phone, body, created_at FROM sms_messages WHERE org_id = ? ORDER BY created_at DESC`).all(req.user.org_id);
+  const byKey = new Map();
+  for (const r of rows) {
+    const key = phoneKey(r.phone);
+    if (!byKey.has(key)) byKey.set(key, { phone: r.phone, last_at: r.created_at, last_direction: r.direction, last_body: r.body, unread: 0 });
+    if (r.direction === 'inbound' && r.created_at > seenAt) byKey.get(key).unread++;
+  }
+  const threads = [...byKey.values()].map(t => ({ ...t, account: findAccountByPhone(req.user.org_id, t.phone) }));
+  res.json({ threads });
+});
+
+// Full back-and-forth for one phone number (matched by normalized digits —
+// see phoneKey above), oldest first — natural chat reading order, unlike
+// every other list in this app (which reads newest-first).
+router.get('/threads/:phone', (req, res) => {
+  const targetKey = phoneKey(req.params.phone);
+  const all = db.prepare(`SELECT m.*, TRIM(COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,'')) AS sent_by_name
+    FROM sms_messages m LEFT JOIN users u ON u.id = m.sent_by WHERE m.org_id = ? ORDER BY m.created_at ASC`).all(req.user.org_id);
+  const messages = all.filter(m => phoneKey(m.phone) === targetKey);
+  res.json({ phone: req.params.phone, account: findAccountByPhone(req.user.org_id, req.params.phone), messages });
 });
 
 // Pulls new inbound messages from SimpleSender's /v1/messages right now —

@@ -16,12 +16,21 @@ renderShell('/admin/sms', `
   <div class="flex-between"><h2>SMS Center</h2><div class="pill-row"><button class="btn btn-outline btn-sm" id="btn-broadcast">Broadcast to a Group</button><button class="btn btn-primary btn-sm" id="btn-compose">Send Message</button></div></div>
   <div id="mock-banner"></div>
   <div class="tabs" id="stabs">
-    <button class="active" data-t="sent">Sent Messages</button>
+    <button class="active" data-t="chats">Chats</button>
+    <button data-t="sent">Sent Messages</button>
     <button data-t="inbox">Inbox</button>
     <button data-t="templates">Templates</button>
   </div>
 
-  <div id="panel-sent">
+  <div id="panel-chats">
+    <p class="small-muted">Every message, in one 2-way conversation per phone number. Reply right from here — it sends a real text.</p>
+    <div style="display:flex;gap:16px;height:70vh;min-height:420px">
+      <div class="card" style="width:300px;flex-shrink:0;padding:0;overflow-y:auto" id="chat-thread-list"><div class="small-muted" style="padding:16px">Loading…</div></div>
+      <div class="card" style="flex:1;display:flex;flex-direction:column;padding:0;overflow:hidden" id="chat-conversation"><div class="small-muted" style="padding:40px;text-align:center">Select a conversation</div></div>
+    </div>
+  </div>
+
+  <div id="panel-sent" style="display:none">
     <div class="toolbar">
       <input id="f-search" placeholder="Search phone or message…">
       <select id="f-status"><option value="">All statuses</option><option value="sent">Sent</option><option value="failed">Failed</option><option value="mock">Mock (no provider)</option></select>
@@ -56,9 +65,11 @@ renderShell('/admin/sms', `
 
 function showSmsTab(t) {
   qsa('#stabs button').forEach(b => { b.classList.toggle('active', b.dataset.t === t); });
-  ['sent','inbox','templates'].forEach(p => qs('#panel-'+p).style.display = p === t ? 'block' : 'none');
+  ['chats','sent','inbox','templates'].forEach(p => qs('#panel-'+p).style.display = p === t ? 'block' : 'none');
+  if (t === 'sent') loadSent();
   if (t === 'templates') loadTemplates();
-  if (t === 'inbox') { loadInbox(); api('/sms/inbox/mark-seen', { method: 'POST' }).catch(() => {}); }
+  if (t === 'inbox') { loadInbox(); document.getElementById('sms-floating-notice')?.remove(); api('/sms/inbox/mark-seen', { method: 'POST' }).catch(() => {}); }
+  if (t === 'chats') loadChatThreads();
 }
 qsa('#stabs button').forEach(b => b.addEventListener('click', () => showSmsTab(b.dataset.t)));
 
@@ -98,6 +109,61 @@ function renderSyncDiagnostics(r) {
       <pre style="white-space:pre-wrap;word-break:break-all;background:var(--bg-alt,#f6f6f6);padding:10px;border-radius:6px;font-size:12px;margin-top:6px">${esc(JSON.stringify(r.sample, null, 2))}</pre>`;
   }
 }
+
+// ============================= Chats (2-way threads) =============================
+let activeChatPhone = null;
+async function loadChatThreads() {
+  try {
+    const { threads } = await api('/sms/threads');
+    qs('#chat-thread-list').innerHTML = threads.length ? threads.map(t => `
+      <div class="chat-thread-row" style="padding:10px 12px;border-bottom:1px solid var(--border);cursor:pointer;${t.phone === activeChatPhone ? 'background:var(--bg-alt,#f3f3f3)' : ''}" onclick="openChatThread('${esc(t.phone)}')">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;gap:6px">
+          <strong style="${t.unread ? '' : 'font-weight:600'};overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t.account?.label || t.phone)}</strong>
+          ${t.unread ? `<span class="badge badge-active">${t.unread}</span>` : ''}
+        </div>
+        <div class="small-muted" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:${t.unread ? '700' : '400'}">${t.last_direction === 'outbound' ? 'You: ' : ''}${esc(t.last_body || '')}</div>
+        <div class="small-muted" style="font-size:11px">${fmtDateTime(t.last_at)}</div>
+      </div>`).join('') : '<div class="small-muted" style="padding:16px">No messages yet.</div>';
+  } catch (err) { toast(err.message, true); }
+}
+window.openChatThread = async (phone) => {
+  activeChatPhone = phone;
+  loadChatThreads();
+  try {
+    const { messages, account } = await api(`/sms/threads/${encodeURIComponent(phone)}`);
+    qs('#chat-conversation').innerHTML = `
+      <div style="padding:12px 16px;border-bottom:1px solid var(--border)"><strong>${esc(account?.label || phone)}</strong><div class="small-muted">${esc(phone)}</div></div>
+      <div id="chat-messages" style="flex:1;overflow-y:auto;padding:12px 16px;display:flex;flex-direction:column;gap:8px">
+        ${messages.length ? messages.map(m => `<div style="align-self:${m.direction==='outbound'?'flex-end':'flex-start'};max-width:70%">
+            <div style="background:${m.direction==='outbound'?'var(--brand-gold-dark,#c9a76a)':'var(--bg-alt,#eee)'};color:${m.direction==='outbound'?'#241a15':'#222'};padding:8px 12px;border-radius:12px">${esc(m.body||'')}</div>
+            <div class="small-muted" style="font-size:11px;margin-top:2px;text-align:${m.direction==='outbound'?'right':'left'}">${fmtDateTime(m.created_at)}${m.sent_by_name ? ' · ' + esc(m.sent_by_name) : ''}${m.status==='failed' ? ' · <span style="color:var(--danger)">failed</span>' : ''}</div>
+          </div>`).join('') : '<div class="small-muted">No messages with this number yet.</div>'}
+      </div>
+      <div style="display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--border)">
+        <input id="chat-reply-input" placeholder="Type a reply…" style="flex:1">
+        <button class="btn btn-primary btn-sm" id="btn-chat-send">Send</button>
+      </div>
+    `;
+    const msgsEl = qs('#chat-messages');
+    if (msgsEl) msgsEl.scrollTop = msgsEl.scrollHeight;
+    qs('#chat-reply-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') sendChatReply(phone); });
+    qs('#btn-chat-send').addEventListener('click', () => sendChatReply(phone));
+    document.getElementById('sms-floating-notice')?.remove();
+    api('/sms/inbox/mark-seen', { method: 'POST' }).then(loadChatThreads).catch(() => {});
+  } catch (err) { toast(err.message, true); }
+};
+window.sendChatReply = async (phone) => {
+  const input = qs('#chat-reply-input');
+  const body = input.value.trim();
+  if (!body) return;
+  const btn = qs('#btn-chat-send');
+  input.disabled = true; if (btn) btn.disabled = true;
+  try {
+    await api('/sms/send', { method: 'POST', body: { to: phone, body } });
+    input.value = '';
+    openChatThread(phone);
+  } catch (err) { toast(err.message, true); input.disabled = false; if (btn) btn.disabled = false; }
+};
 
 qs('#webhook-url').textContent = window.location.origin + '/api/sms/webhook/inbound';
 
@@ -270,15 +336,17 @@ window.sendComposedSms = async () => {
   } catch (err) { toast(err.message, true); }
 };
 
-// Deliberately not calling loadSent()/showSmsTab() before the season filter
-// resolves — an unscoped first call here would flash every season's
+// Deliberately not calling loadSent()/showSmsTab('sent') before the season
+// filter resolves — an unscoped first call here would flash every season's
 // messages for a moment before the season-scoped one replaced it (same
-// race shape #5 fixed for the Applicants list's load()).
-const startTab = new URLSearchParams(location.search).get('tab');
-populateSeasonFilter('f-season').then(activeId => {
-  state.season_id = activeId;
-  if (startTab === 'inbox') showSmsTab('inbox'); else loadSent();
-});
+// race shape #5 fixed for the Applicants list's load()). Chats/Inbox aren't
+// season-scoped, so they're safe to open immediately.
+const startParams = new URLSearchParams(location.search);
+const startTab = startParams.get('tab');
+const startPhone = startParams.get('phone');
+if (startTab === 'inbox') showSmsTab('inbox');
+else { showSmsTab('chats'); if (startPhone) openChatThread(startPhone); }
+populateSeasonFilter('f-season').then(activeId => { state.season_id = activeId; });
 </script>
 </body>
 </html>

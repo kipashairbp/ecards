@@ -296,12 +296,24 @@ router.get('/transactions/reconcile', requirePermission('cards', 'can_view'), (r
     const key = `${r.card_id}|${r.occurred_at}|${r.amount}|${r.store_name}`;
     if (seen.has(key)) { if (r.amount < 0) add(duplicates, r); } else seen.set(key, r.id);
   }
+  // Real disccardpromos transactions that came back on a sync but couldn't
+  // be matched to any local card at all (see services/cardSync.js's
+  // insertUnattributed) — never in card_transactions, so completely
+  // invisible to purchases/refunds above. Org-wide, not season-scoped (no
+  // card to hang a season off of), and always worth showing regardless of
+  // which season is selected — this is the single most likely explanation
+  // for "our total is lower than disccardpromos' own number."
+  const unattributedRows = db.prepare(`SELECT u.amount, u.occurred_at, u.store_name, u.provider_txn_id, a.first_name, a.last_name
+    FROM unattributed_transactions u LEFT JOIN applicants a ON a.id = u.applicant_id WHERE u.org_id = ?`).all(orgId);
+  const unattributed = bucket();
+  for (const r of unattributedRows) if (r.amount < 0) add(unattributed, r);
   res.json({
     season: season ? { id: season.id, name: season.name, start_date: season.start_date, end_date: season.end_date } : null,
     rowsConsidered: rows.length,
     purchases, refunds, netAfterRefunds: money(purchases.amount - refunds.amount), totalSpent: money(purchases.amount - refunds.amount),
     outOfSeasonWindow: outOfWindow, disccardPaidMissing: paidMissing, cartAmountDiffersFromPaid: cartDiffers,
     onDeletedApplicant: deletedApplicant, onDeactivatedCard: deactivatedCard, likelyDuplicates: duplicates,
+    unattributed,
   });
 });
 

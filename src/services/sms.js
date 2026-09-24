@@ -14,6 +14,7 @@
 import { db, uuid, DEFAULT_ORG_ID } from '../db.js';
 import { findAccountByPhone } from '../utils/contactLookup.js';
 import { logApiCall } from './apiCallLog.js';
+import { sendMailChecked, renderSystemTemplate, escapeHtml } from './mail.js';
 
 // A shul/applicant is a fresh row every season, so a message tied to one of
 // those directly (meta.relatedEntityType/Id, set by whichever profile page
@@ -111,6 +112,23 @@ export async function sendSmsChecked(orgId, to, body, meta = {}) {
   return { emailError: error };
 }
 
+// Settings > SMS's "Notify on Incoming Text" — emails a link straight into
+// that conversation (SMS Center > Chats, deep-linked by phone number) every
+// time a new inbound message is logged, from either the webhook or the
+// polling sync below. Best-effort and fire-and-forget (not awaited by
+// either caller) — a notification failure must never affect logging the
+// message itself, which is the part that actually matters.
+function notifyIncomingSms(orgId, phone, body) {
+  const finalOrgId = orgId || DEFAULT_ORG_ID;
+  const to = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'notify_incoming_sms_email'`).get(finalOrgId)?.value;
+  if (!to) return;
+  const account = findAccountByPhone(finalOrgId, phone);
+  const accountLabel = account ? ` from ${account.label}` : '';
+  const threadUrl = `${process.env.APP_URL || ''}/admin/sms.html?tab=chat&phone=${encodeURIComponent(phone)}`;
+  const tmpl = renderSystemTemplate(finalOrgId, 'incomingSms', { phone, accountLabel, body: escapeHtml(body).replace(/\n/g, '<br>'), threadUrl });
+  sendMailChecked(finalOrgId, to, tmpl.subject, tmpl.body, {}).catch(e => console.error('[sms] incoming-text notification email failed:', e.message));
+}
+
 // Logs an inbound message (called from the public webhook route). Provider
 // payload shapes vary; the webhook route normalizes to {from, body} before
 // calling this.
@@ -118,6 +136,7 @@ export function logInboundSms(orgId, from, body) {
   const seasonId = findAccountByPhone(orgId || DEFAULT_ORG_ID, from)?.season_id || null;
   db.prepare(`INSERT INTO sms_messages (id, org_id, direction, phone, body, status, season_id) VALUES (?,?,?,?,?,'received',?)`)
     .run(uuid(), orgId || DEFAULT_ORG_ID, 'inbound', from, body, seasonId);
+  notifyIncomingSms(orgId, from, body);
 }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +218,7 @@ export async function syncInboundSms(orgId, ownNumber) {
     }
     insert.run(uuid(), orgId, 'inbound', phone, body, providerId, findAccountByPhone(orgId, phone)?.season_id || null);
     imported++;
+    notifyIncomingSms(orgId, phone, body);
   }
   // Diagnostics for whichever failure mode is actually happening in
   // production, surfaced all the way to the admin's "Check Now" click

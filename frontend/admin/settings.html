@@ -65,6 +65,8 @@ renderShell('/admin/settings', `
       <h3>Our SMS Number</h3>
       <p class="small-muted">Your SimpleSender sending number. Incoming-message sync (SMS Center &gt; Inbox) uses this to tell replies to you apart from messages you sent — anything addressed to this number is inbound. Update this if the number is ever reassigned.</p>
       <label>SMS Number</label><input id="org-sms_own_number" placeholder="+18555996232">
+      <label style="margin-top:10px">Notify on Incoming Text</label><input id="org-notify_incoming_sms_email" placeholder="e.g. office@yourorg.org">
+      <p class="small-muted" style="margin-top:2px">Emailed a link straight to that conversation every time a new text message comes in. Leave blank to disable.</p>
       <button class="btn btn-sm btn-primary" style="margin-top:14px" onclick="saveSmsOwnNumber()">Save</button>
     </div>
     <div class="card" style="margin-top:16px">
@@ -236,9 +238,10 @@ window.saveDocSignedNotifyEmail = async () => {
 async function loadSmsOwnNumber() {
   const { settings } = await api('/settings');
   qs('#org-sms_own_number').value = settings.sms_own_number || '+18555996232';
+  qs('#org-notify_incoming_sms_email').value = settings.notify_incoming_sms_email || '';
 }
 window.saveSmsOwnNumber = async () => {
-  try { await api('/settings', { method: 'PUT', body: { sms_own_number: qs('#org-sms_own_number').value } }); toast('Saved'); } catch (err) { toast(err.message, true); }
+  try { await api('/settings', { method: 'PUT', body: { sms_own_number: qs('#org-sms_own_number').value, notify_incoming_sms_email: qs('#org-notify_incoming_sms_email').value.trim() } }); toast('Saved'); } catch (err) { toast(err.message, true); }
 };
 async function loadDiscountId() {
   const { settings } = await api('/settings');

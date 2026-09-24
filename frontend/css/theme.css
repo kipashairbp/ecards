@@ -196,6 +196,13 @@ tr:hover td { background: var(--brand-panel-2); }
 .toast.show { opacity: 1; transform: translateY(0); }
 .toast.error { background: var(--danger); }
 
+/* A new incoming text message — deliberately NOT another small nav-tally
+   dot (see shuls/applicants/stores), which is easy to miss as one more
+   number in the header. Bottom-left so it never collides with .toast
+   (bottom-right). */
+.sms-notice { position: fixed; bottom: 24px; left: 24px; max-width: 300px; background: #fff; border: 1px solid var(--border); border-left: 5px solid var(--brand-gold-dark, #c9a76a); border-radius: 10px; box-shadow: var(--shadow); padding: 14px 16px; z-index: 1000; }
+.sms-notice-close { position: absolute; top: 6px; right: 10px; background: none; border: none; cursor: pointer; font-weight: 700; font-size: 16px; color: var(--text-muted); line-height: 1; }
+
 .modal-backdrop { position: fixed; inset: 0; background: rgba(36,26,21,.55); display: flex; align-items: flex-start; justify-content: center; padding: 40px 16px; overflow-y: auto; z-index: 998; }
 .modal { background: #fff; border-radius: var(--radius); width: 100%; max-width: 900px; box-shadow: var(--shadow); }
 .modal-header { display: flex; justify-content: space-between; align-items: center; padding: 18px 24px; border-bottom: 1px solid var(--border); }

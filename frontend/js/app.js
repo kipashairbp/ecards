@@ -427,6 +427,47 @@ function renderShell(activeHref, contentHtml) {
       if (changed) layoutNavOverflow();
     }).catch(() => {});
   }
+  // A new incoming text gets its own floating notice, not just another
+  // small nav-tally dot like shuls/applicants/stores above — a text is a
+  // real person waiting on a reply, easy to miss as one more number in the
+  // header. See pollIncomingSmsNotice below.
+  if (Auth.can('sms')) {
+    pollIncomingSmsNotice();
+    setInterval(pollIncomingSmsNotice, 60000);
+  }
+}
+
+// Shows (or refreshes) a floating card in the corner of the screen for the
+// single most recent unread inbound text — dismissible per-message
+// (sessionStorage, so it doesn't reappear on the next page nav this
+// session) or clearable by actually opening that conversation (Open Chat,
+// or visiting SMS Center > Chats/Inbox directly, which marks everything
+// seen). Re-checks every 60s and on every page load via renderShell.
+function pollIncomingSmsNotice() {
+  api('/sms/inbox/unread-count').then(({ latest }) => {
+    document.getElementById('sms-floating-notice')?.remove();
+    if (!latest) return;
+    if (sessionStorage.getItem('sms_notice_dismissed_' + latest.id)) return;
+    const el = document.createElement('div');
+    el.id = 'sms-floating-notice';
+    el.className = 'sms-notice';
+    el.innerHTML = `
+      <button class="sms-notice-close" type="button" aria-label="Dismiss">&times;</button>
+      <strong>New text message${latest.account ? ' — ' + esc(latest.account.label) : ''}</strong>
+      <div class="small-muted" style="margin-bottom:6px">${esc(latest.phone)}</div>
+      <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:260px">${esc(latest.body || '')}</div>
+      <div style="margin-top:10px"><button class="btn btn-sm btn-primary" type="button">Open Chat</button></div>
+    `;
+    el.querySelector('.sms-notice-close').addEventListener('click', (e) => {
+      e.stopPropagation();
+      sessionStorage.setItem('sms_notice_dismissed_' + latest.id, '1');
+      el.remove();
+    });
+    el.querySelector('.btn-primary').addEventListener('click', () => {
+      location.href = `/admin/sms.html?tab=chat&phone=${encodeURIComponent(latest.phone)}`;
+    });
+    document.body.appendChild(el);
+  }).catch(() => {});
 }
 
 // The header search box (staff/org_admin/super_admin only, see renderShell)

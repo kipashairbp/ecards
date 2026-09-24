@@ -106,6 +106,30 @@ const cleanProviderId = id => String(id).replace(/\.0$/, '');
 // off it instead of this function doing its own GET. This used to mean one
 // disccardpromos request PER APPLICANT with a provider account, every
 // single 15-minute sweep. Omit index for a single-applicant caller (the
+// Persists a transaction that couldn't be matched to a specific local card
+// (see the `unattributed` branch in the loop below) instead of letting it
+// vanish — same sign convention as card_transactions (negative = spend,
+// positive = refund) so a later report can total it the same way. Deduped
+// on provider_txn_id the same way card_transactions is (INSERT OR IGNORE),
+// so re-syncing the same still-unresolved transaction every 15 minutes
+// doesn't pile up duplicate rows. Best-effort: malformed/unrecognizable
+// entries (no amount, no date) are simply skipped here — they're already
+// counted as `malformed` by the caller's own catch-all when this throws or
+// returns without inserting.
+function insertUnattributed(orgId, applicantId, t, rawAmount, occurredAt) {
+  if (rawAmount === undefined || occurredAt === undefined) return;
+  const storeName = (t.vendor || t.store_name || t.merchant || '').trim();
+  const providerTxnId = String(t.id ?? t.transaction_id ?? '');
+  const refundWord = /\b(refund|refunded|reversal|reversed|void|voided|chargeback)\b/i;
+  const isRefund = rawAmount < 0
+    || t.is_refund === true || t.refund === true
+    || [t.type, t.kind, t.transaction_type, t.status, t.description, t.note, t.vendor].some(v => typeof v === 'string' && refundWord.test(v));
+  const storedAmount = isRefund ? Math.abs(rawAmount) : -Math.abs(rawAmount);
+  db.prepare(`INSERT OR IGNORE INTO unattributed_transactions (id, org_id, applicant_id, provider_txn_id, type, amount, store_name, occurred_at, raw_payload)
+    VALUES (?,?,?,?,?,?,?,?,?)`)
+    .run(uuid(), orgId, applicantId, providerTxnId || null, isRefund ? 'refund' : 'purchase', storedAmount, storeName, occurredAt, JSON.stringify(t));
+}
+
 // manual "Sync Now" button), which falls back to a live per-applicant GET.
 export async function syncApplicantCards(orgId, applicant, index) {
   if (!applicant.provider_account_id || applicant.provider_exempt) return { discovered: 0, removed: 0, synced: 0, unattributed: 0, malformed: 0, fetchFailed: false };
@@ -242,9 +266,26 @@ export async function syncApplicantCards(orgId, applicant, index) {
       const maskedRaw = t.card || t.card_number_masked || t.masked_card_number || t.card_number || null;
       const last4 = maskedRaw ? trailingDigits(maskedRaw) : null;
       const cardId = (last4 && byLast4.get(last4)) || (maskedRaw && byMasked.get(maskedRaw)) || soleCardId;
-      if (!cardId) { unattributed++; continue; }
       const rawAmount = t.disccardPaid ?? t.cartAmount ?? t.amount;
       const occurredAt = t.timestamp || t.occurred_at || t.date;
+      if (!cardId) {
+        // Real money that used to be silently dropped here — never inserted
+        // anywhere, not even counted anywhere durable, just an in-memory
+        // `unattributed` tally for this one sync run's own toast message.
+        // That's the single most likely explanation for "our total is lower
+        // than disccardpromos' own number": an applicant holding more than
+        // one card (a replacement issued, or genuinely two live cards) whose
+        // transaction's card mask doesn't cleanly match either one. Captured
+        // here instead so the money is at least visible and totalable (see
+        // GET /cards/transactions/unattributed) even though which specific
+        // card it belongs to is still unknown. insertUnattributed is a
+        // best-effort, separate try/catch — a problem persisting this must
+        // never turn into "and now the rest of this sync's real,
+        // successfully-attributed transactions get skipped too."
+        unattributed++;
+        try { insertUnattributed(orgId, applicant.id, t, rawAmount, occurredAt); } catch (e) { console.error('[cardSync] failed to record unattributed transaction:', e.message); }
+        continue;
+      }
       if (rawAmount === undefined || occurredAt === undefined) {
         malformed++;
         console.error(`[cardSync] transaction ${t.id ?? t.transaction_id ?? '(no id)'} on customer ${customer.id ?? applicant.external_id} doesn't match any known shape (missing amount and/or date) — raw entry: ${JSON.stringify(t)}`);

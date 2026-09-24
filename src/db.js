@@ -363,6 +363,30 @@ CREATE TABLE IF NOT EXISTS card_transactions (
   created_at TEXT DEFAULT (datetime('now'))
 );
 
+-- A real disccardpromos transaction that came back on a sync but couldn't
+-- be matched to any specific local card (see services/cardSync.js) — most
+-- commonly an applicant holding more than one card whose transaction mask
+-- didn't cleanly match either one. Previously just an in-memory count for
+-- one sync run's own toast message and otherwise silently dropped, which is
+-- real money never appearing in any total here even though disccardpromos
+-- has it — the leading suspect behind "our total is lower than
+-- disccardpromos' own number." provider_txn_id UNIQUE (same as
+-- card_transactions above) is what makes re-syncing the same still-
+-- unresolved transaction every 15 minutes an INSERT OR IGNORE no-op instead
+-- of piling up duplicates.
+CREATE TABLE IF NOT EXISTS unattributed_transactions (
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  applicant_id TEXT REFERENCES applicants(id),
+  provider_txn_id TEXT UNIQUE,
+  type TEXT NOT NULL,
+  amount REAL NOT NULL,
+  store_name TEXT,
+  occurred_at TEXT,
+  raw_payload TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
 -- ===================== Stores =====================
 CREATE TABLE IF NOT EXISTS stores (
   id TEXT PRIMARY KEY,
