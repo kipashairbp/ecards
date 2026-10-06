@@ -310,6 +310,7 @@ const NAV_ITEMS = [
   { href: '/admin/applicants', label: 'Applicants', icon: '&#9670;', resource: 'applicants' },
   { href: '/admin/cards', label: 'Cards & Transactions', icon: '&#9670;', resource: 'cards' },
   { href: '/admin/stores', label: 'Stores', icon: '&#9670;', resource: 'stores' },
+  { href: '/admin/store-billing', label: 'Store Billing', icon: '&#9670;', resource: 'store_billing' },
   { href: '/admin/tasks', label: 'Tasks', icon: '&#9670;', resource: 'tasks' },
   { href: '/admin/forms', label: 'Form Builder', icon: '&#9670;', resource: 'forms' },
   { href: '/admin/emails', label: 'Email Center', icon: '&#9670;', resource: 'emails' },
