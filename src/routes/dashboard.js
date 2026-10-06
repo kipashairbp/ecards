@@ -90,6 +90,10 @@ router.get('/stats', (req, res) => {
     stats.cards = {
       total: db.prepare(`SELECT COUNT(*) c FROM cards WHERE org_id = ?${seasonClause}`).get(orgId, ...seasonParams).c,
       activated: db.prepare(`SELECT COUNT(*) c FROM cards WHERE org_id = ? AND status='activated'${seasonClause}`).get(orgId, ...seasonParams).c,
+      // Of the cards that are currently active, how many actually have
+      // money loaded onto them (cards.amount > 0) — shown as a fraction of
+      // `activated` above ("Total Loaded Accounts Active": activatedWithMoney/activated).
+      activatedWithMoney: db.prepare(`SELECT COUNT(*) c FROM cards WHERE org_id = ? AND status='activated' AND amount > 0${seasonClause}`).get(orgId, ...seasonParams).c,
       // Every approved applicant's committed card_amount, NOT SUM(cards.amount)
       // — the `cards` table only gets a row once a physical card number is
       // actually registered/discovered (see cardSync.js), so an approved

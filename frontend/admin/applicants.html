@@ -32,6 +32,7 @@ renderShell('/admin/applicants', `
       <select id="f-status"><option value="">All statuses</option><option value="pending">Pending</option><option value="approved">Approved</option><option value="rejected">Rejected</option><option value="soft_rejected">Soft Reject</option><option value="incomplete">Incomplete</option><option value="draft">Draft</option></select>
       <select id="f-paused"><option value="">Paused: All</option><option value="1">Paused only</option><option value="0">Not paused</option></select>
       <select id="f-wna"><option value="">Will Not Activate: All</option><option value="1">Marked only</option><option value="0">Not marked</option></select>
+      <select id="f-active-card"><option value="">Active Card: All</option><option value="1">Yes</option><option value="0">No</option></select>
       <select id="f-marital"><option value="">Any marital status</option><option value="single">Single</option><option value="married">Married</option><option value="widowed">Widowed</option><option value="divorced">Divorced</option></select>
       <select id="f-shul"><option value="">All Shuls</option></select>
       <select id="f-season"></select>
@@ -63,7 +64,7 @@ renderShell('/admin/applicants', `
   <div class="paginator" id="pager"></div>
 `);
 
-let state = { search:'', status:'', paused:'', will_not_activate:'', marital_status:'', shul_id:'', season_id:'', provider_sync:'', provider_check:'', amount_min:'', amount_max:'', sort:'created_at', dir:'DESC', page:1, pageSize:Auth.pageSize('applicants') };
+let state = { search:'', status:'', paused:'', will_not_activate:'', active_card:'', marital_status:'', shul_id:'', season_id:'', provider_sync:'', provider_check:'', amount_min:'', amount_max:'', sort:'created_at', dir:'DESC', page:1, pageSize:Auth.pageSize('applicants') };
 let selected = new Set();
 // Each row's own last-loaded data, keyed by id — kept around (across pages,
 // across reloads) purely so a mass action can tell upfront how many of the
@@ -109,7 +110,7 @@ const APPLICANT_COLUMNS = [
   { key: 'approval_status', label: 'Status', sort: 'approval_status', render: a => badge(a.approval_status, a.approval_status)
     + (a.approval_status === 'rejected' && a.rejection_reason ? `<div class="rejection-reason" title="${esc(a.rejection_reason)}">${esc(a.rejection_reason)}</div>` : '') },
   { key: 'card_amount', label: 'Card $', sort: 'card_amount', render: a => a.card_amount != null ? fmtMoney(a.card_amount) : '' },
-  { key: 'active_card_count', label: '# of Cards', render: a => a.active_card_count || 0 },
+  { key: 'active_card_count', label: 'Active Card', sort: 'active_card', render: a => a.active_card_count > 0 ? 'Yes' : 'No' },
   { key: 'will_not_activate', label: 'Will Not Activate', render: a => a.will_not_activate ? `${badge('yes','paused')}${a.will_not_activate_at ? `<div class="small-muted">${fmtDate(a.will_not_activate_at)}</div>` : ''}` : '' },
   { key: 'provider_sync', label: 'Disccardpromos', render: a => providerSyncBadge(a.provider_sync) },
   { key: 'provider_check_status', label: 'Disccardpromos Says', render: a => providerCheckBadge(a.provider_check_status) },
@@ -198,6 +199,7 @@ qs('#f-search').addEventListener('input', debounce(() => { state.search = qs('#f
 qs('#f-status').addEventListener('change', () => { state.status = qs('#f-status').value; state.page = 1; load(); });
 qs('#f-paused').addEventListener('change', () => { state.paused = qs('#f-paused').value; state.page = 1; load(); });
 qs('#f-wna').addEventListener('change', () => { state.will_not_activate = qs('#f-wna').value; state.page = 1; load(); });
+qs('#f-active-card').addEventListener('change', () => { state.active_card = qs('#f-active-card').value; state.page = 1; load(); });
 qs('#f-marital').addEventListener('change', () => { state.marital_status = qs('#f-marital').value; state.page = 1; load(); });
 qs('#f-shul').addEventListener('change', () => { state.shul_id = qs('#f-shul').value; state.page = 1; load(); });
 qs('#f-amount-min').addEventListener('input', debounce(() => { state.amount_min = qs('#f-amount-min').value; state.page = 1; load(); }, 350));
@@ -687,6 +689,7 @@ async function openApplicant(id) {
       </div>`;
     const footer = `
       <button class="btn btn-outline btn-sm" onclick="showOtherSeasons('Applicant', '/applicants/${id}/other-seasons', 'openApplicant')">View Other Seasons</button>
+      ${a.provider_account_id ? `<button class="btn btn-outline btn-sm" onclick="window.open('https://disccardpromos.com/portal/org/customers/${encodeURIComponent(a.provider_account_id)}/', '_blank')">DiscCard</button>` : ''}
       ${a.provider_account_id && ['super_admin','org_admin'].includes(Auth.user()?.role) ? `<button class="btn btn-outline btn-sm" onclick="viewLiveProviderData('${id}')">View Live Disccardpromos Data</button>` : ''}
       <button class="btn btn-outline btn-sm" onclick="openQuickTaskModal('applicant','${id}','${esc(a.first_name+' '+a.last_name).replace(/'/g,"\\'")}')">+ Add Task</button>
       ${['super_admin','org_admin'].includes(Auth.user()?.role) ? `<button class="btn btn-outline btn-sm" style="color:#b71c1c;border-color:#b71c1c" onclick="deleteApplicant('${id}')">Delete Permanently</button>` : ''}

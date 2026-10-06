@@ -69,6 +69,12 @@ router.get('/stats', (req, res) => {
     // deactivated + lost grouped together (both mean "no longer a live
     // card"), same reasoning as applicants.other above.
     deactivated: cardStatusCount('deactivated') + cardStatusCount('lost'),
+    // Of the cards that are currently active, how many actually have money
+    // loaded onto them (cards.amount > 0) — the "Activated Accounts" stat
+    // on this dashboard shows just this number (no denominator); the main
+    // Dashboard shows it as a fraction of `activated` above. Same
+    // underlying fact, two different presentations.
+    activatedWithMoney: db.prepare(`SELECT COUNT(*) c FROM cards WHERE org_id = ? AND status = 'activated' AND amount > 0${seasonClause}`).get(orgId, ...seasonParams).c,
   };
 
   // Same two formulas as routes/dashboard.js's funds panel: loaded is every

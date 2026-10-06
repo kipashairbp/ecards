@@ -484,12 +484,25 @@ function scopeWhere(req) {
   return { where, params };
 }
 
+// Shared by GET /, /export, and /ids — the applicant filter list's "Active
+// Card" column/filter is EXISTS-based against cards.status = 'activated'
+// rather than a stored column, same underlying fact active_card_count
+// (see below) is derived from, so this stays the single source of truth
+// for what "has an active card" means everywhere it's checked.
+const ACTIVE_CARD_EXISTS = `EXISTS (SELECT 1 FROM cards WHERE applicant_id = a.id AND status = 'activated')`;
+function applyActiveCardFilter(where, params, active_card) {
+  if (active_card === '1') return where + ` AND ${ACTIVE_CARD_EXISTS}`;
+  if (active_card === '0') return where + ` AND NOT ${ACTIVE_CARD_EXISTS}`;
+  return where;
+}
+
 router.get('/', (req, res) => {
-  const { search, status, shul_id, season_id, home_for_yomtov, marital_status, paused, will_not_activate, provider_sync, provider_check, amount_min, amount_max, sort = 'created_at', dir = 'DESC', page = 1, pageSize = 50 } = req.query;
+  const { search, status, shul_id, season_id, home_for_yomtov, marital_status, paused, will_not_activate, active_card, provider_sync, provider_check, amount_min, amount_max, sort = 'created_at', dir = 'DESC', page = 1, pageSize = 50 } = req.query;
   let { where, params } = scopeWhere(req);
   if (status) { where += ' AND a.approval_status = ?'; params.push(status); }
   if (paused === '1' || paused === '0') { where += ' AND a.is_paused = ?'; params.push(+paused); }
   if (will_not_activate === '1' || will_not_activate === '0') { where += ' AND a.will_not_activate = ?'; params.push(+will_not_activate); }
+  where = applyActiveCardFilter(where, params, active_card);
   // A merged record's shul_id column only names the primary shul — match a
   // shul filter against every contributing shul (see applicant_submissions)
   // so a merged applicant still shows up when filtering for a non-primary
@@ -531,7 +544,9 @@ router.get('/', (req, res) => {
     params.push(like, like, like, likeNoDash, likeNoDash, likeNoDash, like, like, like, like, like, like, like);
   }
   const allowedSort = ['created_at','last_name','approval_status','num_children','card_amount','external_id'];
-  const sortCol = allowedSort.includes(sort) ? `a.${sort}` : 'a.created_at';
+  // active_card isn't a stored column — same EXISTS check as the filter
+  // above, just used as a sort expression instead of a WHERE clause.
+  const sortCol = sort === 'active_card' ? ACTIVE_CARD_EXISTS : (allowedSort.includes(sort) ? `a.${sort}` : 'a.created_at');
   const sortDir = dir === 'ASC' ? 'ASC' : 'DESC';
   const total = db.prepare(`SELECT COUNT(*) c FROM applicants a ${where}`).get(...params).c;
   const offset = (Math.max(1, +page) - 1) * +pageSize;
@@ -573,11 +588,12 @@ router.get('/', (req, res) => {
 // Full-detail CSV export — every field, no pagination, respects the same
 // filters as the list view. Must be registered before /:id.
 router.get('/export', requirePermission('applicants', 'can_export'), (req, res) => {
-  const { search, status, shul_id, season_id, home_for_yomtov, marital_status, paused, will_not_activate, amount_min, amount_max } = req.query;
+  const { search, status, shul_id, season_id, home_for_yomtov, marital_status, paused, will_not_activate, active_card, amount_min, amount_max } = req.query;
   let { where, params } = scopeWhere(req);
   if (status) { where += ' AND a.approval_status = ?'; params.push(status); }
   if (paused === '1' || paused === '0') { where += ' AND a.is_paused = ?'; params.push(+paused); }
   if (will_not_activate === '1' || will_not_activate === '0') { where += ' AND a.will_not_activate = ?'; params.push(+will_not_activate); }
+  where = applyActiveCardFilter(where, params, active_card);
   if (shul_id) { where += ' AND (a.shul_id = ? OR a.id IN (SELECT applicant_id FROM applicant_submissions WHERE shul_id = ?))'; params.push(shul_id, shul_id); }
   if (season_id) { where += ' AND a.season_id = ?'; params.push(season_id); }
   if (marital_status) { where += ' AND a.marital_status = ?'; params.push(marital_status); }
@@ -625,11 +641,12 @@ router.get('/export', requirePermission('applicants', 'can_export'), (req, res) 
 // /:id. Same filters as GET / and /export — kept in sync by hand, same as
 // those two already are with each other.
 router.get('/ids', (req, res) => {
-  const { search, status, shul_id, season_id, home_for_yomtov, marital_status, paused, will_not_activate, amount_min, amount_max } = req.query;
+  const { search, status, shul_id, season_id, home_for_yomtov, marital_status, paused, will_not_activate, active_card, amount_min, amount_max } = req.query;
   let { where, params } = scopeWhere(req);
   if (status) { where += ' AND a.approval_status = ?'; params.push(status); }
   if (paused === '1' || paused === '0') { where += ' AND a.is_paused = ?'; params.push(+paused); }
   if (will_not_activate === '1' || will_not_activate === '0') { where += ' AND a.will_not_activate = ?'; params.push(+will_not_activate); }
+  where = applyActiveCardFilter(where, params, active_card);
   if (shul_id) { where += ' AND (a.shul_id = ? OR a.id IN (SELECT applicant_id FROM applicant_submissions WHERE shul_id = ?))'; params.push(shul_id, shul_id); }
   if (season_id) { where += ' AND a.season_id = ?'; params.push(season_id); }
   if (marital_status) { where += ' AND a.marital_status = ?'; params.push(marital_status); }

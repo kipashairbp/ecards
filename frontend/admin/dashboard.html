@@ -119,6 +119,7 @@ async function loadStats() {
     if (stats.cards) tiles.push(
       kpiCard('Cards Issued', stats.cards.total, 'var(--viz-2)', EXEC_ICONS.card),
       kpiCard('Cards Activated', stats.cards.activated, 'var(--viz-3)', EXEC_ICONS.card),
+      kpiCard('Total Loaded Accounts Active', `${stats.cards.activatedWithMoney}/${stats.cards.activated}`, 'var(--viz-good)', EXEC_ICONS.card),
       kpiCard('Total Loaded', fmtMoney(stats.cards.totalLoaded), 'var(--brand-gold-dark)', EXEC_ICONS.coin));
     qs('#stats').innerHTML = tiles.join('');
     qs('#dup-panel').style.display = stats.duplicates?.open > 0 ? 'block' : 'none';
