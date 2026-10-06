@@ -1183,10 +1183,15 @@ window.openStoreInvoiceModal = async (id, onDone) => {
     `;
     const footer = `
       ${canEdit && bill.status === 'pending' ? `<button class="btn btn-outline btn-sm" style="color:#b71c1c;border-color:#b71c1c" onclick="rejectStoreInvoice('${bill.id}')">Reject</button>
-      <button class="btn btn-primary btn-sm" onclick="openStoreCompletePayment('${bill.id}', ${bill.amount}, '${esc(bill.period || '').replace(/'/g, "\\'")}')">Mark Payment Sent</button>` : ''}
+      <button class="btn btn-primary btn-sm" onclick="openStoreCompletePayment('${bill.id}', ${bill.amount}, '${(bill.period || '').replace(/'/g, "\\'")}')">Mark Payment Sent</button>` : ''}
+      ${canEdit ? `<button class="btn btn-outline btn-sm" onclick="editStoreInvoiceNote('${bill.id}', '${(bill.admin_notes || '').replace(/'/g, "\\'").replace(/\n/g, '\\n')}')">${bill.admin_notes ? 'Edit' : 'Add'} Internal Note</button>` : ''}
       ${isTopAdmin ? `<button class="btn btn-outline btn-sm" style="color:#b71c1c;border-color:#b71c1c" onclick="deleteStoreInvoice('${bill.id}')">Delete</button>` : ''}
     `;
-    openModal(`Invoice — ${esc(bill.store_name)}`, body, footer, { wide: true });
+    // title is raw text, not pre-escaped — openModal() escapes it itself;
+    // escaping here too used to double-escape any apostrophe/ampersand in a
+    // store name (e.g. "Tuli's Hardware" rendered as the literal text
+    // "Tuli&#39;s Hardware" instead of an apostrophe).
+    openModal(`Invoice — ${bill.store_name}`, body, footer, { wide: true });
   } catch (err) { toast(err.message, true); }
 };
 
@@ -1220,7 +1225,7 @@ window.openStoreCompletePayment = (id, amount, period) => {
     <label>Note to Store <span class="small-muted">(optional — included in the email they get)</span></label><textarea id="cp-public-note" rows="2"></textarea>
     <label>Internal Note <span class="small-muted">(optional — never shown to the store)</span></label><textarea id="cp-internal-note" rows="2"></textarea>
   `;
-  openModal(`Mark Payment Sent — ${esc(period || '')}`, body, `<button class="btn btn-primary btn-sm" onclick="confirmStoreCompletePayment('${id}')">Confirm Sent</button>`);
+  openModal(`Mark Payment Sent — ${period || ''}`, body, `<button class="btn btn-primary btn-sm" onclick="confirmStoreCompletePayment('${id}')">Confirm Sent</button>`);
 };
 window.confirmStoreCompletePayment = async (id) => {
   try {
@@ -1246,6 +1251,22 @@ window.deleteStoreInvoice = async (id) => {
 
 window.downloadStoreInvoiceFile = async (id) => {
   try { await downloadAuthed(`/store-billing/invoices/${id}/file`, 'invoice'); } catch (err) { toast(err.message, true); }
+};
+
+// Settable any time, regardless of status — unlike the payment-sent note
+// (tied to an email that's already gone out once completed), this is
+// purely internal and reopening the invoice modal afterward re-fetches it
+// so the updated note shows immediately.
+window.editStoreInvoiceNote = (id, currentNote) => {
+  const body = `<label>Internal Note <span class="small-muted">(never shown to the store)</span></label><textarea id="ein-note" rows="4">${esc(currentNote || '')}</textarea>`;
+  openModal('Internal Note', body, `<button class="btn btn-primary btn-sm" onclick="confirmEditStoreInvoiceNote('${id}')">Save</button>`);
+};
+window.confirmEditStoreInvoiceNote = async (id) => {
+  try {
+    await api(`/store-billing/invoices/${id}/notes`, { method: 'POST', body: { admin_notes: qs('#ein-note').value } });
+    toast('Note saved');
+    openStoreInvoiceModal(id, window.__storeInvoiceOnDone);
+  } catch (err) { toast(err.message, true); }
 };
 
 // Shared SMS+Email history/quick-send tab for applicant & shul detail modals.

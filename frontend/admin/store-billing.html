@@ -93,7 +93,7 @@ window.viewPeriod = async (id) => {
       <table><thead><tr><th>Store</th><th>Email</th><th>Submitted?</th></tr></thead>
       <tbody>${invited.map(i => `<tr><td>${esc(i.store_name)}</td><td>${badge(i.email_status, i.email_status === 'sent' ? 'active' : 'rejected')}</td><td>${i.submitted ? badge('yes', 'active') : badge('no', 'pending')}</td></tr>`).join('')}</tbody></table>
     `;
-    openModal(`Billing Period — ${esc(period.label)}`, body, '', { wide: true });
+    openModal(`Billing Period — ${period.label}`, body, '', { wide: true });
   } catch (err) { toast(err.message, true); }
 };
 

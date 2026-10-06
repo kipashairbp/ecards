@@ -69,12 +69,15 @@ router.get('/stats', (req, res) => {
     // deactivated + lost grouped together (both mean "no longer a live
     // card"), same reasoning as applicants.other above.
     deactivated: cardStatusCount('deactivated') + cardStatusCount('lost'),
-    // Of the cards that are currently active, how many actually have money
-    // loaded onto them (cards.amount > 0) — the "Activated Accounts" stat
-    // on this dashboard shows just this number (no denominator); the main
-    // Dashboard shows it as a fraction of `activated` above. Same
-    // underlying fact, two different presentations.
-    activatedWithMoney: db.prepare(`SELECT COUNT(*) c FROM cards WHERE org_id = ? AND status = 'activated' AND amount > 0${seasonClause}`).get(orgId, ...seasonParams).c,
+    // Distinct approved applicants with at least one currently-active card
+    // (accounts, not cards — an applicant with 2 cards and 1 active still
+    // counts once) — the "Activated Accounts" stat on this dashboard shows
+    // just this number; the main Dashboard shows it as a fraction of
+    // `applicants.approved` above (same underlying fact, two presentations).
+    // Not conditioned on cards.amount > 0 — a card can be genuinely active
+    // with no money loaded yet, and that shouldn't exclude it here.
+    activatedAccounts: db.prepare(`SELECT COUNT(DISTINCT a.id) c FROM applicants a JOIN cards c ON c.applicant_id = a.id
+      WHERE a.org_id = ? AND a.approval_status = 'approved' AND c.status = 'activated'${seasonId ? ' AND a.season_id = ?' : ''}`).get(orgId, ...seasonParams).c,
   };
 
   // Same two formulas as routes/dashboard.js's funds panel: loaded is every

@@ -215,7 +215,7 @@ async function loadDonorDashboard() {
   qs('#kpi-row').innerHTML = [
     ['Total Applicants', applicants.total, 'var(--viz-1)', EXEC_ICONS.people],
     ['Approved Applicants', applicants.approved, 'var(--viz-good)', EXEC_ICONS.check],
-    ['Activated Accounts', cards.activatedWithMoney, 'var(--viz-2)', EXEC_ICONS.card],
+    ['Activated Accounts', `${cards.activatedAccounts}/${applicants.approved}`, 'var(--viz-2)', EXEC_ICONS.card],
     ['Money Loaded', fmtMoney(funds.loaded), 'var(--brand-gold-dark)', EXEC_ICONS.coin],
     ['Money Spent', fmtMoney(funds.spent), 'var(--brand-gold-dark)', EXEC_ICONS.receipt],
     ['Open Duplicate Flags', duplicatesOpen, duplicatesOpen > 0 ? 'var(--viz-critical)' : 'var(--viz-muted)', EXEC_ICONS.alert],

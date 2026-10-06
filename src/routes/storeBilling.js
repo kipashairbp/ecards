@@ -293,6 +293,21 @@ router.get('/stores/:storeId/payment-info/reveal', requirePermission('store_bill
   res.json({ paymentInfo: row });
 });
 
+// Internal note, settable independent of status/payment — unlike
+// payment_note (which only ever goes out with the one "payment sent"
+// email and would be misleading to edit after that email already sent),
+// admin_notes is purely for the admin's own record-keeping and makes
+// sense to add or update any time, including well after an invoice is
+// already marked completed or rejected.
+router.post('/invoices/:id/notes', requirePermission('store_billing', 'can_edit'), (req, res) => {
+  const bill = db.prepare('SELECT * FROM store_bill_submissions WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
+  if (!bill) return res.status(404).json({ error: 'Not found' });
+  const { admin_notes } = req.body || {};
+  db.prepare(`UPDATE store_bill_submissions SET admin_notes = ? WHERE id = ?`).run(admin_notes || null, bill.id);
+  logAudit(req.user.org_id, req.user.id, 'update_invoice_note', 'store', bill.store_id, { admin_notes: bill.admin_notes }, { admin_notes }, req.ip);
+  res.json({ bill: db.prepare('SELECT * FROM store_bill_submissions WHERE id = ?').get(bill.id) });
+});
+
 router.post('/invoices/:id/reject', requirePermission('store_billing', 'can_edit'), (req, res) => {
   const bill = db.prepare('SELECT * FROM store_bill_submissions WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
   if (!bill) return res.status(404).json({ error: 'Not found' });
