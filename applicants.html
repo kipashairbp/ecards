@@ -1,0 +1,1433 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Applicants · Kipas Hair BP Platform</title>
+<link rel="stylesheet" href="/css/theme.css">
+<link rel="icon" type="image/png" sizes="32x32" href="/img/favicon-32.png">
+<link rel="apple-touch-icon" href="/img/apple-touch-icon.png">
+<link rel="stylesheet" href="/css/portal-theme.css">
+</head>
+<body>
+<script src="/js/app.js"></script>
+<script>
+Auth.requireAdmin();
+renderShell('/admin/applicants', `
+  <div class="list-header">
+    <div class="flex-between">
+      <h2>Applicants</h2>
+      <div class="pill-row">
+        <button class="btn btn-outline btn-sm" id="btn-template">Download Import Template</button>
+        <button class="btn btn-outline btn-sm" id="btn-import">Mass Upload</button>
+        <button class="btn btn-outline btn-sm" id="btn-export">Export Excel</button>
+        <button class="btn btn-outline btn-sm" id="f-dupes">Duplicates</button>
+        <button class="btn btn-outline btn-sm" id="btn-appeals">Appeals</button>
+        <button class="btn btn-outline btn-sm" id="btn-provider-sync">Disccardpromos Sync</button>
+        <button class="btn btn-outline btn-sm" id="btn-columns">Customize Columns</button>
+        <button class="btn btn-primary btn-sm" id="btn-new">+ Add Applicant</button>
+      </div>
+    </div>
+    <div class="toolbar">
+      <input id="f-search" placeholder="Search name, phone, email…">
+      <select id="f-status"><option value="">All statuses</option><option value="pending">Pending</option><option value="approved">Approved</option><option value="rejected">Rejected</option><option value="soft_rejected">Soft Reject</option><option value="incomplete">Incomplete</option><option value="draft">Draft</option></select>
+      <select id="f-paused"><option value="">Paused: All</option><option value="1">Paused only</option><option value="0">Not paused</option></select>
+      <select id="f-wna"><option value="">Will Not Activate: All</option><option value="1">Marked only</option><option value="0">Not marked</option></select>
+      <select id="f-marital"><option value="">Any marital status</option><option value="single">Single</option><option value="married">Married</option><option value="widowed">Widowed</option><option value="divorced">Divorced</option></select>
+      <select id="f-shul"><option value="">All Shuls</option></select>
+      <select id="f-season"></select>
+      <div class="amount-filter"><input id="f-amount-min" type="number" min="0" step="1" placeholder="Min $"><span class="small-muted">&ndash;</span><input id="f-amount-max" type="number" min="0" step="1" placeholder="Max $"></div>
+      <select id="f-pagesize"><option value="25">25 / page</option><option value="50">50 / page</option><option value="100">100 / page</option><option value="200">200 / page</option></select>
+    </div>
+  </div>
+  <div id="cap-banner"></div>
+  <div class="toolbar" style="justify-content:flex-end">
+    <select id="mass-action">
+      <option value="approve">Approve</option>
+      <option value="reject">Reject</option>
+      <option value="set-pending">Set to Pending</option>
+      <option value="email">Email</option>
+      <option value="sms">SMS</option>
+      <option value="delete">Delete Permanently</option>
+    </select>
+    <button class="btn btn-sm btn-outline" id="btn-select-all-filtered">Select All Matching Filters</button>
+    <button class="btn btn-sm btn-primary" id="btn-mass-apply" disabled>Apply to Selected (0)</button>
+  </div>
+  <div id="live-banner"></div>
+  <div id="provider-sync-banner"></div>
+  <div class="card" style="padding:0;overflow-x:auto">
+    <table id="tbl">
+      <thead id="thead"></thead>
+      <tbody id="tbody"><tr><td class="empty-state">Loading…</td></tr></tbody>
+    </table>
+  </div>
+  <div class="paginator" id="pager"></div>
+`);
+
+let state = { search:'', status:'', paused:'', will_not_activate:'', marital_status:'', shul_id:'', season_id:'', provider_sync:'', provider_check:'', amount_min:'', amount_max:'', sort:'created_at', dir:'DESC', page:1, pageSize:Auth.pageSize('applicants') };
+let selected = new Set();
+// Each row's own last-loaded data, keyed by id — kept around (across pages,
+// across reloads) purely so a mass action can tell upfront how many of the
+// current selection would be skipped (see massActionSkipNote in app.js)
+// without a separate fetch. Only ever needs an id that was actually
+// rendered at some point, which checking its box requires anyway.
+let selectedMeta = new Map();
+// Which target-state each mass action checks for, so the skip-count preview
+// can tell an admin "3 of 5 are already approved" before running it instead
+// of only after. No entry (delete) = no skip check, same as before this.
+const MASS_SKIP_PREDICATES = {
+  approve: a => a.approval_status !== 'approved' && !a.is_paused,
+  reject: a => a.approval_status !== 'rejected',
+  'set-pending': a => a.approval_status !== 'pending',
+  email: a => !!a.email,
+  sms: a => !!(a.husband_cell || a.wife_cell || a.home_phone),
+};
+
+// Every field a column can show, plus how to render it — the checkbox
+// (selection) column is always first and never customizable, so it's not
+// in this list. Which of these show, and in what order, is per-admin
+// (Customize Columns button, saved via attachColumnCustomizer).
+function contactLine(a) {
+  const method = a.preferred_contact_method || '';
+  const num = a.preferred_number === 'husband' ? a.husband_cell : a.preferred_number === 'wife' ? a.wife_cell : a.home_phone;
+  return `${esc(method)}${num ? ': ' + esc(num) : ''}${a.email ? '<br>' + esc(a.email) : ''}`;
+}
+const APPLICANT_COLUMNS = [
+  { key: 'external_id', label: 'ID', sort: 'external_id', render: a => `<code>${esc(a.external_id||'')}</code>` },
+  { key: 'name', label: 'Name', sort: 'last_name', render: a => `<strong>${esc(a.first_name)} ${esc(a.last_name)}</strong>${a.is_paused ? ' ' + badge('paused','paused') : ''}` },
+  { key: 'shul', label: 'Shul', render: a => a.contributing_shuls?.length > 1
+    ? `<div class="shul-pill-group">${a.contributing_shuls.map((n, i) => `<span class="shul-pill${i===0?' primary':''}">${esc(n)}</span>`).join('')}</div>`
+    : esc(a.shul_name || (a.approval_status === 'soft_rejected' && a.previous_shul_name ? `Previously: ${a.previous_shul_name}` : '')) },
+  { key: 'marital_status', label: 'Marital', render: a => esc(a.marital_status||'') },
+  { key: 'contact', label: 'Contact', render: a => contactLine(a) },
+  { key: 'email', label: 'Email', render: a => esc(a.email||'') },
+  { key: 'home_phone', label: 'Home Phone', render: a => esc(a.home_phone||'') },
+  { key: 'husband_cell', label: 'Husband Cell', render: a => esc(a.husband_cell||'') },
+  { key: 'wife_cell', label: 'Wife Cell', render: a => esc(a.wife_cell||'') },
+  { key: 'address', label: 'Address', render: a => esc([a.address,a.city,a.state,a.zip].filter(Boolean).join(', ')) },
+  { key: 'num_children', label: 'Children', sort: 'num_children', render: a => a.num_children ?? 0 },
+  { key: 'home_for_yomtov', label: 'Home Yom Tov', render: a => a.home_for_yomtov ? 'Yes' : 'No' },
+  { key: 'approval_status', label: 'Status', sort: 'approval_status', render: a => badge(a.approval_status, a.approval_status)
+    + (a.approval_status === 'rejected' && a.rejection_reason ? `<div class="rejection-reason" title="${esc(a.rejection_reason)}">${esc(a.rejection_reason)}</div>` : '') },
+  { key: 'card_amount', label: 'Card $', sort: 'card_amount', render: a => a.card_amount != null ? fmtMoney(a.card_amount) : '' },
+  { key: 'active_card_count', label: '# of Cards', render: a => a.active_card_count || 0 },
+  { key: 'will_not_activate', label: 'Will Not Activate', render: a => a.will_not_activate ? `${badge('yes','paused')}${a.will_not_activate_at ? `<div class="small-muted">${fmtDate(a.will_not_activate_at)}</div>` : ''}` : '' },
+  { key: 'provider_sync', label: 'Disccardpromos', render: a => providerSyncBadge(a.provider_sync) },
+  { key: 'provider_check_status', label: 'Disccardpromos Says', render: a => providerCheckBadge(a.provider_check_status) },
+  { key: 'comments', label: 'Comments', render: a => esc(a.comments||'') },
+  { key: 'created_at', label: 'Submitted', sort: 'created_at', render: a => fmtDate(a.created_at) },
+];
+const DEFAULT_APPLICANT_COLUMNS = ['external_id','name','shul','marital_status','contact','num_children','home_for_yomtov','approval_status','card_amount','active_card_count','created_at'];
+let activeColumns = DEFAULT_APPLICANT_COLUMNS;
+
+function renderThead() {
+  const cols = activeColumns.map(k => APPLICANT_COLUMNS.find(c => c.key === k)).filter(Boolean);
+  qs('#thead').innerHTML = `<tr>
+    <th style="width:34px"><input type="checkbox" id="chk-all"></th>
+    ${cols.map(c => `<th ${c.sort ? `data-sort="${c.sort}"` : ''}>${esc(c.label)}</th>`).join('')}
+    <th></th>
+  </tr>`;
+  qs('#chk-all').addEventListener('change', (e) => { qsa('.row-chk:not(:disabled)').forEach(c => { c.checked = e.target.checked; c.dispatchEvent(new Event('change')); }); });
+}
+qs('#thead').parentElement.addEventListener('click', (e) => {
+  const th = e.target.closest('th[data-sort]');
+  if (!th) return;
+  const key = th.dataset.sort;
+  state.dir = (state.sort === key && state.dir === 'DESC') ? 'ASC' : 'DESC';
+  state.sort = key; load();
+});
+
+async function load() {
+  const params = new URLSearchParams(Object.fromEntries(Object.entries(state).filter(([,v]) => v !== '')));
+  const providerSyncBannerText = { missing: 'Showing only approved applicants missing a disccardpromos account.', deactivated: 'Showing only no-longer-approved applicants that still carry a real disccardpromos account.' }[state.provider_sync]
+    || (state.provider_check ? `Showing only applicants disccardpromos reported as "${PROVIDER_CHECK_LABELS[state.provider_check] || state.provider_check}" in the last verification.` : '');
+  qs('#provider-sync-banner').innerHTML = providerSyncBannerText
+    ? `<div class="card" style="padding:10px 14px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center">
+        <span>${providerSyncBannerText}</span>
+        <button class="btn btn-sm btn-outline" onclick="clearProviderSyncFilter()">Clear filter</button>
+      </div>` : '';
+  try {
+    const { applicants, total } = await api('/applicants?' + params);
+    for (const a of applicants) selectedMeta.set(a.id, a);
+    const cols = activeColumns.map(k => APPLICANT_COLUMNS.find(c => c.key === k)).filter(Boolean);
+    qs('#tbody').innerHTML = applicants.length ? applicants.map(a => rowHtml(a, cols)).join('') : `<tr><td colspan="${cols.length+2}" class="empty-state">No applicants found.</td></tr>`;
+    const pages = Math.max(1, Math.ceil(total / state.pageSize));
+    qs('#pager').innerHTML = `<button class="btn btn-sm btn-outline" ${state.page<=1?'disabled':''} onclick="changePage(-1)">Prev</button> Page ${state.page} of ${pages} (${total} total) <button class="btn btn-sm btn-outline" ${state.page>=pages?'disabled':''} onclick="changePage(1)">Next</button>`;
+    qsa('.row-chk').forEach(c => c.addEventListener('change', onCheck));
+  } catch (err) { toast(err.message, true); }
+}
+function changePage(d) { state.page += d; load(); }
+
+function rowHtml(a, cols) {
+  return `<tr onclick="openApplicant('${a.id}')" style="cursor:pointer">
+    <td onclick="event.stopPropagation()"><input type="checkbox" class="row-chk" data-id="${a.id}"></td>
+    ${cols.map(c => `<td>${c.render(a)}</td>`).join('')}
+    <td><button class="btn btn-sm btn-outline" onclick="event.stopPropagation();openApplicant('${a.id}')">View</button></td>
+  </tr>`;
+}
+
+function onCheck(e) {
+  const id = e.target.dataset.id;
+  if (e.target.checked) selected.add(id); else selected.delete(id);
+  qs('#btn-mass-apply').textContent = `Apply to Selected (${selected.size})`;
+  qs('#btn-mass-apply').disabled = selected.size === 0;
+}
+
+// Selects every id matching the CURRENT filters — every page, not just the
+// one on screen — in one click, so "email every approved applicant at Shul
+// X" doesn't mean paging through and re-checking chk-all on each page.
+// Reuses `state` exactly as `load()` does (page/pageSize/sort/dir are
+// harmless extras GET /applicants/ids just ignores). Merges into `selected`
+// rather than replacing it, so it composes with rows already hand-picked.
+qs('#btn-select-all-filtered').addEventListener('click', async () => {
+  const btn = qs('#btn-select-all-filtered');
+  btn.disabled = true;
+  try {
+    const params = new URLSearchParams(Object.fromEntries(Object.entries(state).filter(([,v]) => v !== '')));
+    const { ids } = await api('/applicants/ids?' + params);
+    for (const id of ids) selected.add(id);
+    qsa('.row-chk').forEach(c => { if (selected.has(c.dataset.id)) c.checked = true; });
+    qs('#chk-all').checked = qsa('.row-chk').length > 0 && qsa('.row-chk:not(:checked)').length === 0;
+    qs('#btn-mass-apply').textContent = `Apply to Selected (${selected.size})`;
+    qs('#btn-mass-apply').disabled = selected.size === 0;
+    toast(`Selected ${ids.length} matching the current filters`);
+  } catch (err) { toast(err.message, true); }
+  finally { btn.disabled = false; }
+});
+
+qs('#f-search').addEventListener('input', debounce(() => { state.search = qs('#f-search').value; state.page = 1; load(); }, 350));
+qs('#f-status').addEventListener('change', () => { state.status = qs('#f-status').value; state.page = 1; load(); });
+qs('#f-paused').addEventListener('change', () => { state.paused = qs('#f-paused').value; state.page = 1; load(); });
+qs('#f-wna').addEventListener('change', () => { state.will_not_activate = qs('#f-wna').value; state.page = 1; load(); });
+qs('#f-marital').addEventListener('change', () => { state.marital_status = qs('#f-marital').value; state.page = 1; load(); });
+qs('#f-shul').addEventListener('change', () => { state.shul_id = qs('#f-shul').value; state.page = 1; load(); });
+qs('#f-amount-min').addEventListener('input', debounce(() => { state.amount_min = qs('#f-amount-min').value; state.page = 1; load(); }, 350));
+qs('#f-amount-max').addEventListener('input', debounce(() => { state.amount_max = qs('#f-amount-max').value; state.page = 1; load(); }, 350));
+qs('#f-season').addEventListener('change', () => {
+  state.season_id = qs('#f-season').value; state.page = 1;
+  // The shul filter is scoped to the season (a shul is a fresh row every
+  // season) — a shul picked under the old season almost certainly isn't a
+  // valid id in the new one, so reset the filter along with the list rather
+  // than silently keep filtering by a shul_id that can never match anything.
+  state.shul_id = ''; populateShulFilter('f-shul', state.season_id);
+  load();
+});
+qs('#f-pagesize').value = state.pageSize;
+qs('#f-pagesize').addEventListener('change', () => { state.pageSize = +qs('#f-pagesize').value; state.page = 1; Auth.savePageSize('applicants', state.pageSize); load(); });
+function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
+
+qs('#btn-template').addEventListener('click', () => downloadAuthed('/applicants/import/template', 'applicant_import_template.xlsx'));
+qs('#btn-export').addEventListener('click', () => downloadAuthed('/applicants/export?' + new URLSearchParams(Object.fromEntries(Object.entries(state).filter(([k,v]) => v !== '' && !['sort','dir','page','pageSize'].includes(k)))), 'applicants.xlsx'));
+qs('#btn-new').addEventListener('click', () => openApplicantForm());
+qs('#btn-import').addEventListener('click', () => openImportModal());
+qs('#f-dupes').addEventListener('click', showDuplicates);
+qs('#btn-appeals').addEventListener('click', showAppeals);
+qs('#btn-provider-sync').addEventListener('click', showProviderSync);
+
+// null = not approved (irrelevant); the three real states an approved
+// applicant can be in — see providerSyncStatus() in routes/applicants.js
+// for what each one actually means. A $0 card amount is NOT its own state
+// here — both approve routes always attempt the account write regardless
+// of amount (amount only gates whether funds get loaded onto it after),
+// so a $0 applicant still shows as 'synced' once the account exists.
+function providerSyncBadge(status) {
+  if (!status) return '';
+  const labels = { synced: 'Synced', exempt: 'Exempt', missing: 'Missing', deactivated: 'Deactivated' };
+  const classes = { synced: 'approved', exempt: 'submitted', missing: 'rejected', deactivated: 'pending' };
+  return badge(labels[status] || status, classes[status] || status);
+}
+
+// Answers "594 approved but only 567 in disccardpromos" directly, with the
+// breakdown behind the gap — 'exempt' is expected and not a problem;
+// 'missing' is the one number worth acting on.
+// Status only — nothing here needs clicking to keep the two systems matched.
+// The automatic match (routes/applicants.js's enforceProviderForOrg) runs
+// on its own after every deploy, every 15 minutes, and right after any
+// approval/rejection whose disccardpromos call failed. This just shows the
+// last run's verdict and the few things only a human can fix (an approved
+// applicant with no shul, a data value disccardpromos rejects outright).
+async function showProviderSync() {
+  try {
+    const params = seasonParam();
+    const [s, e] = await Promise.all([api('/applicants/provider-sync-summary' + params), api('/applicants/provider-enforce' + params)]);
+    const r = e.result;
+    const verdict = e.status === 'running'
+      ? `<p><strong>Automatic match is running right now</strong> (${e.progress} of ${e.total || '…'})…</p>`
+      : !r ? `<p class="small-muted">The automatic match hasn't run for this season yet. It runs about 40 seconds after every deploy or restart, then every 15 minutes. (It never runs while the season has no live disccardpromos API key.)</p>`
+      : r.matched
+        ? `<p style="color:var(--success,green)"><strong>Matched.</strong> disccardpromos active accounts: <strong>${r.after.active}</strong> = your distinct accounts: <strong>${r.ours.distinctActiveAccounts}</strong>. Last checked ${fmtDateTime(r.ranAt)}.</p>`
+        : `<p style="color:var(--danger)"><strong>Not matched.</strong> disccardpromos active: <strong>${r.after?.active ?? '?'}</strong> vs your distinct accounts: <strong>${r.ours.distinctActiveAccounts}</strong>. Last run ${fmtDateTime(r.ranAt)}.${r.after ? '' : ' (Their customer list could not be pulled on that run.)'}</p>`;
+    const needs = r?.unfixable?.length
+      ? `<p class="small-muted" style="margin-top:10px;color:var(--danger)"><strong>${r.unfixable.length} need a human</strong> — the automatic match cannot fix these:</p><ul style="margin:6px 0 0;padding-left:18px;font-size:13px">${r.unfixable.map(u => `<li>${esc(u.name)} — ${esc(u.reason)}</li>`).join('')}</ul>`
+      : '';
+    const body = `
+      ${verdict}
+      ${needs}
+      <table style="width:100%;margin-top:12px">
+        <tr><td>Approved applicants this season</td><td style="text-align:right"><strong>${s.approved}</strong></td></tr>
+        ${r ? `<tr><td>… sharing one account as merged duplicates</td><td style="text-align:right">${r.counts.sharedByMerge}</td></tr>` : ''}
+        <tr><td>… exempt (backfill import — never sent, on purpose)</td><td style="text-align:right">${s.exempt}</td></tr>
+        <tr><td>… without any account right now</td><td style="text-align:right">${s.missing}</td></tr>
+        <tr style="border-top:1px solid var(--border)"><td><strong>Distinct accounts that should be active</strong></td><td style="text-align:right"><strong>${r ? r.ours.distinctActiveAccounts : s.distinctAccounts}</strong></td></tr>
+        ${r?.after ? `
+          <tr style="border-top:1px solid var(--border)"><td>disccardpromos — active</td><td style="text-align:right"><strong>${r.after.active}</strong></td></tr>
+          <tr><td>disccardpromos — inactive (rejected/pending/held by nobody, locked on purpose)</td><td style="text-align:right">${r.after.inactive}</td></tr>
+          <tr><td>disccardpromos — total customers</td><td style="text-align:right">${r.after.total}</td></tr>` : ''}
+      </table>
+      ${r ? `<p class="small-muted" style="margin-top:12px">Last run: ${r.counts.alreadyRight} already right · ${r.counts.relinked} relinked · ${r.counts.reactivated} re-activated · ${r.counts.created} created${r.counts.fundsLoaded ? ` (${r.counts.fundsLoaded} loaded with funds)` : ''} · ${r.counts.deactivatedNonApproved + r.counts.deactivatedOrphans} deactivated.</p>` : ''}
+      ${r?.notes?.length ? `<p class="small-muted" style="margin-top:8px">Notes:</p><ul style="margin:6px 0 0;padding-left:18px;font-size:13px">${r.notes.map(n => `<li>${esc(n)}</li>`).join('')}</ul>` : ''}
+    `;
+    const footer = `
+      ${s.missing ? `<button class="btn btn-outline btn-sm" onclick="closeModal();viewMissingProviderSync()">View the ${s.missing} without an account</button>` : ''}
+      <button class="btn btn-outline btn-sm" onclick="closeModal();startProviderAudit()">Verify Against Disccardpromos (read-only)</button>
+      <button class="btn btn-primary btn-sm" ${e.status === 'running' ? 'disabled' : ''} onclick="closeModal();startProviderEnforce()">Make It Match Now</button>
+    `;
+    openModal('Disccardpromos Match Status', body, footer);
+  } catch (err) { toast(err.message, true); }
+}
+function viewMissingProviderSync() {
+  qs('#f-status').value = 'approved'; state.status = 'approved';
+  state.provider_sync = 'missing'; state.page = 1;
+  load();
+}
+// Deactivated spans every non-approved status (rejected/pending/soft_rejected)
+// — clears the status filter entirely rather than forcing one, unlike
+// viewMissingProviderSync which only ever means 'approved'.
+function viewDeactivatedProviderSync() {
+  qs('#f-status').value = ''; state.status = '';
+  state.provider_sync = 'deactivated'; state.page = 1;
+  load();
+}
+function clearProviderSyncFilter() { state.provider_sync = ''; state.provider_check = ''; load(); }
+
+// --- Verify Against Disccardpromos — ground truth from their API, both
+// directions. See routes/applicants.js's runProviderAudit for what each
+// outcome means. Runs server-side as a job (one API call per account), so
+// this polls for progress and then renders the saved result.
+const PROVIDER_CHECK_LABELS = { active: 'Exists, active', inactive: 'Exists, inactive', not_found: 'Does not exist', mock: 'Mock-mode id (never real)', error: 'Could not check', relinked: 'Found + relinked', missing: 'No account there either', cleared: 'Phantom id cleared' };
+function providerCheckBadge(status) {
+  if (!status) return '';
+  const classes = { active: 'approved', inactive: 'pending', not_found: 'rejected', mock: 'rejected', error: 'rejected', relinked: 'approved', missing: 'rejected', cleared: 'submitted' };
+  return badge(PROVIDER_CHECK_LABELS[status] || status, classes[status] || 'submitted');
+}
+function seasonParam() { return state.season_id ? `?season_id=${state.season_id}` : ''; }
+function seasonBody() { return state.season_id ? { season_id: state.season_id } : {}; }
+async function startProviderAudit() {
+  try {
+    await api('/applicants/provider-audit', { method: 'POST', body: seasonBody() });
+  } catch (err) {
+    // 409 = already running: just attach to it and show progress.
+    if (!/already running/i.test(err.message)) { toast(err.message, true); return; }
+  }
+  openModal('Verifying Against Disccardpromos', `<p id="provider-audit-progress">Starting…</p><p class="small-muted">One call per account — a few hundred accounts takes a minute or two. You can close this; the result is saved and reopens from the same button.</p>`, '');
+  const poll = async () => {
+    let r;
+    try { r = await api('/applicants/provider-audit' + seasonParam()); } catch (err) { toast(err.message, true); return; }
+    if (r.status === 'running') {
+      const el = qs('#provider-audit-progress');
+      if (el) el.textContent = `Checked ${r.progress} of ${r.total || '…'}`;
+      setTimeout(poll, 1500);
+      return;
+    }
+    if (r.status === 'error') { openModal('Verification Failed', `<p style="color:var(--danger)">${esc(r.error || 'Unknown error')}</p>`, ''); return; }
+    showProviderAuditResult(r.result);
+  };
+  setTimeout(poll, 800);
+}
+async function showLastProviderAudit() {
+  try {
+    const r = await api('/applicants/provider-audit' + seasonParam());
+    if (r.status === 'running') return startProviderAudit();
+    if (!r.result) return toast('No verification has been run for this season yet.', true);
+    showProviderAuditResult(r.result);
+  } catch (err) { toast(err.message, true); }
+}
+function showProviderAuditResult(res) {
+  const o = res.ours, p = res.provider;
+  const list = (items, fmt) => items.length ? `<ul style="margin:6px 0 0;padding-left:18px;font-size:13px">${items.slice(0, 60).map(fmt).join('')}${items.length > 60 ? `<li>…and ${items.length - 60} more (use the View button)</li>` : ''}</ul>` : '';
+  const phantom = o.not_found + o.mock;
+  const body = `
+    <p class="small-muted">Ran ${fmtDateTime(res.ranAt)}. Every account id this season holds was checked directly against disccardpromos${p ? ', and their full customer list was pulled for the reverse check' : ''}.</p>
+    <table style="width:100%">
+      <tr><td>Distinct account ids we hold</td><td style="text-align:right"><strong>${o.distinctAccounts}</strong></td></tr>
+      <tr><td>… disccardpromos confirms, active</td><td style="text-align:right">${o.active}</td></tr>
+      <tr><td>… disccardpromos confirms, inactive</td><td style="text-align:right">${o.inactive}</td></tr>
+      <tr><td style="color:var(--danger)">… disccardpromos says do NOT exist</td><td style="text-align:right;color:var(--danger)"><strong>${o.not_found}</strong></td></tr>
+      <tr><td style="color:var(--danger)">… mock-mode placeholders (never real)</td><td style="text-align:right;color:var(--danger)"><strong>${o.mock}</strong></td></tr>
+      ${o.error ? `<tr><td>… could not be checked (API error)</td><td style="text-align:right">${o.error}</td></tr>` : ''}
+      <tr><td>Approved applicants with no id here, but found on disccardpromos and relinked</td><td style="text-align:right">${o.relinked}</td></tr>
+      <tr><td>Approved applicants with no account anywhere (still missing)</td><td style="text-align:right">${o.stillMissing}</td></tr>
+      ${p ? `
+        <tr style="border-top:1px solid var(--border)"><td><strong>disccardpromos' own customer count</strong></td><td style="text-align:right"><strong>${p.total}</strong></td></tr>
+        <tr><td>… active / inactive</td><td style="text-align:right">${p.active} / ${p.inactive}</td></tr>
+        <tr><td style="color:var(--danger)">… customers there that nothing here points at</td><td style="text-align:right;color:var(--danger)"><strong>${p.orphans.length}</strong></td></tr>
+      ` : `<tr style="border-top:1px solid var(--border)"><td colspan="2" class="small-muted">Their customer list could not be pulled${res.listError ? `: ${esc(res.listError)}` : ''} — only our side was verified.</td></tr>`}
+    </table>
+    ${phantom ? `<p class="small-muted" style="margin-top:12px"><strong>${phantom} phantom id(s)</strong> — we count these as accounts, disccardpromos doesn't have them. This is what inflates our number above theirs. Clear them, then Retry Sync re-creates real accounts for any that are approved.</p>${list(res.details.not_found.concat(res.details.mock), d => `<li>${esc(d.names)} — ${esc(d.statuses)} — id ${esc(d.accountId)}</li>`)}` : ''}
+    ${o.relinked ? `<p class="small-muted" style="margin-top:12px"><strong>${o.relinked} relinked</strong> — these already existed on disccardpromos; we'd only lost the id. Nothing to re-create.</p>${list(res.details.relinked, d => `<li>${esc(d.names)} — id ${esc(d.accountId)}</li>`)}` : ''}
+    ${p && p.orphans.length ? `<p class="small-muted" style="margin-top:12px"><strong>${p.orphans.length} customer(s) on disccardpromos with no applicant here</strong> — created directly on their dashboard, from a record deleted here, or left behind by a merge from before this was fixed. These count on their side, never on ours. Deactivate locks it (reversible on their dashboard, nothing removed); Delete removes it for real on disccardpromos — every account should end up assigned to something here, so this is how to actually clear one out rather than leave it sitting inactive forever.</p>${list(p.orphans, c => `<li>${esc(c.name)} — id ${esc(c.accountId)}${c.externalId ? `, external id ${esc(c.externalId)}` : ', no external id'}${c.groupName ? `, group ${esc(c.groupName)}` : ''} — ${c.isActive ? 'active' : 'inactive'}${c.balance != null ? `, balance $${c.balance}` : ''}${c.origin ? `<br><span class="small-muted">${esc(c.origin)}</span>` : ''}${c.isActive ? ` <button class="btn btn-outline btn-sm" style="margin-left:6px" onclick="deactivateOrphan('${esc(c.accountId)}')">Deactivate</button>` : ''} <button class="btn btn-outline btn-sm" style="margin-left:6px;color:#b71c1c;border-color:#b71c1c" onclick="deleteOrphan('${esc(c.accountId)}', ${c.balance ?? 0})">Delete</button></li>`)}` : ''}
+    ${o.error ? `<p class="small-muted" style="margin-top:12px;color:var(--danger)">Could not check:</p>${list(res.details.error, d => `<li>${esc(d.names)}: ${esc(d.message || '')}</li>`)}` : ''}
+  `;
+  // Read-only: anything actionable here is picked up by the automatic match
+  // on its next run (see showProviderSync) — no buttons to click.
+  const footer = `
+    ${phantom ? `<button class="btn btn-outline btn-sm" onclick="viewProviderCheck('not_found')">View Phantoms</button>` : ''}
+    <button class="btn btn-outline btn-sm" onclick="closeModal();startProviderAudit()">Run Again</button>
+  `;
+  openModal('Disccardpromos Verification', body, footer);
+}
+// --- Make Disccardpromos Match — see routes/applicants.js's
+// runProviderEnforce. One job, in order: link/reactivate/create for every
+// approved applicant, deactivate everything nobody approved holds, then
+// re-pull their list and show their active count next to ours.
+async function startProviderEnforce() {
+  if (!confirm('Make disccardpromos match this season?\n\n• Every approved applicant gets one ACTIVE account (existing ones are re-activated or linked; missing ones are CREATED) loaded with their full Card Amount — real money. This also catches anyone whose balance is out of sync for any reason (a skipped/failed load, a later card_amount change, etc.) and corrects it to the right amount.\n• Accounts held only by rejected/pending applicants, or by nobody, are DEACTIVATED (never deleted).\n\nSafe to run again any time. Continue?')) return;
+  try {
+    await api('/applicants/provider-enforce', { method: 'POST', body: seasonBody() });
+  } catch (err) {
+    if (!/already in progress/i.test(err.message)) { toast(err.message, true); return; }
+  }
+  openModal('Making Disccardpromos Match', `<p id="provider-enforce-progress">Starting…</p><p class="small-muted">Only applicants that actually need a change trigger a call, so this is usually quick. You can close this; the result is saved.</p>`, '');
+  const poll = async () => {
+    let r;
+    try { r = await api('/applicants/provider-enforce' + seasonParam()); } catch (err) { toast(err.message, true); return; }
+    if (r.status === 'running') {
+      const el = qs('#provider-enforce-progress');
+      if (el) el.textContent = `Processed ${r.progress} of ${r.total || '…'}`;
+      setTimeout(poll, 1500); return;
+    }
+    if (r.status === 'error') { openModal('Match Run Failed', `<p style="color:var(--danger)">${esc(r.error || 'Unknown error')}</p>`, ''); return; }
+    showProviderEnforceResult(r.result);
+    load();
+  };
+  setTimeout(poll, 800);
+}
+function showProviderEnforceResult(r) {
+  const c = r.counts, o = r.ours, list = (items, fmt) => items.length ? `<ul style="margin:6px 0 0;padding-left:18px;font-size:13px">${items.map(fmt).join('')}</ul>` : '';
+  const verdict = r.after
+    ? (r.matched
+      ? `<p style="margin-top:12px;color:var(--success,green)"><strong>Matched.</strong> disccardpromos active = ${r.after.active} = your ${o.distinctActiveAccounts} distinct active accounts.</p>`
+      : `<p style="margin-top:12px;color:var(--danger)"><strong>Not matched yet:</strong> disccardpromos active ${r.after.active} vs your ${o.distinctActiveAccounts} distinct active accounts (${r.after.active - o.distinctActiveAccounts > 0 ? '+' : ''}${r.after.active - o.distinctActiveAccounts}). The list below is everything that still needs a human.</p>`)
+    : `<p style="margin-top:12px;color:var(--danger)">Their list could not be re-pulled for the final tally — run again.</p>`;
+  const body = `
+    <p class="small-muted">Ran ${fmtDateTime(r.ranAt)}.</p>
+    <table style="width:100%">
+      <tr><td>Approved applicants this season</td><td style="text-align:right"><strong>${o.approved}</strong></td></tr>
+      <tr><td>… sharing one account as merged duplicates</td><td style="text-align:right">${c.sharedByMerge}</td></tr>
+      <tr><td>… exempt (backfill, never sent)</td><td style="text-align:right">${o.exempt}</td></tr>
+      <tr><td>… could not be fixed (see below)</td><td style="text-align:right">${o.unfixable}</td></tr>
+      <tr style="border-top:1px solid var(--border)"><td><strong>= distinct accounts that should be active</strong></td><td style="text-align:right"><strong>${o.distinctActiveAccounts}</strong></td></tr>
+      <tr style="border-top:1px solid var(--border)"><td>disccardpromos active before → after</td><td style="text-align:right">${r.before.active} → <strong>${r.after ? r.after.active : '?'}</strong></td></tr>
+      <tr><td>disccardpromos inactive before → after</td><td style="text-align:right">${r.before.inactive} → ${r.after ? r.after.inactive : '?'}</td></tr>
+      <tr><td>disccardpromos total</td><td style="text-align:right">${r.after ? r.after.total : r.before.total}</td></tr>
+    </table>
+    ${verdict}
+    <p class="small-muted" style="margin-top:12px">This run: ${c.alreadyRight} already right · ${c.relinked} relinked · ${c.reactivated} re-activated · ${c.created} created${c.fundsLoaded ? ` (${c.fundsLoaded} loaded with funds)` : ''} · ${c.deactivatedNonApproved} deactivated (not approved) · ${c.deactivatedOrphans} deactivated (held by nobody)</p>
+    ${r.unfixable.length ? `<p class="small-muted" style="margin-top:10px;color:var(--danger)"><strong>Still need a human:</strong></p>${list(r.unfixable, u => `<li>${esc(u.name)} — ${esc(u.reason)}</li>`)}` : ''}
+    ${r.deactivated.length ? `<p class="small-muted" style="margin-top:10px">Deactivated:</p>${list(r.deactivated, d => `<li>${esc(d)}</li>`)}` : ''}
+    ${r.notes.length ? `<p class="small-muted" style="margin-top:10px">Notes:</p>${list(r.notes, n => `<li>${esc(n)}</li>`)}` : ''}
+  `;
+  openModal('Disccardpromos Match Result', body, `<button class="btn btn-outline btn-sm" onclick="closeModal();startProviderEnforce()">Run Again</button>`);
+}
+async function deactivateOrphan(accountId) {
+  if (!confirm(`Deactivate disccardpromos customer ${accountId}? No applicant here holds it. The card is locked on their side (reversible there); nothing is deleted.`)) return;
+  try {
+    await api('/applicants/provider-audit/deactivate-orphan', { method: 'POST', body: { ...seasonBody(), account_id: accountId } });
+    toast(`Customer ${accountId} deactivated on disccardpromos`);
+    showLastProviderAudit();
+  } catch (err) { toast(err.message, true); }
+}
+// Permanently removes it on disccardpromos, unlike Deactivate above — see
+// routes/applicants.js's /provider-audit/delete-orphan.
+async function deleteOrphan(accountId, balance) {
+  if (!confirm(`Permanently delete disccardpromos customer ${accountId}?\n\nNo applicant here holds it.${balance ? ` It currently has a balance of $${balance} — this is NOT moved anywhere first, check/transfer it on disccardpromos yourself before deleting if it's worth recovering.` : ''}\n\nThis cannot be undone.`)) return;
+  try {
+    await api('/applicants/provider-audit/delete-orphan', { method: 'POST', body: { ...seasonBody(), account_id: accountId } });
+    toast(`Customer ${accountId} deleted from disccardpromos`);
+    showLastProviderAudit();
+  } catch (err) { toast(err.message, true); }
+}
+function viewProviderCheck(status) {
+  closeModal();
+  qs('#f-status').value = ''; state.status = ''; state.provider_sync = '';
+  state.provider_check = status; state.page = 1;
+  load();
+}
+async function clearPhantomAccounts() {
+  if (!confirm('Clear every account id that disccardpromos says does not exist (or that was only a mock-mode placeholder)? Nothing on disccardpromos is touched — those accounts are not there. Approved applicants become "Missing" and can then be re-synced.')) return;
+  try {
+    const r = await api('/applicants/provider-audit/clear-phantoms', { method: 'POST', body: seasonBody() });
+    toast(`Cleared ${r.cleared} phantom id(s)`);
+    closeModal(); load();
+    showProviderSync();
+  } catch (err) { toast(err.message, true); }
+}
+async function retryProviderSync() {
+  if (!confirm('Re-create a disccardpromos account for every approved applicant that has none? A brand-new account is loaded with that applicant\'s Card Amount, exactly as approval would have done — real money. An account that turns out to already exist is only linked back, never re-loaded.')) return;
+  try {
+    closeModal();
+    toast('Re-syncing missing applicants with disccardpromos…');
+    const r = await api('/applicants/retry-provider-sync', { method: 'POST', body: seasonBody() });
+    const body = `
+      <p>Attempted ${r.attempted}. Created ${r.created} new account(s)${r.fundsLoaded ? ` (${r.fundsLoaded} loaded with funds)` : ''}, linked ${r.linkedExisting} that already existed, linked ${r.linkedSecondaries} merged record(s) to their primary${r.failed ? `, <strong style="color:var(--danger)">${r.failed} failed</strong>` : ''}.</p>
+      ${r.failureDetails.length ? `<div class="small-muted" style="margin-top:8px;color:var(--danger)">${r.failureDetails.map(d => esc(d)).join('<br>')}</div>` : ''}
+      ${r.notes.length ? `<div class="small-muted" style="margin-top:8px">${r.notes.map(d => esc(d)).join('<br>')}</div>` : ''}
+    `;
+    openModal('Retry Sync', body, '');
+    load();
+  } catch (err) { toast(err.message, true); }
+}
+async function retryDeactivation() {
+  try {
+    const r = await api('/applicants/retry-deactivation', { method: 'POST', body: {} });
+    const body = `
+      <p>Attempted ${r.attempted} applicant(s). ${r.succeeded} deactivated successfully${r.failed ? `, ${r.failed} still failed` : ''}.</p>
+      ${r.failureDetails.length ? `<div class="small-muted" style="margin-top:8px;color:var(--danger)">${r.failureDetails.map(d => esc(d)).join('<br>')}</div>` : ''}
+    `;
+    openModal('Retry Deactivation', body, '');
+    load();
+  } catch (err) { toast(err.message, true); }
+}
+// Backfill for merge groups that predate a merged secondary automatically
+// sharing its primary's disccardpromos account — see
+// services/duplicates.js's reconcileAccountsForGroup. Sweeps every season
+// (not just the one currently filtered) since a stale merge from an old
+// season is just as real a duplicate account as a current one.
+async function reconcileMergedAccounts() {
+  try {
+    const r = await api('/applicants/reconcile-merged-accounts', { method: 'POST', body: {} });
+    const conflictRows = r.conflicts.map(c => `<tr><td>${esc(c.secondaryName)}</td><td>${esc(c.secondaryAccountId)}</td><td>${esc(c.primaryName)}</td><td>${esc(c.primaryAccountId)}</td></tr>`).join('');
+    const body = `
+      <p>Checked ${r.groupsChecked} merge group(s). Linked ${r.linked} applicant record(s) to their primary's disccardpromos account.</p>
+      ${r.conflicts.length ? `
+        <p class="small-muted" style="margin-top:12px;color:var(--danger)">${r.conflicts.length} secondary record(s) already have their OWN disccardpromos account, separate from their primary's — these were left untouched since overwriting could orphan a real (possibly funded) account. Review these on disccardpromos directly and decide whether to deactivate/merge them there, then re-run this.</p>
+        <table style="width:100%;margin-top:8px;font-size:13px">
+          <tr><th style="text-align:left">Secondary</th><th style="text-align:left">Its account</th><th style="text-align:left">Primary</th><th style="text-align:left">Primary's account</th></tr>
+          ${conflictRows}
+        </table>
+      ` : `<p class="small-muted" style="margin-top:12px">No conflicts — every merged group now shares one account with its primary.</p>`}
+    `;
+    openModal('Reconcile Merged Accounts', body, '');
+    load();
+  } catch (err) { toast(err.message, true); }
+}
+// One-time (safely re-runnable) cleanup for every merge group from BEFORE
+// a merge collapsed the group into one real applicants row — those old
+// merges just tagged the losing records with merge_group_id and left them
+// sitting there as separate rows. This snapshots each one's own submitted
+// data (so its shul keeps seeing it) and folds it away for real, same as a
+// fresh merge does now. Fully undoable per group from Recent Actions.
+async function collapseMergedGroups() {
+  if (!confirm('Collapse every existing merge group into one real record per group? Each losing shul\'s own submission is preserved (they\'ll keep seeing it), and their separate applicant row is then removed. This can be undone per-group from Recent Actions. Continue?')) return;
+  try {
+    const r = await api('/applicants/collapse-merged-groups', { method: 'POST', body: {} });
+    toast(r.groupsCollapsed ? `Collapsed ${r.groupsCollapsed} merge group(s) into one record each.` : 'Nothing to collapse — every merge group is already one record.');
+    load();
+  } catch (err) { toast(err.message, true); }
+}
+const MASS_ACTIONS = {
+  approve: {
+    confirm: null,
+    run: (ids) => {
+      const amount = prompt("Card amount to set for all selected (leave blank to use each applicant's existing/default amount):", '');
+      const body = { ids };
+      if (amount !== null && amount !== '') body.card_amount = +amount;
+      return api('/applicants/mass-approve', { method: 'POST', body });
+    },
+    summarize: r => {
+      let msg = `Approved ${r.approved}, skipped ${r.skipped}${r.capReached ? ' (season capacity reached)' : ' (paused)'}`;
+      if (r.contributionBlocked) msg += ` — ${r.contributionBlocked} skipped: shul contribution not confirmed / below minimum`;
+      if (r.providerErrors) {
+        msg += ` — ${r.providerErrors} disccardpromos issue(s)`;
+        // Real per-applicant reasons, not just a bare count — see the
+        // comment on providerErrorDetails in the mass-approve route. Only
+        // the first few are shown inline (a large batch could otherwise
+        // produce an unreadably long toast); providerErrorsHint still covers
+        // the single most common case (no Package/Discount ID configured).
+        if (r.providerErrorDetails?.length) msg += `: ${r.providerErrorDetails.slice(0, 3).join('; ')}${r.providerErrorDetails.length > 3 ? `; +${r.providerErrorDetails.length - 3} more (see Recent Actions for the full list)` : ''}`;
+        else if (r.providerErrorsHint) msg += `: ${r.providerErrorsHint}`;
+      }
+      // Not an "error" (an intentionally-comped applicant looks identical),
+      // but used to be silent — indistinguishable from funds genuinely
+      // loading. If this fires for most/all of a batch, the amount typed
+      // into the prompt above was left blank AND the applicants' own Card
+      // Amount / the season's default are $0 or unset.
+      if (r.zeroAmountSkipped) msg += ` — ${r.zeroAmountSkipped} had a $0 card amount, nothing sent to disccardpromos`;
+      return { msg, isError: !!r.providerErrors || !!r.contributionBlocked || !!r.zeroAmountSkipped };
+    },
+  },
+  reject: {
+    confirm: n => `Reject ${n} selected applicant(s)?`,
+    run: (ids) => api('/applicants/mass-reject', { method: 'POST', body: { ids } }),
+    summarize: r => ({ msg: `Rejected ${r.rejected}, skipped ${r.skipped}`, isError: !!r.cardLockErrors }),
+  },
+  'set-pending': {
+    confirm: n => `Move ${n} selected applicant(s) back to pending?`,
+    run: (ids) => api('/applicants/mass-set-pending', { method: 'POST', body: { ids } }),
+    summarize: r => ({ msg: `Updated ${r.updated}, skipped ${r.skipped}`, isError: !!r.cardLockErrors }),
+  },
+  delete: {
+    confirm: n => `Permanently delete ${n} selected applicant(s)? This removes each applicant, their cards, and notes completely and cannot be undone.`,
+    run: (ids) => api('/applicants/mass-delete-permanent', { method: 'POST', body: { ids } }),
+    summarize: r => ({ msg: `Deleted ${r.deleted}, skipped ${r.skipped}`, isError: !!r.cardLockErrors }),
+  },
+  email: {
+    confirm: null,
+    run: (ids) => openMassMessageModal('applicant', 'email', ids),
+    summarize: r => ({ msg: `Sent to ${r.sent} of ${r.total} recipient(s)${r.failed ? `, ${r.failed} failed` : ''}`, isError: !!r.failed && r.sent === 0 }),
+  },
+  sms: {
+    confirm: null,
+    run: (ids) => openMassMessageModal('applicant', 'sms', ids),
+    summarize: r => ({ msg: `Sent to ${r.sent} of ${r.total} recipient(s)${r.failed ? `, ${r.failed} failed` : ''}`, isError: !!r.failed && r.sent === 0 }),
+  },
+};
+qs('#btn-mass-apply').addEventListener('click', async () => {
+  const actionKey = qs('#mass-action').value;
+  const action = MASS_ACTIONS[actionKey];
+  const ids = Array.from(selected);
+  const skipNote = massActionSkipNote(ids.map(id => selectedMeta.get(id)), MASS_SKIP_PREDICATES[actionKey]);
+  const confirmMsg = [action.confirm ? action.confirm(ids.length) : null, skipNote].filter(Boolean).join('\n\n');
+  if (confirmMsg && !confirm(confirmMsg)) return;
+  try {
+    const r = await action.run(ids);
+    if (!r) return;
+    const { msg, isError } = action.summarize(r);
+    toast(msg, !!isError);
+    selected.clear(); load();
+  } catch (err) { toast(err.message, true); }
+});
+
+async function openApplicant(id) {
+  try {
+    const { applicant: a, notes, cards, flags, mergeGroup, requiresShulContribution, mergedBy, bypassHistory } = await api(`/applicants/${id}`);
+    const resolverName = (r) => r.first_name ? `${r.first_name} ${r.last_name || ''}`.trim() : 'an admin (no longer on the account)';
+    const body = `
+      <div class="tabs" id="atabs"><button class="active" data-t="info">Info</button><button data-t="notes">Notes (${notes.length})</button><button data-t="cards">Card (${cards.length})</button><button data-t="documents">Documents</button><button data-t="messages">Messages</button><button data-t="history">History</button></div>
+      <div id="atab-info">
+        <div class="grid-2">
+          <div><strong>Applicant ID</strong><br><code>${esc(a.external_id||'')}</code></div>
+          <div><strong>Status</strong><br>${badge(a.approval_status, a.approval_status)} ${a.is_paused ? badge('paused','paused') : ''} ${a.will_not_activate ? badge('will not activate','paused') : ''}
+            ${a.approval_status === 'rejected' && a.rejection_reason ? `<div class="rejection-reason" title="${esc(a.rejection_reason)}">${esc(a.rejection_reason)}</div>` : ''}
+            ${a.will_not_activate ? `<div class="small-muted">Marked "Will Not Activate" by the shul on ${fmtDate(a.will_not_activate_at)}</div>` : ''}</div>
+        </div>
+        ${flags.length ? `<div class="divider"></div><div style="color:var(--danger)">
+          <strong>&#9888; Duplicate flag open.</strong>
+          ${flags.map(f => f.entity_id === f.matched_entity_id ? `<div style="margin-top:6px">Own phone numbers look like a duplicate — reason: ${esc(f.reason)}.
+            <button class="btn btn-sm btn-outline" onclick="resolvePhoneCollision('${f.id}','${id}')">Confirm Correct as Entered</button></div>`
+            : `<div style="margin-top:6px">Matches another applicant — reason: ${esc(f.reason)}.
+            <button class="btn btn-sm btn-outline" onclick="openMergeView('${f.id}','${id}')">View &amp; Resolve</button></div>`).join('')}
+        </div>` : (a.is_paused ? `<div class="divider"></div><div style="color:var(--danger)">
+          <strong>&#9888; Paused, but no open duplicate flag was found.</strong> The flag that caused this was likely already resolved elsewhere.
+          <div style="margin-top:6px"><button class="btn btn-sm btn-outline" onclick="unpauseOrphanedApplicant('${id}')">Unpause</button></div>
+        </div>` : '')}
+        ${a.approval_status === 'soft_rejected' && a.previous_shul_name ? `<div class="divider"></div><p class="small-muted">Previously at: <strong>${esc(a.previous_shul_name)}</strong></p>` : ''}
+        ${mergeGroup && mergeGroup.length > 1 ? `<div class="divider"></div><div style="color:var(--text-muted);background:#f9efe0;padding:8px 12px;border-radius:6px">
+          <strong>One shared record — submitted by ${mergeGroup.length} shuls:</strong>
+          <div class="shul-pill-group" style="margin-top:6px">${mergeGroup.map(m => `<span class="shul-pill${m.is_primary ? ' primary' : ''}">${esc(m.shul_name)}${m.is_primary ? '' : ` <button type="button" title="Remove ${esc(m.shul_name)} from this merged record" onclick="removeShulFromMerge('${id}','${m.id}')" style="border:none;background:none;cursor:pointer;color:inherit;font-weight:700;line-height:1;padding:0;margin-left:2px">&times;</button>`}</span>`).join('')}</div>
+        </div>` : ''}
+        ${mergedBy ? `<div class="divider"></div><p class="small-muted">This is a merged record — combined by <strong>${esc(resolverName(mergedBy))}</strong> on ${fmtDate(mergedBy.created_at)}.</p>` : ''}
+        ${bypassHistory && bypassHistory.length ? `<div class="divider"></div><div class="small-muted">
+          ${bypassHistory.map(b => `<div>Checked against a possible duplicate (${esc(b.reason)}) and confirmed as a different person by <strong>${esc(resolverName(b))}</strong> on ${fmtDate(b.resolved_at)}.</div>`).join('')}
+        </div>` : ''}
+        <div class="divider"></div>
+        <div class="grid-2">
+          <div><label>First Name</label><input id="e-first_name" value="${esc(a.first_name||'')}"></div>
+          <div><label>Last Name</label><input id="e-last_name" value="${esc(a.last_name||'')}"></div>
+        </div>
+        <label>Shul</label><select id="e-shul_id"><option value="">Loading…</option></select>
+        <div class="grid-2">
+          <div><label>Marital Status</label><select id="e-marital"><option ${a.marital_status==='single'?'selected':''}>single</option><option ${a.marital_status==='married'?'selected':''}>married</option><option ${a.marital_status==='widowed'?'selected':''}>widowed</option><option ${a.marital_status==='divorced'?'selected':''}>divorced</option></select></div>
+          <div><label>Children</label><input id="e-children" type="number" value="${a.num_children??0}"></div>
+        </div>
+        <div class="grid-2">
+          <div><label>Home Phone</label><input id="e-home_phone" value="${esc(a.home_phone||'')}"></div>
+          <div><label>Email</label><input id="e-email" value="${esc(a.email||'')}"></div>
+        </div>
+        <div class="grid-2">
+          <div><label>Husband Cell</label><input id="e-husband_cell" value="${esc(a.husband_cell||'')}"></div>
+          <div><label>Wife Cell</label><input id="e-wife_cell" value="${esc(a.wife_cell||'')}"></div>
+        </div>
+        <div class="grid-2">
+          <div><label>Preferred Contact</label><select id="e-pcm"><option value=""></option><option ${a.preferred_contact_method==='phone'?'selected':''}>phone</option><option ${a.preferred_contact_method==='text'?'selected':''}>text</option><option ${a.preferred_contact_method==='email'?'selected':''}>email</option></select></div>
+          <div><label>Number To Use</label><select id="e-pn"><option value=""></option><option ${a.preferred_number==='home'?'selected':''}>home</option><option ${a.preferred_number==='husband'?'selected':''}>husband</option><option ${a.preferred_number==='wife'?'selected':''}>wife</option></select></div>
+        </div>
+        <label>Address</label><input id="e-address" value="${esc(a.address||'')}">
+        <div class="grid-2"><div><label>City</label><input id="e-city" value="${esc(a.city||'')}"></div><div><label>State</label><input id="e-state" value="${esc(a.state||'')}"></div></div>
+        <label>Zip</label><input id="e-zip" value="${esc(a.zip||'')}" style="max-width:160px">
+        <div class="checkbox-row" style="margin-top:14px"><input type="checkbox" id="e-yomtov" ${a.home_for_yomtov?'checked':''}><label style="margin:0">Home for Yom Tov</label></div>
+        <label>Card Amount ($)</label><input id="e-card" type="number" step="0.01" value="${a.card_amount ?? ''}">
+        ${['super_admin','org_admin'].includes(Auth.user()?.role) ? `<div class="checkbox-row" style="margin-top:14px"><input type="checkbox" id="e-provider-exempt" ${a.provider_exempt?'checked':''}><label style="margin:0">Never send to disccardpromos (one-time backfill import)</label></div>` : ''}
+        <label>Comments</label><textarea id="e-comments" rows="3">${esc(a.comments||'')}</textarea>
+        ${requiresShulContribution ? `<div class="divider"></div>
+        <label>Minimum Contribution Override ($, internal — hidden from shul; blank uses the shul's default)</label>
+        <input id="e-min_contribution_override" type="number" step="0.01" min="0" value="${a.min_contribution_override ?? ''}" placeholder="Use shul default">
+        <div class="grid-2" style="margin-top:10px">
+          <div><strong>Shul-Reported Contribution</strong><br>${a.shul_contribution_amount != null ? fmtMoney(a.shul_contribution_amount) : '<span class="small-muted">Not reported yet</span>'}</div>
+          <div><strong>Shul Confirmed</strong><br>${a.shul_contribution_confirmed ? 'Yes' : 'No'}</div>
+        </div>` : ''}
+        <label>Permanent Comments (internal — carries forward to future seasons)</label>
+        <textarea id="e-permanent_comments" rows="3">${esc(a.permanent_comments||'')}</textarea>
+      </div>
+      <div id="atab-notes" style="display:none">
+        <div style="display:flex;gap:8px"><input id="new-anote" placeholder="Add an internal note…"><button class="btn btn-sm btn-primary" onclick="addApplicantNote('${id}')">Add</button></div>
+        <div style="margin-top:14px">${notes.map(n => `<div style="padding:10px 0;border-bottom:1px solid var(--border)"><div>${esc(n.note)}</div><div class="small-muted">${esc(n.first_name||'')} ${esc(n.last_name||'')} · ${fmtDateTime(n.created_at)}</div></div>`).join('') || '<p class="small-muted">No notes yet.</p>'}</div>
+      </div>
+      <div id="atab-cards" style="display:none">
+        ${a.provider_account_id ? `<p class="small-muted">disccardpromos Account: <code>${esc(a.provider_account_id)}</code></p>` : ''}
+        ${cards.length ? cards.map(c => `<div class="card" style="margin-bottom:10px"><div class="flex-between"><strong>${esc(c.card_number_masked||'Unassigned')}</strong>${badge(c.status,c.status)}</div><div class="small-muted">Amount: ${fmtMoney(c.amount)} · Activated: ${c.activated_at?fmtDateTime(c.activated_at):'not yet'}</div><a class="small-muted" href="/admin/cards?card=${c.id}">View transactions</a></div>`).join('') : `<p class="small-muted">No card assigned yet.</p>${a.approval_status==='approved' ? `<button class="btn btn-sm btn-primary" onclick="assignCard('${id}')">Assign Gift Card</button>` : '<p class="small-muted">Applicant must be approved first.</p>'}`}
+      </div>
+      <div id="atab-documents" style="display:none">
+        <div id="atab-documents-list"><p class="small-muted">Loading…</p></div>
+      </div>
+      <div id="atab-messages" style="display:none">
+        <div id="atab-messages-list"><p class="small-muted">Loading…</p></div>
+      </div>
+      <div id="atab-history" style="display:none">
+        <div id="atab-history-list"><p class="small-muted">Loading…</p></div>
+      </div>`;
+    const footer = `
+      <button class="btn btn-outline btn-sm" onclick="showOtherSeasons('Applicant', '/applicants/${id}/other-seasons', 'openApplicant')">View Other Seasons</button>
+      ${a.provider_account_id ? `<button class="btn btn-outline btn-sm" onclick="window.open('https://disccardpromos.com/portal/org/customers/${encodeURIComponent(a.provider_account_id)}/', '_blank')">DiscCard</button>` : ''}
+      ${a.provider_account_id && ['super_admin','org_admin'].includes(Auth.user()?.role) ? `<button class="btn btn-outline btn-sm" onclick="viewLiveProviderData('${id}')">View Live Disccardpromos Data</button>` : ''}
+      <button class="btn btn-outline btn-sm" onclick="openQuickTaskModal('applicant','${id}','${esc(a.first_name+' '+a.last_name).replace(/'/g,"\\'")}')">+ Add Task</button>
+      ${['super_admin','org_admin'].includes(Auth.user()?.role) ? `<button class="btn btn-outline btn-sm" style="color:#b71c1c;border-color:#b71c1c" onclick="deleteApplicant('${id}')">Delete Permanently</button>` : ''}
+      ${a.approval_status !== 'pending' ? `<button class="btn btn-outline btn-sm" onclick="setApplicantPending('${id}')">Set to Pending</button>` : ''}
+      ${!a.is_paused && a.shul_id && a.approval_status !== 'approved' ? `<button class="btn btn-outline btn-sm" onclick="openSoftReject('${id}')">Soft Reject…</button>` : ''}
+      ${a.is_paused ? '' : (a.approval_status !== 'approved' ? `<button class="btn btn-outline btn-sm" onclick="rejectApplicant('${id}')">Reject</button><button class="btn btn-primary btn-sm" onclick="approveApplicant('${id}')">Approve</button>` : '')}
+      <button class="btn btn-primary btn-sm" onclick="saveApplicant('${id}')">Save</button>`;
+    openModal(`${a.first_name} ${a.last_name}`, body, footer);
+    attachShulSelect('e-shul_id', a.shul_id || '', a.season_id || '');
+    loadGoogleMaps().then(() => { attachPlacesAutocomplete('e-address', { address: 'e-address', city: 'e-city', state: 'e-state', zip: 'e-zip' }); });
+    qsa('#atabs button').forEach(b => b.addEventListener('click', () => {
+      qsa('#atabs button').forEach(x => x.classList.remove('active')); b.classList.add('active');
+      ['info','notes','cards','documents','messages','history'].forEach(t => qs('#atab-'+t).style.display = t === b.dataset.t ? 'block' : 'none');
+    }));
+    loadDocumentsTab('applicant', id, 'atab-documents-list', a.email || '');
+    loadMessagesTab('applicant', id, 'atab-messages-list', a.husband_cell || a.wife_cell || a.home_phone || '', a.email || '', a);
+    loadHistoryTab('applicant', id, 'atab-history-list');
+  } catch (err) { toast(err.message, true); }
+}
+
+// Raw GET /:id/provider-customer passthrough, shown as-is — the exact
+// field names disccardpromos actually uses for things like transaction
+// history aren't all confirmed (their docs site is unreachable from this
+// environment's own network policy), so seeing the real JSON here is the
+// most direct way to check what a live response actually looks like,
+// rather than only via server logs.
+window.viewLiveProviderData = async (id) => {
+  try {
+    const { customer, mockMode } = await api(`/applicants/${id}/provider-customer`);
+    const body = mockMode
+      ? `<p class="small-muted">This season is in mock mode — nothing real to show.</p>`
+      : `<pre style="white-space:pre-wrap;word-break:break-word;font-size:12px;max-height:60vh;overflow:auto">${esc(JSON.stringify(customer, null, 2))}</pre>`;
+    openModal('Live Disccardpromos Customer Data', body, '');
+  } catch (err) { toast(err.message, true); }
+};
+
+window.saveApplicant = async (id) => {
+  const body = {
+    first_name: qs('#e-first_name').value, last_name: qs('#e-last_name').value,
+    marital_status: qs('#e-marital').value, num_children: +qs('#e-children').value, home_phone: qs('#e-home_phone').value,
+    email: qs('#e-email').value, husband_cell: qs('#e-husband_cell').value, wife_cell: qs('#e-wife_cell').value,
+    preferred_contact_method: qs('#e-pcm').value, preferred_number: qs('#e-pn').value, address: qs('#e-address').value,
+    city: qs('#e-city').value, state: qs('#e-state').value, zip: qs('#e-zip').value, home_for_yomtov: qs('#e-yomtov').checked,
+    card_amount: qs('#e-card').value === '' ? null : +qs('#e-card').value, comments: qs('#e-comments').value,
+    permanent_comments: qs('#e-permanent_comments').value,
+  };
+  const providerExemptEl = qs('#e-provider-exempt');
+  if (providerExemptEl) body.provider_exempt = providerExemptEl.checked;
+  const minContribEl = qs('#e-min_contribution_override');
+  if (minContribEl) body.min_contribution_override = minContribEl.value === '' ? null : +minContribEl.value;
+  // Skip shul_id only if the dropdown hasn't finished loading yet — normally
+  // it's always pre-filled with the applicant's current shul, so this just
+  // sends whatever's selected (unchanged or newly picked).
+  const shulId = qs('#e-shul_id').value;
+  if (shulId) body.shul_id = shulId;
+  try {
+    const r = await api(`/applicants/${id}`, { method: 'PUT', body });
+    if (r.providerPushError || r.providerFundsError) {
+      toast(`Saved here, but disccardpromos rejected it: ${r.providerPushError || r.providerFundsError}`, true);
+    } else {
+      toast('Saved');
+    }
+    closeModal(); load();
+  } catch (err) { toast(err.message, true); }
+};
+window.approveApplicant = async (id) => {
+  try {
+    const r = await api(`/applicants/${id}/approve`, { method: 'POST' });
+    const issues = [r.emailError && `email failed: ${r.emailError}`, r.providerAccountError && `disccardpromos account failed: ${r.providerAccountError}`, r.providerFundsError && `card not loaded: ${r.providerFundsError}`].filter(Boolean);
+    toast(issues.length ? `Approved, but ${issues.join('; ')}` : 'Approved', issues.length > 0);
+    closeModal(); load();
+  } catch (err) { toast(err.message, true); }
+};
+window.rejectApplicant = async (id) => {
+  if (!confirm('Reject this applicant?')) return;
+  try {
+    const r = await api(`/applicants/${id}/reject`, { method: 'POST' });
+    toast(r.cardLockErrors?.length ? `Rejected, but card lock failed: ${r.cardLockErrors.join('; ')}` : 'Rejected', !!r.cardLockErrors?.length);
+    closeModal(); load();
+  } catch (err) { toast(err.message, true); }
+};
+window.setApplicantPending = async (id) => {
+  try {
+    const r = await api(`/applicants/${id}/set-pending`, { method: 'POST' });
+    toast(r.cardLockErrors?.length ? `Moved back to pending, but card lock failed: ${r.cardLockErrors.join('; ')}` : 'Moved back to pending', !!r.cardLockErrors?.length);
+    closeModal(); load();
+  } catch (err) { toast(err.message, true); }
+};
+// Lists every shul this applicant is (or, via a duplicate match, might be)
+// submitted under — GET /applicants/:id/shul-group already resolves the
+// whole cluster, open-flag or already-merged. Soft-rejecting any one of
+// them detaches just that record from its shul and marks it Soft Reject;
+// the others in the list are untouched.
+window.openSoftReject = async (id) => {
+  try {
+    const { members } = await api(`/applicants/${id}/shul-group`);
+    const body = `<p class="small-muted">Pick which shul's submission to remove. That record is detached from its shul and marked <strong>Soft Reject</strong> — it stays that way, not counted against any shul's slots, until an admin gives it a shul again (which moves it back to Pending automatically).</p>
+      ${members.map(m => `<div class="card" style="margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;gap:10px">
+        <div><strong>${esc(m.first_name)} ${esc(m.last_name)}</strong>${m.id === id ? ' <span class="small-muted">(this record)</span>' : ''}<br>
+          <span class="small-muted">${esc(m.shul_name || (m.previous_shul_name ? `No shul (previously ${m.previous_shul_name})` : 'No shul'))} — ${badge(m.approval_status, m.approval_status)}</span></div>
+        ${m.shul_id ? `<button class="btn btn-sm btn-danger" onclick="softRejectApplicant('${m.id}','${id}')">Soft Reject</button>` : '<span class="small-muted">No shul to remove from</span>'}
+      </div>`).join('')}`;
+    // Closed first — this modal is always opened on top of the applicant
+    // profile modal, and openModal() never removes a prior one on its own
+    // (see the identical note on openMergeView above).
+    closeModal();
+    openModal('Soft Reject', body, `<button class="btn btn-outline btn-sm" onclick="closeModal();openApplicant('${id}')">Cancel</button>`);
+  } catch (err) { toast(err.message, true); }
+};
+window.softRejectApplicant = async (memberId, fromId) => {
+  if (!confirm('Remove this applicant from their shul and mark them Soft Reject?')) return;
+  try {
+    const r = await api(`/applicants/${memberId}/soft-reject`, { method: 'POST' });
+    toast(r.cardLockErrors?.length ? `Soft rejected, but card lock failed: ${r.cardLockErrors.join('; ')}` : 'Soft rejected', !!r.cardLockErrors?.length);
+    closeModal(); load();
+  } catch (err) { toast(err.message, true); }
+};
+window.deleteApplicant = async (id) => {
+  if (!confirm('Permanently delete this applicant? This removes their record, cards, notes, and documents completely and cannot be undone. Their disccardpromos customer (if any) will be locked, not deleted.')) return;
+  try {
+    const r = await api(`/applicants/${id}/permanent`, { method: 'DELETE' });
+    toast(r.cardLockErrors?.length ? `Deleted, but disccardpromos lock failed: ${r.cardLockErrors.join('; ')}` : 'Applicant deleted', !!r.cardLockErrors?.length);
+    closeModal(); load();
+  } catch (err) { toast(err.message, true); }
+};
+window.addApplicantNote = async (id) => { const note = qs('#new-anote').value.trim(); if (!note) return; try { await api(`/applicants/${id}/notes`, { method: 'POST', body: { note } }); closeModal(); openApplicant(id); } catch (err) { toast(err.message, true); } };
+window.assignCard = async (id) => {
+  const cardNumber = prompt('Enter the physical card number to activate for this applicant (disccardpromos activates a real card you already hold — it does not generate one):');
+  if (!cardNumber) return;
+  try { await api('/cards/assign', { method: 'POST', body: { applicant_id: id, card_number: cardNumber.trim() } }); toast('Card assigned'); closeModal(); openApplicant(id); } catch (err) { toast(err.message, true); }
+};
+
+function openApplicantForm() {
+  const body = `
+    <div class="grid-2"><div><label>First Name *</label><input id="n-first_name"></div><div><label>Last Name *</label><input id="n-last_name"></div></div>
+    <label>Shul *</label><select id="n-shul_id"><option value="">Loading…</option></select>
+    <div class="grid-2">
+      <div><label>Marital Status</label><select id="n-marital_status"><option value=""></option><option>single</option><option>married</option><option>widowed</option><option>divorced</option></select></div>
+      <div><label>Children</label><input id="n-num_children" type="number" value="0"></div>
+    </div>
+    <div class="grid-2"><div><label>Home Phone</label><input id="n-home_phone"></div><div><label>Email</label><input id="n-email"></div></div>
+    <div class="grid-2"><div><label>Husband Cell</label><input id="n-husband_cell"></div><div><label>Wife Cell</label><input id="n-wife_cell"></div></div>
+    <div class="grid-2">
+      <div><label>Preferred Contact</label><select id="n-pcm"><option value=""></option><option>phone</option><option>text</option><option>email</option></select></div>
+      <div><label>Number To Use</label><select id="n-pn"><option value=""></option><option value="home">home</option><option value="husband">husband</option><option value="wife">wife</option></select></div>
+    </div>
+    <label>Address</label><input id="n-address">
+    <div class="grid-2"><div><label>City</label><input id="n-city"></div><div><label>State</label><input id="n-state"></div></div>
+    <label>Zip</label><input id="n-zip">
+    <div class="checkbox-row" style="margin-top:14px"><input type="checkbox" id="n-yomtov"><label style="margin:0">Home for Yom Tov</label></div>
+    <label>Card Amount ($)</label><input id="n-card" type="number" step="0.01">
+    <label>Comments</label><textarea id="n-comments" rows="3"></textarea>
+    <div class="divider"></div>
+    <div class="checkbox-row"><input type="checkbox" id="n-bypass"><label style="margin:0">Bypass required fields for this submission</label></div>
+  `;
+  openModal('Add Applicant', body, `<button class="btn btn-primary btn-sm" onclick="createApplicant()">Create</button>`);
+  attachShulSelect('n-shul_id', '', state.season_id);
+  loadGoogleMaps().then(() => { attachPlacesAutocomplete('n-address', { address: 'n-address', city: 'n-city', state: 'n-state', zip: 'n-zip' }); });
+}
+window.createApplicant = async () => {
+  const body = {
+    first_name: qs('#n-first_name').value, last_name: qs('#n-last_name').value, shul_id: qs('#n-shul_id').value,
+    marital_status: qs('#n-marital_status').value, num_children: +qs('#n-num_children').value || 0,
+    home_phone: qs('#n-home_phone').value, email: qs('#n-email').value,
+    husband_cell: qs('#n-husband_cell').value, wife_cell: qs('#n-wife_cell').value,
+    preferred_contact_method: qs('#n-pcm').value, preferred_number: qs('#n-pn').value,
+    address: qs('#n-address').value, city: qs('#n-city').value, state: qs('#n-state').value, zip: qs('#n-zip').value,
+    home_for_yomtov: qs('#n-yomtov').checked, card_amount: qs('#n-card').value === '' ? null : +qs('#n-card').value,
+    comments: qs('#n-comments').value, bypass_required: qs('#n-bypass').checked,
+  };
+  if (!body.shul_id) return toast('Select a shul from the dropdown', true);
+  try { await api('/applicants', { method: 'POST', body }); toast('Applicant created'); closeModal(); load(); } catch (err) { toast(err.message, true); }
+};
+
+function openImportModal() {
+  const body = `<p class="small-muted">Upload an Excel (.xlsx) file using the template — CSV isn't accepted, since it doesn't reliably support Hebrew text. The <code>shul_id</code> column must be that shul's 4-digit ID (shown on the shul's profile), not its name. To mass-edit existing applicants, export first, edit cells in Excel, and re-upload — a row with a filled-in <code>id</code> column updates that applicant (only the cells you actually changed), instead of creating a new one.</p>
+    <input type="file" id="import-file" accept=".xlsx">
+    <div class="checkbox-row" style="margin-top:12px"><input type="checkbox" id="import-bypass"><label style="margin:0">Bypass missing required fields (admin only — rows with blanks are still imported; first/last name still required)</label></div>
+    <div class="checkbox-row" style="margin-top:8px"><input type="checkbox" id="import-provider-exempt"><label style="margin:0">One-time backfill for another season — never send these to disccardpromos (permanent, even if later approved/rejected)</label></div>
+    <div id="import-result" style="margin-top:14px"></div>`;
+  openModal('Mass Upload Applicants', body, `<button class="btn btn-primary btn-sm" id="btn-run-import" onclick="runImport()">Upload</button>`);
+}
+window.runImport = async () => {
+  const btn = qs('#btn-run-import');
+  if (btn.disabled) return;
+  const file = qs('#import-file').files[0];
+  if (!file) return toast('Choose a file first', true);
+  const fd = new FormData(); fd.append('file', file); fd.append('provider_exempt', qs('#import-provider-exempt').checked); fd.append('bypass_required', qs('#import-bypass').checked);
+  btn.disabled = true; btn.textContent = 'Uploading…';
+  try {
+    const r = await api('/applicants/import', { method: 'POST', isForm: true, body: fd });
+    qs('#import-result').innerHTML = `<p><strong>${r.success}</strong> created, <strong>${r.updated}</strong> updated, <strong>${r.duplicates}</strong> flagged as duplicates, <strong>${r.errors.length}</strong> errors.</p>` +
+      (r.errors.length ? `<ul>${r.errors.slice(0,20).map(e=>`<li>Row ${e.row}: ${esc(e.error)}</li>`).join('')}</ul>` : '');
+    load();
+  } catch (err) {
+    if (err.data?.errors) {
+      qs('#import-result').innerHTML = `<p style="color:var(--danger)"><strong>${esc(err.message)}</strong></p><ul>${err.data.errors.slice(0,20).map(e=>`<li>Row ${e.row}: ${esc(e.error)}</li>`).join('')}</ul>`;
+    } else toast(err.message, true);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Upload';
+  }
+};
+
+// Keep in sync with MERGE_FIELDS in services/duplicates.js — real
+// identity/contact/demographic data an admin can pick a per-field winner
+// for when merging. shul/status/source aren't "merged"; each member keeps
+// its own.
+const APPLICANT_MERGE_FIELDS = [
+  ['first_name','First Name'], ['last_name','Last Name'], ['marital_status','Marital Status'],
+  ['home_phone','Home Phone'], ['husband_cell','Husband Cell'], ['wife_cell','Wife Cell'], ['email','Email'],
+  ['address','Address'], ['city','City'], ['state','State'], ['zip','Zip'],
+  ['preferred_contact_method','Preferred Contact'], ['preferred_number','Preferred Number'],
+  ['num_children','Children'], ['home_for_yomtov','Home for Yom Tov'], ['comments','Comments'], ['card_amount','Card Amount'],
+];
+
+let dupFlagsCache = [];
+let dupSearchTerm = '';
+async function showDuplicates() {
+  mergeViewReturnToApplicant = null;
+  try {
+    const { flags } = await api('/applicants/duplicates/open' + (state.season_id ? `?season_id=${state.season_id}` : ''));
+    dupFlagsCache = flags;
+    renderDuplicatesList();
+  } catch (err) { toast(err.message, true); }
+}
+function renderDuplicatesList() {
+  const body = `<input id="dup-search" placeholder="Search by name, shul, or reason…" value="${esc(dupSearchTerm)}" style="margin-bottom:12px">
+    <div id="dup-list">${renderDupListOnly()}</div>`;
+  const footer = `<button class="btn btn-outline btn-sm" onclick="recheckAllDuplicates()">Recheck All (org-wide)</button>
+    <button class="btn btn-outline btn-sm" onclick="collapseMergedGroups()">Collapse Old Merges Into One Record</button>`;
+  openModal('Duplicate Applicant Flags', body, footer);
+  qs('#dup-search').addEventListener('input', (e) => { dupSearchTerm = e.target.value; qs('#dup-list').innerHTML = renderDupListOnly(); });
+  qs('#dup-search').focus();
+  qs('#dup-search').selectionStart = qs('#dup-search').selectionEnd = dupSearchTerm.length;
+}
+// 'incomplete' (carried-forward, awaiting re-enrollment) applicants used to
+// still get checked as the SUBJECT of a duplicate check on every edit,
+// which could flag+pause one before it was ever re-enrolled — see
+// services/duplicates.js's checkApplicantDuplicate. This sweep undoes any
+// flag that only exists because of that (org-wide, since it could be
+// sitting in any season) and freshly re-checks every other currently-
+// unpaused real applicant to catch anything a bug ever let through.
+async function recheckAllDuplicates() {
+  if (!confirm('Recheck every applicant org-wide? This clears any duplicate flag caused by the incomplete-applicant bug, and freshly checks everyone else for anything that was missed. Safe to re-run.')) return;
+  try {
+    const r = await api('/applicants/duplicates/recheck-all', { method: 'POST', body: {} });
+    toast(`Checked ${r.checked}. Cleared ${r.cleared} spurious flag(s), ${r.staleCleared} stale flag(s) with a missing partner, unpaused ${r.unpaused} orphaned pause(s), found ${r.flagged} new one(s).`);
+    showDuplicates();
+  } catch (err) { toast(err.message, true); }
+}
+function renderDupListOnly() {
+  const term = dupSearchTerm.trim().toLowerCase();
+  const flags = term
+    ? dupFlagsCache.filter(f => [f.entity?.first_name, f.entity?.last_name, f.entity?.shul_name, f.matched?.first_name, f.matched?.last_name, f.matched?.shul_name, f.reason]
+        .some(v => (v || '').toLowerCase().includes(term)))
+    : dupFlagsCache;
+  return flags.length ? flags.map(f => f.entity_id === f.matched_entity_id ? `<div class="card" style="margin-bottom:10px;cursor:pointer" onclick="openApplicantFromDupFlag('${f.entity_id}')" title="Click to open this applicant's profile and edit the numbers">
+      <strong>${esc(f.entity?.first_name)} ${esc(f.entity?.last_name)}</strong> (${esc(f.entity?.shul_name||'')}) — own phone numbers look like a duplicate<br>
+      <span class="small-muted">Reason: ${esc(f.reason)}</span>
+      <div style="margin-top:10px">
+        <button class="btn btn-sm btn-primary" onclick="event.stopPropagation(); resolvePhoneCollision('${f.id}')">Confirm Correct as Entered</button>
+      </div>
+    </div>` : `<div class="card" style="margin-bottom:10px">
+      <strong>${esc(f.entity?.first_name)} ${esc(f.entity?.last_name)}</strong> (${esc(f.entity?.shul_name||'')}) may duplicate
+      <strong>${esc(f.matched?.first_name)} ${esc(f.matched?.last_name)}</strong> (${esc(f.matched?.shul_name||'')})<br>
+      <span class="small-muted">Reason: ${esc(f.reason)}</span>
+      <div style="margin-top:10px">
+        <button class="btn btn-sm btn-primary" onclick="openMergeView('${f.id}')">Compare &amp; Resolve</button>
+      </div>
+    </div>`).join('') : `<p class="small-muted">${dupFlagsCache.length ? 'No flags match your search.' : 'No open duplicate flags.'}</p>`;
+}
+// A self-flag (see services/duplicates.js's detectOwnPhoneCollision) has no
+// second applicant to compare against — just confirms the two numbers
+// really are what was entered, same 'bypass' action the API already
+// supports, and clears the pause. Callable from either the plain
+// Duplicates list (#dup-list present) or the applicant's own profile
+// (applicantId passed, re-opens the profile so the cleared pause shows
+// immediately) — guarded so calling it from one doesn't error out looking
+// for the other's DOM.
+// Clicking a phone-collision entry in the plain Duplicates list opens the
+// applicant so an admin can actually edit the numbers, not just confirm
+// blindly. closeModal() first — same reason openMergeView does it before
+// its own modal transition (see its comment): without it, the Duplicates
+// list modal is left underneath, stacking backdrops.
+window.openApplicantFromDupFlag = (applicantId) => { closeModal(); openApplicant(applicantId); };
+window.resolvePhoneCollision = async (flagId, applicantId) => {
+  try {
+    await api(`/applicants/duplicates/${flagId}/resolve`, { method: 'POST', body: { action: 'bypass' } });
+    toast('Confirmed — unpaused');
+    dupFlagsCache = dupFlagsCache.filter(f => f.id !== flagId);
+    if (qs('#dup-list')) qs('#dup-list').innerHTML = renderDupListOnly();
+    if (applicantId) openApplicant(applicantId);
+    load();
+  } catch (err) { toast(err.message, true); }
+};
+
+// ============================= Rejection Appeals =============================
+// A shul asked "why was this rejected" (one click from their own portal —
+// see applicant_rejection_appeals); this is where an admin answers it, with
+// the same reason-response optionally saved as a reusable template so it
+// doesn't need retyping next time a similar rejection comes up.
+let appealsCache = [];
+async function showAppeals() {
+  try {
+    appealsCache = (await api('/applicants/appeals/open')).appeals;
+    renderAppealsList();
+  } catch (err) { toast(err.message, true); }
+}
+function renderAppealsList() {
+  const body = appealsCache.length ? appealsCache.map(a => `<div class="card" style="margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;gap:10px">
+      <div><strong>${esc(a.first_name)} ${esc(a.last_name)}</strong> <span class="small-muted">(${esc(a.external_id||'')})</span><br>
+        <span class="small-muted">${esc(a.shul_name)} is asking why this was rejected — requested ${fmtDateTime(a.created_at)}</span></div>
+      <button class="btn btn-sm btn-primary" onclick="openRespondAppeal('${a.id}')">Respond</button>
+    </div>`).join('') : `<p class="small-muted">No open appeals.</p>`;
+  openModal('Rejection Appeals', body, '');
+}
+let appealTemplatesCache = [];
+window.openRespondAppeal = async (appealId) => {
+  const a = appealsCache.find(x => x.id === appealId);
+  if (!a) return;
+  try { appealTemplatesCache = (await api('/applicants/rejection-reason-templates')).templates; } catch { appealTemplatesCache = []; }
+  const templateOptions = `<option value="">Write your own</option>` + appealTemplatesCache.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('');
+  const body = `
+    <p class="small-muted"><strong>${esc(a.first_name)} ${esc(a.last_name)}</strong> — ${esc(a.shul_name)} asked why this applicant was rejected.</p>
+    ${appealTemplatesCache.length ? `<label>Use Saved Reason</label><select id="ar-template" onchange="applyAppealTemplate()">${templateOptions}</select>` : ''}
+    <label>Reason</label><textarea id="ar-reason" rows="5" placeholder="Explain why this applicant was rejected…"></textarea>
+    <div class="checkbox-row" style="margin-top:10px"><input type="checkbox" id="ar-save-template"><label style="margin:0">Save this as a reusable reason</label></div>
+    <div id="ar-save-name-wrap" style="display:none;margin-top:8px"><label>Reason Name</label><input id="ar-save-name" placeholder="e.g. Outside service area"></div>
+  `;
+  openModal('Respond to Appeal', body, `<button class="btn btn-primary btn-sm" id="btn-send-appeal-response" onclick="submitAppealResponse('${appealId}')">Send Response</button>`);
+  qs('#ar-save-template').addEventListener('change', (e) => { qs('#ar-save-name-wrap').style.display = e.target.checked ? 'block' : 'none'; });
+};
+window.applyAppealTemplate = () => {
+  const t = appealTemplatesCache.find(x => x.id === qs('#ar-template').value);
+  qs('#ar-reason').value = t ? t.body : '';
+};
+window.submitAppealResponse = async (appealId) => {
+  const btn = qs('#btn-send-appeal-response');
+  if (btn.disabled) return;
+  const reason = qs('#ar-reason').value.trim();
+  if (!reason) return toast('Enter a reason', true);
+  const saveTemplate = qs('#ar-save-template').checked;
+  const templateName = qs('#ar-save-name').value.trim();
+  if (saveTemplate && !templateName) return toast('Enter a name for the saved reason', true);
+  btn.disabled = true; btn.textContent = 'Sending…';
+  try {
+    if (saveTemplate) await api('/applicants/rejection-reason-templates', { method: 'POST', body: { name: templateName, body: reason } });
+    const r = await api(`/applicants/appeals/${appealId}/respond`, { method: 'POST', body: { reason } });
+    toast(r.emailError ? `Sent, but email failed: ${r.emailError}` : 'Response sent');
+    appealsCache = appealsCache.filter(a => a.id !== appealId);
+    if (appealsCache.length) renderAppealsList(); else closeModal();
+    load();
+    refreshHeaderBadges();
+  } catch (err) {
+    toast(err.message, true);
+    btn.disabled = false; btn.textContent = 'Send Response';
+  }
+};
+
+// The merge group can be more than a pair — the same family can get
+// submitted by three, four, five different shuls in one season. Rather than
+// comparing all N side by side in one wide table (unreadable past 3-4, and
+// "Dismiss" never actually resolved anything — a dismissed member's flag
+// just sat open and the whole group kept reappearing forever), a group of
+// 3+ is worked through two records at a time: pick exactly 2, compare and
+// resolve THAT pair for real (merge or bypass — both are permanent, real
+// backend actions), and the result rejoins the pool to be compared against
+// whichever member is still unresolved next. Always fetches the FULL
+// connected group fresh (see GET /applicants/duplicates/:flagId/group),
+// including every open flag between any two of its members — needed to
+// know, for whichever pair gets picked, what they were actually flagged
+// for and whether bypass is even possible (only a DIRECT flag between the
+// two chosen members can be bypassed; two that are only transitively
+// related through a third member have no flag to close).
+let mergeGroupCache = null;
+// Set only when opened from an applicant's own profile (see openApplicant's
+// "View & Resolve" button) rather than the Duplicates list, so the compare
+// view's Back button can return to that profile directly instead of always
+// landing on the full list — the whole point of surfacing this from the
+// profile in the first place.
+let mergeViewReturnToApplicant = null;
+// The up-to-2 member ids currently picked for a pairwise compare. Reset on
+// every fresh group open and after every resolved pair.
+let mergePairSelection = [];
+window.openMergeView = async (flagId, fromApplicantId) => {
+  mergeViewReturnToApplicant = fromApplicantId || null;
+  mergePairSelection = [];
+  try {
+    const group = await api(`/applicants/duplicates/${flagId}/group`);
+    mergeGroupCache = group;
+    // Closed only once the fetch succeeds — an errored fetch below leaves
+    // whatever modal was already open (profile or list) in place instead of
+    // vanishing into a blank screen. Explicit close before the next
+    // openModal() matters here specifically: unlike every other same-modal
+    // transition in this app, this one can be reached from a DIFFERENT
+    // modal (the applicant profile) and hands back to it later (Back to
+    // Applicant, below) — without this, that round trip stacks multiple
+    // #ec-modal backdrops (openModal never removes a prior one), and the
+    // leftover invisible ones intercept clicks on whatever's rendered on
+    // top.
+    closeModal();
+    renderMergeView();
+  } catch (err) { toast(err.message, true); }
+};
+// A member already folded into someone else (via a merge earlier in THIS
+// pairwise flow, or an older one) drops out — its primary stands in for it
+// from here on. merge_group_id === own id means "still its own primary"
+// (either never merged, or IS the primary); anything else means "already
+// resolved into that id."
+function activeMergeMembers() {
+  return mergeGroupCache.members.filter(m => !m.merge_group_id || m.merge_group_id === m.id);
+}
+function memberById(id) {
+  return mergeGroupCache.members.find(m => m.id === id);
+}
+// Dispatches to whichever screen the current group state calls for: fully
+// resolved, a plain pair (no picker needed — same as the original 2-record
+// flow), a pair already picked mid-flow, or the picker itself.
+function renderMergeView() {
+  // The flag this view was specifically opened for (a profile's own "View &
+  // Resolve" button, or renderMergeDone's "Resolve It Now") must always be
+  // directly resolvable as long as both its own two parties are still real,
+  // existing rows in this fetch — regardless of whether either one ALSO
+  // carries unrelated merge_group_id baggage from a separate, past
+  // resolution having nothing to do with this flag. Checked first, before
+  // the "active members of the whole transitive pull-in" logic below:
+  // that logic exists to catch two survivors with nothing left between
+  // them, but it can spuriously mark the very member this flag is about as
+  // "already folded away" over a completely different old merge, sending
+  // this view straight to a dead end for a flag that's still genuinely
+  // open and has never actually been looked at.
+  const originalFlag = mergeGroupCache.flag;
+  if (originalFlag && mergeGroupCache.flags.some(f => f.id === originalFlag.id)
+      && mergeGroupCache.members.some(m => m.id === originalFlag.entity_id) && mergeGroupCache.members.some(m => m.id === originalFlag.matched_entity_id)) {
+    mergePairSelection = [originalFlag.entity_id, originalFlag.matched_entity_id];
+    return renderPairCompare();
+  }
+  const active = activeMergeMembers();
+  // "Done" isn't just "down to 1 person" — it's also reached the moment
+  // nothing among whoever's left is still an open question. Two survivors
+  // that were already directly bypassed against each other (or were never
+  // flagged against each other at all) have nothing left to compare, even
+  // though both are still technically "active" individuals.
+  const stillConnected = mergeGroupCache.flags.some(f => active.some(m => m.id === f.entity_id) && active.some(m => m.id === f.matched_entity_id));
+  if (active.length <= 1 || !stillConnected) return renderMergeDone();
+  if (active.length === 2) { mergePairSelection = [active[0].id, active[1].id]; return renderPairCompare(); }
+  if (mergePairSelection.length === 2 && mergePairSelection.every(id => active.some(m => m.id === id))) return renderPairCompare();
+  return renderPairPicker();
+}
+function mergeExitBtn() {
+  return mergeViewReturnToApplicant
+    ? `<button class="btn btn-outline btn-sm" onclick="closeModal();openApplicant('${mergeViewReturnToApplicant}')">Back to Applicant</button>`
+    : `<button class="btn btn-outline btn-sm" onclick="closeModal();showDuplicates()">Back to List</button>`;
+}
+async function renderMergeDone() {
+  // Nothing left to compare doesn't necessarily mean the applicant this view
+  // was opened from got unpaused along the way — a chain resolved pair by
+  // pair can leave the entry record's own is_paused stuck at 1 (its flag
+  // closed, but nothing in that step happened to touch it). Since THIS
+  // group is genuinely done, try to clear it here rather than surfacing a
+  // dead end with no action. The unpause endpoint refuses (409) if the
+  // applicant is still paused over a SEPARATE, unrelated open flag (not
+  // part of this group) — that's a real remaining problem, not a no-op, so
+  // it must not be reported as "cleared".
+  let pauseNote = '';
+  let blockingFlagId = null;
+  if (mergeViewReturnToApplicant) {
+    try {
+      const r = await api(`/applicants/${mergeViewReturnToApplicant}/unpause`, { method: 'POST', body: {} });
+      if (r.unpaused) pauseNote = ' Its pause has been cleared.';
+    } catch (err) {
+      pauseNote = ` This record is still paused — ${err.message}`;
+      // The endpoint names the exact flag blocking it (see routes/
+      // applicants.js's POST /:id/unpause) — jump straight into resolving
+      // THAT one instead of making the admin close this, reopen the
+      // profile, and hunt for the right button themselves.
+      blockingFlagId = err.data?.flagId || null;
+    }
+  }
+  const footer = blockingFlagId
+    ? `${mergeExitBtn()}<button class="btn btn-sm btn-primary" onclick="openMergeView('${blockingFlagId}','${mergeViewReturnToApplicant}')">Resolve It Now</button>`
+    : mergeExitBtn().replace('btn-outline', 'btn-primary');
+  openModal('Compare & Merge Records', `<p>This duplicate group is fully resolved — nothing left to compare.${pauseNote}</p>`, footer);
+  load();
+}
+window.unpauseOrphanedApplicant = async (id) => {
+  try {
+    const r = await api(`/applicants/${id}/unpause`, { method: 'POST', body: {} });
+    toast(r.unpaused ? `Unpaused.${r.staleCleared ? ` Cleared ${r.staleCleared} stale flag(s) whose other side no longer exists.` : ''}` : 'Already active.');
+    openApplicant(id);
+    load();
+  } catch (err) { toast(err.message, true); }
+};
+// Detaches one contributing shul's submission from a merged applicant —
+// "this shul's family isn't actually part of this merged record," without
+// touching anything else. Only shown on non-primary pills (see openApplicant
+// above) — the backend itself also refuses to remove the primary.
+window.removeShulFromMerge = async (applicantId, shulId) => {
+  if (!confirm("Remove this shul from this merged record? They'll lose access to it entirely in their portal — this doesn't restore a separate applicant for them.")) return;
+  try {
+    await api(`/applicants/${applicantId}/submissions/${shulId}`, { method: 'DELETE' });
+    toast('Removed');
+    openApplicant(applicantId);
+    load();
+  } catch (err) { toast(err.message, true); }
+};
+function renderPairPicker() {
+  const active = activeMergeMembers();
+  const body = `
+    <p class="small-muted">This is a group of ${active.length} records still needing review. Pick exactly <strong>2</strong> to compare at a time — once that pair is resolved, the result rejoins the group so you can compare it against whoever's next.</p>
+    <div>${active.map(m => {
+      const checked = mergePairSelection.includes(m.id);
+      const disabled = !checked && mergePairSelection.length >= 2;
+      return `<label class="checkbox-row card" style="display:flex;align-items:center;gap:10px;margin-bottom:6px;padding:10px 12px;${disabled ? 'opacity:.5' : ''}">
+        <input type="checkbox" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''} onchange="togglePairPick('${esc(m.id)}', this.checked)">
+        <span><strong>${esc(m.first_name)} ${esc(m.last_name)}</strong> — ${esc(m.shul_name || (m.previous_shul_name ? `previously ${m.previous_shul_name}` : 'no shul'))} ${badge(m.approval_status, m.approval_status)}</span>
+      </label>`;
+    }).join('')}</div>
+  `;
+  const footer = `${mergeExitBtn()}<button class="btn btn-primary btn-sm" ${mergePairSelection.length === 2 ? '' : 'disabled'} onclick="renderPairCompare()">Compare Selected &rarr;</button>`;
+  openModal('Compare & Merge Records', body, footer);
+}
+window.togglePairPick = (id, checked) => {
+  if (checked) { if (mergePairSelection.length < 2) mergePairSelection.push(id); }
+  else { mergePairSelection = mergePairSelection.filter(x => x !== id); }
+  renderPairPicker();
+};
+function renderPairCompare() {
+  const active = activeMergeMembers();
+  const [idA, idB] = mergePairSelection;
+  // Looked up from the FULL member list, not just `active` — the very pair
+  // renderMergeView's "original flag" shortcut selects can include a member
+  // that active's own merge_group_id filter would otherwise exclude (see
+  // that shortcut's comment); this pair is still fully resolvable as long
+  // as both rows genuinely exist, so it must render here regardless.
+  const a = memberById(idA), b = memberById(idB);
+  if (!a || !b) { mergePairSelection = []; return renderMergeView(); } // stale selection safety net
+  const members = [a, b];
+  // Only a DIRECT flag between exactly these two can be bypassed — two
+  // members only linked transitively through a third have nothing open to
+  // close (see the mergeGroupCache comment above).
+  const pairFlag = mergeGroupCache.flags.find(f => (f.entity_id === idA && f.matched_entity_id === idB) || (f.entity_id === idB && f.matched_entity_id === idA));
+  // A soft-rejected member (no current shul) can't be picked as Primary —
+  // the backend rejects it (see mergeApplicants's shul_id guard) since
+  // there'd be no shul left to actually hold the resulting card. Default
+  // the pre-checked radio to the first eligible member instead of always
+  // index 0, so opening this view doesn't start on a choice that would
+  // just get rejected on submit.
+  const defaultPrimaryIdx = Math.max(0, members.findIndex(m => m.shul_id));
+  const cols = members.map((m, i) => `<th style="min-width:200px">
+      <div class="checkbox-row" style="margin-bottom:4px"><input type="radio" name="merge-primary" value="${esc(m.id)}" id="mp-${i}" ${i===defaultPrimaryIdx?'checked':''} ${m.shul_id?'':'disabled'}>
+        <label for="mp-${i}" style="margin:0"><strong>${esc(m.first_name)} ${esc(m.last_name)}</strong></label></div>
+      <span class="small-muted">${esc(m.shul_name || (m.previous_shul_name ? `previously ${m.previous_shul_name}` : 'no shul'))}</span><br>
+      ${badge(m.approval_status, m.approval_status)}
+    </th>`).join('');
+  const rows = APPLICANT_MERGE_FIELDS.map(([key, label]) => {
+    const cells = members.map((m, i) => {
+      const v = m[key];
+      const display = key === 'home_for_yomtov' ? (v ? 'Yes' : 'No') : (v ?? '');
+      return `<td><label class="checkbox-row" style="margin:0"><input type="radio" name="mf-${key}" value="${esc(String(v ?? ''))}" ${i===0?'checked':''}> <span>${esc(String(display))}</span></label></td>`;
+    }).join('');
+    return `<tr><td class="small-muted" style="white-space:nowrap">${esc(label)}</td>${cells}</tr>`;
+  }).join('');
+  const body = `
+    <p class="small-muted">${pairFlag ? `Flagged for: ${esc(pairFlag.reason)}.` : 'These two are only linked through another record in this group — no direct match reason between them.'}
+    Pick which record is <strong>Primary</strong> (that's the one that keeps going forward as the real card-holder), then pick which value to keep for each field — you can mix and match.</p>
+    <div style="overflow-x:auto"><table><thead><tr><th></th>${cols}</tr></thead><tbody>${rows}</tbody></table></div>
+  `;
+  // "Back to Group" only makes sense once a picker step actually happened
+  // (an original group of 3+) — a plain 2-record group never had one, so it
+  // exits the whole flow directly, same as before this rewrite.
+  const backBtn = mergeGroupCache.members.length > 2
+    ? `<button class="btn btn-outline btn-sm" onclick="mergePairSelection=[];renderMergeView()">Back to Group</button>`
+    : mergeExitBtn();
+  const isFinalPair = active.length === 2;
+  const footer = `${backBtn}
+    ${pairFlag ? `<button class="btn btn-outline btn-sm" onclick="bypassPair('${pairFlag.id}')">Bypass (not the same person)</button>` : ''}
+    <button class="btn btn-primary btn-sm" onclick="submitPairMerge('${mergeGroupCache.flag.id}')">Merge &amp; ${isFinalPair ? 'Resolve' : 'Continue'}</button>`;
+  openModal('Compare & Merge Records', body, footer);
+}
+// After either action: re-fetch the SAME working set of ids this view
+// opened with (see ?ids= on GET .../group) — not a fresh transitive-closure
+// re-derivation, which would reseed from just the original flag's two
+// entities and can silently drop members still connected to each other but
+// no longer to that original pair once its own connecting flags close one
+// by one. Nobody this view already showed the admin should ever quietly
+// disappear mid-review.
+async function refreshMergeGroupAndContinue() {
+  mergePairSelection = [];
+  const ids = mergeGroupCache.members.map(m => m.id);
+  try {
+    mergeGroupCache = await api(`/applicants/duplicates/${mergeGroupCache.flag.id}/group?ids=${ids.join(',')}`);
+  } catch (err) { toast(err.message, true); }
+  renderMergeView();
+  load();
+}
+window.bypassPair = async (flagId) => {
+  try {
+    await api(`/applicants/duplicates/${flagId}/resolve`, { method: 'POST', body: { action: 'bypass' } });
+    toast('Marked as different people');
+    await refreshMergeGroupAndContinue();
+  } catch (err) { toast(err.message, true); }
+};
+// presetArgs (primaryId/values/memberIds), when passed, is a retry after an
+// ACCOUNT_CONFLICT was just resolved — the original Compare & Merge modal
+// is already gone by then, so the retry reuses the exact choices captured
+// the first time around rather than trying to re-read a form that no
+// longer exists.
+window.submitPairMerge = async (flagId, accountConflictResolution, presetArgs) => {
+  let primaryId, values, memberIds;
+  if (presetArgs) {
+    ({ primaryId, values, memberIds } = presetArgs);
+  } else {
+    primaryId = qs('input[name="merge-primary"]:checked')?.value;
+    if (!primaryId) return toast('Pick a primary record', true);
+    values = {};
+    for (const [key] of APPLICANT_MERGE_FIELDS) {
+      const el = qs(`input[name="mf-${key}"]:checked`);
+      if (el) values[key] = key === 'num_children' || key === 'card_amount' ? (el.value === '' ? null : +el.value)
+        : key === 'home_for_yomtov' ? (el.value === '1' || el.value === 'true' ? 1 : 0)
+        : el.value;
+    }
+    memberIds = mergePairSelection;
+  }
+  // A losing member that already held its own real disccardpromos account
+  // always gets combined into the one this merge keeps — no account is ever
+  // left orphaned. Only pauses to ask when BOTH accounts genuinely have real
+  // money on them (see mergeApplicants' ACCOUNT_CONFLICT) — anything less
+  // just combines automatically with no popup at all.
+  try {
+    const result = await api(`/applicants/duplicates/${flagId}/merge`, { method: 'POST', body: { primaryId, values, memberIds, accountConflictResolution } });
+    if (result.accountConflictErrors?.length) toast(`Merged, but combining the other account's balance failed: ${result.accountConflictErrors.join('; ')} — check Provider Audit for a leftover account`, true);
+    else toast('Merged');
+    await refreshMergeGroupAndContinue();
+  } catch (err) {
+    if (err.data?.accountConflict) return openAccountConflictModal(flagId, err.data.conflicts, { primaryId, values, memberIds });
+    toast(err.message, true);
+  }
+};
+// One radio choice per conflicting account, shown only when both sides
+// genuinely have real money on them — "Combine balances" (adds the other
+// account's real current balance onto the kept one, then closes it) or
+// "Close without transferring" (discards whatever's on it). Submits the
+// SAME merge again with those choices, which is what lets it proceed past
+// ACCOUNT_CONFLICT this time.
+function openAccountConflictModal(flagId, conflicts, mergeArgs) {
+  const fmt = v => v == null ? 'unknown (could not read live)' : `$${Number(v).toFixed(2)}`;
+  const body = `
+    <p>Both accounts involved in this merge have real money on them. Balances below were just read live from disccardpromos, not pulled from anything cached. Choose what to do with each one before this merge can continue — nothing has been changed yet.</p>
+    ${conflicts.map((c, i) => `
+      <div class="divider"></div>
+      <table style="width:100%;font-size:13px;margin-bottom:8px">
+        <tr><th></th><th style="text-align:left;padding:2px 8px">Keeping</th><th style="text-align:left;padding:2px 8px">Would be closed</th></tr>
+        <tr><td class="small-muted">Name</td><td style="padding:2px 8px"><strong>${esc(c.primaryName)}</strong></td><td style="padding:2px 8px"><strong>${esc(c.secondaryName)}</strong></td></tr>
+        <tr><td class="small-muted">System ID</td><td style="padding:2px 8px">${esc(c.primaryExternalId || '—')}</td><td style="padding:2px 8px">${esc(c.secondaryExternalId || '—')}</td></tr>
+        <tr><td class="small-muted">disccard ID</td><td style="padding:2px 8px">${esc(c.primaryAccountId || '—')}</td><td style="padding:2px 8px">${esc(c.secondaryAccountId || '—')}</td></tr>
+        <tr><td class="small-muted">Husband's Cell</td><td style="padding:2px 8px">${esc(c.primaryHusbandCell || '—')}</td><td style="padding:2px 8px">${esc(c.secondaryHusbandCell || '—')}</td></tr>
+        <tr><td class="small-muted">Live Balance</td><td style="padding:2px 8px"><strong>${fmt(c.primaryBalance)}</strong></td><td style="padding:2px 8px"><strong>${fmt(c.secondaryBalance)}</strong></td></tr>
+      </table>
+      <label class="checkbox-row" style="margin-bottom:4px"><input type="radio" name="acr-${i}" value="transfer" checked> <span><strong>Merge the balances</strong> — write ${fmt((Number(c.primaryBalance)||0) + (Number(c.secondaryBalance)||0))} (the total of both) onto the kept account, then close the other</span></label>
+      <label class="checkbox-row" style="margin-bottom:4px"><input type="radio" name="acr-${i}" value="delete"> <span>Keep <strong>${esc(c.primaryName)}</strong>'s total — ${fmt(c.primaryBalance)} stays as-is on the kept account; ${fmt(c.secondaryBalance)} on the closed one is not moved</span></label>
+      <label class="checkbox-row"><input type="radio" name="acr-${i}" value="use_secondary"> <span>Keep <strong>${esc(c.secondaryName)}</strong>'s total instead — the kept account's balance is overwritten to ${fmt(c.secondaryBalance)}, then the other is closed</span></label>
+    `).join('')}
+  `;
+  const footer = `
+    <button class="btn btn-outline btn-sm" onclick="closeModal()">Cancel — don't merge yet</button>
+    <button class="btn btn-primary btn-sm" id="btn-confirm-account-conflict">Confirm &amp; Merge</button>
+  `;
+  openModal('Choose what happens to the other account', body, footer);
+  qs('#btn-confirm-account-conflict').addEventListener('click', () => {
+    const resolution = {};
+    conflicts.forEach((c, i) => { resolution[c.secondaryAccountId] = qs(`input[name="acr-${i}"]:checked`).value; });
+    closeModal();
+    submitPairMerge(flagId, resolution, mergeArgs);
+  });
+}
+
+// Deliberately no load() in this initial-resolution .then() (only in the
+// onChange callback above, fired later by an actual reorder) — the season
+// filter below hasn't set state.season_id yet at this point, so calling
+// load() here raced against populateSeasonFilter and could win, flashing
+// every season's applicants for a moment before the season-filtered load()
+// replaced it.
+attachColumnCustomizer('btn-columns', 'columns_applicants', APPLICANT_COLUMNS, DEFAULT_APPLICANT_COLUMNS, (order) => { activeColumns = order; renderThead(); load(); })
+  .then(order => { activeColumns = order; renderThead(); });
+// Scoped to the resolved season, not called unscoped first — an unscoped
+// call would flash every shul from every past season into the list for a
+// moment before this one replaced it (same race shape #5 fixed for load()
+// above).
+// Deep link from a shul's profile ("View Applicants" button, ?shul_id=<id>)
+// straight into that shul's already-filtered list. Applied inside
+// populateShulFilter's .then() rather than as a separate top-level
+// statement — that call fills the #f-shul <option> list asynchronously, so
+// setting state.shul_id/the select's value any earlier would leave the
+// dropdown showing "All Shuls" even though the table itself was already
+// correctly filtered underneath.
+const deepLinkShulId = new URLSearchParams(location.search).get('shul_id');
+populateSeasonFilter('f-season').then(activeId => {
+  state.season_id = activeId;
+  populateShulFilter('f-shul', activeId).then(() => {
+    if (deepLinkShulId) { state.shul_id = deepLinkShulId; qs('#f-shul').value = deepLinkShulId; }
+    load();
+  });
+});
+
+// Deep link from the "Notify on Document Signed" admin email (?id=<applicantId>)
+// straight into that applicant's popup.
+const deepLinkApplicantId = new URLSearchParams(location.search).get('id');
+if (deepLinkApplicantId) openApplicant(deepLinkApplicantId);
+
+// A record can change status entirely outside this admin's session (e.g.
+// a document signed via a public link) — re-fetch the list whenever the
+// tab regains focus so it doesn't sit stale indefinitely.
+document.addEventListener('visibilitychange', () => { if (!document.hidden) load(); });
+attachLiveRefresh('live-banner', async () => {
+  const params = new URLSearchParams({ search: state.search, status: state.status, marital_status: state.marital_status, shul_id: state.shul_id, season_id: state.season_id, pageSize: 1 });
+  const { total } = await api('/applicants?' + params);
+  return total;
+}, load);
+// Badges the Duplicates and Appeals buttons with their open counts so a new
+// one (e.g. an overnight import's flag, or a shul's appeal) doesn't sit
+// unnoticed until someone happens to click in — mirrors the nav's
+// pending-count dots for shuls/applicants/stores in app.js's renderShell.
+// Re-called after responding to an appeal so the badge updates live.
+function refreshHeaderBadges() {
+  qs('#f-dupes').innerHTML = 'Duplicates';
+  qs('#btn-appeals').innerHTML = 'Appeals';
+  api('/dashboard/pending-counts').then(({ counts }) => {
+    if (counts.duplicates) qs('#f-dupes').insertAdjacentHTML('beforeend', ` ${badge(String(counts.duplicates), 'rejected')}`);
+    if (counts.appeals) qs('#btn-appeals').insertAdjacentHTML('beforeend', ` ${badge(String(counts.appeals), 'rejected')}`);
+  }).catch(() => {});
+}
+refreshHeaderBadges();
+api('/seasons/active').then(({ season }) => {
+  if (!season || season.max_accepted_applicants == null) return;
+  qs('#cap-banner').innerHTML = `<div class="card" style="margin-bottom:16px;${season.is_full ? 'border-color:var(--danger)' : ''}">
+    <strong>${esc(season.name)} capacity:</strong> ${season.accepted_count} of ${season.max_accepted_applicants} accepted (${season.remaining} remaining)
+    ${season.is_full ? ' <strong style="color:var(--danger)">This season is full — new applications are locked.</strong>' : ''}
+  </div>`;
+}).catch(() => {});
+</script>
+</body>
+</html>
