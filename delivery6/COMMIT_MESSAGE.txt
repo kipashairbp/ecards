@@ -1,0 +1,26 @@
+Fix store password reset, sync store portal login emails, let impersonated admins skip billing verification, and notify on Brevo bounces
+
+- accept-invite no longer force-reactivates a deactivated account, and
+  forgot-password no longer issues a reset token for one; both now also
+  bump token_version on reset so old sessions are invalidated (previously
+  only change-password did this).
+- stores.js now syncs a store's portal login email when owner_email/
+  manager_email changes, mirroring shuls.js's syncPortalEmailForShul,
+  instead of only ever deactivating the login. Applies to admin edit, the
+  store's own onboarding wizard, and store creation/application, all of
+  which also now reject a field with more than one address in it
+  (looksLikeSingleEmail, src/utils/email.js).
+- Enter Portal sessions now carry a signed impersonatedBy claim
+  (src/middleware/auth.js) so Store Billing can tell an impersonating
+  admin's session from the store's own and skip the emailed-code
+  verification gate, since the admin can't read the store's inbox anyway.
+- New src/routes/emailEvents.js handles Brevo's delivery-status webhook:
+  on a bounce/block/spam event it marks the matching emails_sent row and
+  sends an internal notice (new emailBounce template, configurable via
+  a new Settings > Notify on Bounced Email field) to staff, never to the
+  bounced address itself. sendMailChecked now captures Brevo's message id
+  to match events precisely.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012xZutnBTXxVHZBLN37CM1H
+
