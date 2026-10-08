@@ -76,6 +76,8 @@ function paint(html) {
 
 async function refreshStatus() {
   BW.status = await api('/store-billing/my/status');
+  // admin-editable list (Settings > Store Billing); the bundled usbanks.js is only the fallback
+  if (!BW.banks) { try { BW.banks = (await api('/store-billing/banks')).banks; } catch { BW.banks = window.US_BANKS; } }
 }
 
 async function boot() {
@@ -278,7 +280,14 @@ function viewInvoiceSuccess() {
 
 // ===================== Actions =====================
 
-BW.startVerify = (purpose) => { BW.verifyPurpose = purpose; BW.view = 'verify_send'; render(); };
+BW.startVerify = (purpose) => {
+  // An impersonating admin can't read the store's own inbox, so the server
+  // already treats them as pre-verified (see /my/status's `impersonating`
+  // flag and routes/storeBilling.js) — skip the code screens entirely and
+  // land straight on whatever that purpose was leading to.
+  if (BW.status.impersonating) { BW.view = purpose === 'payment_info' ? 'payment_form' : 'invoice_form'; render(); if (purpose === 'payment_info') wirePaymentForm(); return; }
+  BW.verifyPurpose = purpose; BW.view = 'verify_send'; render();
+};
 BW.cancelVerify = () => { BW.view = BW.status.hasPaymentInfo ? 'main' : 'need_setup'; render(); };
 BW.backToMain = async () => { BW.view = 'main'; await refreshStatus(); await loadBills(); render(); };
 
@@ -340,7 +349,7 @@ BW.confirmCode = async () => {
 
 BW.filterBanks = (q) => {
   const dropdown = qs('#bank-dropdown');
-  const matches = US_BANKS.filter(b => b.toLowerCase().includes((q || '').toLowerCase())).slice(0, 40);
+  const matches = (BW.banks || window.US_BANKS).filter(b => b.toLowerCase().includes((q || '').toLowerCase())).slice(0, 40);
   dropdown.innerHTML = matches.map(b => `<div class="bank-item" onclick="BW.pickBank('${b.replace(/'/g, "\\'")}')">${renderBankLogo(b, 28)}<span>${esc(b)}</span></div>`).join('') || '<div class="bank-item" style="cursor:default">No matches</div>';
   dropdown.style.display = 'block';
 };

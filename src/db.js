@@ -1369,5 +1369,14 @@ safeAlter(`ALTER TABLE store_bill_submissions ADD COLUMN payment_note TEXT`);
 db.prepare(`UPDATE store_bill_submissions SET status = 'pending' WHERE status IN ('submitted', 'reviewed')`).run();
 db.prepare(`UPDATE store_bill_submissions SET status = 'completed' WHERE status = 'paid'`).run();
 
+// Brevo's own message id for a sent email — captured at send time
+// (services/mail.js's sendMailChecked) so a later async delivery-status
+// webhook (routes/emailEvents.js) can match a bounce/block/spam-complaint
+// event back to the specific emails_sent row it's about, instead of only
+// being able to guess "the most recent row to that address." status gains
+// a new value here too: sent | failed | dry_run | bounced.
+safeAlter(`ALTER TABLE emails_sent ADD COLUMN message_id TEXT`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_emails_sent_message_id ON emails_sent(message_id)`);
+
 export const DEFAULT_ORG_ID = defaultOrgId;
 export function uuid() { return randomUUID(); }

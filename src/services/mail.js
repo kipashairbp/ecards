@@ -133,17 +133,22 @@ export async function sendMail(orgId, to, subject, bodyHtml, replyTo) {
 // which record this email was about (Email Center's own compose flow uses
 // it; automatic system emails don't bother).
 export async function sendMailChecked(orgId, to, subject, bodyHtml, meta = {}) {
-  let status = 'sent', emailError = null;
+  let status = 'sent', emailError = null, messageId = null;
   try {
     const result = await sendMail(orgId, to, subject, bodyHtml, meta.replyTo);
     if (result?.dryRun) { status = 'dry_run'; emailError = 'Email provider not configured (BREVO_API_KEY missing). No email was actually sent.'; }
+    // Brevo's send response — captured so a later async bounce/block/spam
+    // webhook (routes/emailEvents.js) can match the event back to this
+    // exact row instead of only guessing "the most recent row to this
+    // address." Not present in dry-run mode (nothing was actually sent).
+    else messageId = result?.messageId || null;
   } catch (e) {
     status = 'failed'; emailError = e.message;
   }
   try {
-    db.prepare(`INSERT INTO emails_sent (id, org_id, to_email, subject, body_html, status, error_message, related_entity_type, related_entity_id, sent_by)
-      VALUES (?,?,?,?,?,?,?,?,?,?)`)
-      .run(uuid(), orgId || DEFAULT_ORG_ID, to, subject, bodyHtml, status, emailError, meta.relatedEntityType || null, meta.relatedEntityId || null, meta.sentBy || null);
+    db.prepare(`INSERT INTO emails_sent (id, org_id, to_email, subject, body_html, status, error_message, related_entity_type, related_entity_id, sent_by, message_id)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(uuid(), orgId || DEFAULT_ORG_ID, to, subject, bodyHtml, status, emailError, meta.relatedEntityType || null, meta.relatedEntityId || null, meta.sentBy || null, messageId);
   } catch (e) { console.error('[mail] failed to log sent email:', e.message); }
   return { emailError };
 }
@@ -315,6 +320,16 @@ export const SYSTEM_EMAIL_TEMPLATES = {
       </table>
       <p>It may take up to <strong>4 business days</strong> to show up in your account.</p>
       {{noteBlock}}`,
+  },
+  // Internal notice only — see Settings > Organization's "Notify on Bounced
+  // Email" (notify_email_bounce_email) and routes/emailEvents.js's public
+  // Brevo webhook. Never sent to the address that actually bounced.
+  emailBounce: {
+    label: 'Internal Notice: Email Bounced/Blocked', vars: ['toEmail', 'subject', 'eventLabel', 'reason'],
+    subject: 'Email could not be delivered: {{toEmail}}',
+    body: `<p>Brevo reported that an email we sent could not be delivered.</p>
+      <p><strong>To:</strong> {{toEmail}}<br><strong>Original Subject:</strong> {{subject}}<br><strong>Reason:</strong> {{eventLabel}}{{reason}}</p>
+      <p style="color:#8a7c63;font-size:13px">Check the Email Center's sent log for the full message.</p>`,
   },
 };
 

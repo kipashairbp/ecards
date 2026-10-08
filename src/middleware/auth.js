@@ -13,8 +13,16 @@ if (!process.env.JWT_SECRET && process.env.NODE_ENV === 'production') {
 }
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 
-export function signToken(user) {
-  return jwt.sign({ userId: user.id, tokenVersion: user.token_version || 0 }, JWT_SECRET, { expiresIn: '30d' });
+// impersonatedBy (an admin user id) is only ever set by POST /auth/impersonate/:token
+// redeeming an "Enter Portal" link — a real login never passes it. Carrying
+// it in the JWT itself (rather than, say, looking up impersonation_tokens.
+// used_at by iat, which would be a fragile coincidence to rely on) is what
+// lets downstream routes — Store Billing's email-verification gate in
+// particular, see routes/storeBilling.js — tell "this is genuinely the
+// store's own login" apart from "this is an admin looking through the
+// store's eyes," without a second request. Null for a real login.
+export function signToken(user, impersonatedBy = null) {
+  return jwt.sign({ userId: user.id, tokenVersion: user.token_version || 0, impersonatedBy }, JWT_SECRET, { expiresIn: '30d' });
 }
 
 // The shape sent to the client for a `user` object, everywhere one is sent
@@ -40,6 +48,17 @@ export function auth(req, res, next) {
   if ((user.token_version || 0) !== (decoded.tokenVersion || 0)) return res.status(401).json({ error: 'Session expired, please log in again' });
   if (user.is_paused) return res.status(423).json({ error: 'Account is paused pending duplicate resolution. Contact the administrator.', code: 'ACCOUNT_PAUSED' });
   req.user = user;
+  // Set only for a token minted by POST /auth/impersonate/:token — see
+  // signToken's comment. Re-validated here on every request rather than
+  // trusted blindly from the token's own claim: if the impersonating admin
+  // has since been deactivated, this falls back to treating the session as
+  // a normal (non-bypassed) one instead of leaving a stale privilege behind.
+  if (decoded.impersonatedBy) {
+    const admin = db.prepare('SELECT id, is_active FROM users WHERE id = ?').get(decoded.impersonatedBy);
+    req.impersonatedBy = admin && admin.is_active ? admin.id : null;
+  } else {
+    req.impersonatedBy = null;
+  }
   // The JWT's own `iat` (seconds since epoch, set automatically by jwt.sign)
   // doubles as a stable "this login" marker — same token, same iat, on every
   // request until the next login issues a fresh one. Store Billing's invoice

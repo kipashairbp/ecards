@@ -1,8 +1,9 @@
 import { Router } from 'express';
 import multer from 'multer';
 import { join } from 'path';
-import { writeFileSync, unlinkSync, existsSync } from 'fs';
+import { writeFileSync, unlinkSync, existsSync, readFileSync } from 'fs';
 import { db, uuid, DATA_DIR } from '../db.js';
+import { sendXlsx } from '../services/xlsx.js';
 import { requirePermission } from '../middleware/permissions.js';
 import { auth } from '../middleware/auth.js';
 import { sendMailChecked, renderSystemTemplate, escapeHtml } from '../services/mail.js';
@@ -17,6 +18,28 @@ const invoiceUpload = multer({ storage: multer.memoryStorage(), limits: { fileSi
 const BILLS_DIR = join(DATA_DIR, 'store-bills');
 
 router.use(auth);
+
+// Bank picker list for the store portal's payment-info form. The built-in
+// list lives in frontend/js/usbanks.js (read here so there's exactly one
+// copy); an admin can replace it wholesale from Settings > Store Billing,
+// stored as a JSON array under the store_billing_banks setting. "Other /
+// Not Listed" is always kept last since it's what unlocks the free-text
+// bank name field.
+const OTHER_BANK = 'Other / Not Listed';
+const DEFAULT_BANKS = (() => {
+  try {
+    const src = readFileSync(new URL('../../frontend/js/usbanks.js', import.meta.url), 'utf8');
+    return new Function('return ' + src.match(/window\.US_BANKS\s*=\s*(\[[\s\S]*?\]);/)[1])();
+  } catch (e) { console.error('[store-billing] could not read usbanks.js:', e.message); return []; }
+})();
+function getBanks(orgId) {
+  let list = null;
+  try { const v = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'store_billing_banks'`).get(orgId)?.value; if (v) list = JSON.parse(v); } catch { /* malformed setting -> built-in list */ }
+  if (!Array.isArray(list) || !list.length) list = DEFAULT_BANKS;
+  const clean = [...new Set(list.map(b => String(b).trim()).filter(b => b && b !== OTHER_BANK))];
+  return [...clean, OTHER_BANK];
+}
+router.get('/banks', (req, res) => res.json({ banks: getBanks(req.user.org_id) }));
 
 function periodLabel(startDate, endDate) {
   const fmt = (d) => { try { return new Date(d + 'T00:00:00Z').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' }); } catch { return d; } };
@@ -84,7 +107,15 @@ router.get('/my/status', async (req, res) => {
   res.json({
     hasPaymentInfo: !!paymentInfo,
     paymentInfo: maskPaymentInfo(paymentInfo),
-    invoiceVerifiedThisSession: hasVerifiedThisSession(req.user.store_id, req.tokenIat),
+    // An impersonating admin can't read the store's own inbox, so the whole
+    // code-verification premise doesn't apply to them — both this flag and
+    // the payment-info/invoice-submit routes below treat an impersonated
+    // session as already verified. `impersonating` additionally lets the
+    // frontend skip straight past the payment-info verify step too (it's
+    // normally NOT session-cached — see hasVerifiedThisSession's comment —
+    // but there's no code to even send here, so there's nothing to cache).
+    invoiceVerifiedThisSession: !!req.impersonatedBy || hasVerifiedThisSession(req.user.store_id, req.tokenIat),
+    impersonating: !!req.impersonatedBy,
     periods: invites.map(p => ({ id: p.id, start_date: p.start_date, end_date: p.end_date, label: periodLabel(p.start_date, p.end_date), submitted: !!p.submitted })),
     taxId: settings.store_billing_tax_id || '',
     legalName: settings.store_billing_legal_name || '',
@@ -131,7 +162,8 @@ router.post('/payment-info', (req, res) => {
   // field (e.g. mismatched account numbers) must be fixable by resubmitting
   // the SAME form without burning the verification code and forcing the
   // whole email-code dance over again for a one-character fix.
-  if (!useVerification(req.user.store_id, 'payment_info', b.verificationId)) {
+  // Impersonating admins skip this entirely — see /my/status's comment.
+  if (!req.impersonatedBy && !useVerification(req.user.store_id, 'payment_info', b.verificationId)) {
     return res.status(400).json({ error: 'Please verify your email before saving payment information.', code: 'VERIFICATION_REQUIRED' });
   }
   const existing = db.prepare('SELECT id FROM store_payment_info WHERE store_id = ?').get(req.user.store_id);
@@ -159,7 +191,8 @@ router.post('/my/invoices', invoiceUpload.single('file'), async (req, res) => {
   const paymentInfo = db.prepare('SELECT * FROM store_payment_info WHERE store_id = ?').get(req.user.store_id);
   if (!paymentInfo) return res.status(400).json({ error: 'Please complete your payment information before submitting an invoice.', code: 'PAYMENT_INFO_REQUIRED' });
   const b = req.body || {};
-  if (!hasVerifiedThisSession(req.user.store_id, req.tokenIat) && !useVerification(req.user.store_id, 'invoice_submit', b.verificationId)) {
+  // Impersonating admins skip this entirely — see /my/status's comment.
+  if (!req.impersonatedBy && !hasVerifiedThisSession(req.user.store_id, req.tokenIat) && !useVerification(req.user.store_id, 'invoice_submit', b.verificationId)) {
     return res.status(400).json({ error: 'Please verify your email before submitting.', code: 'VERIFICATION_REQUIRED' });
   }
   const amountNum = +b.amount;
@@ -279,6 +312,29 @@ router.get('/invoices/:id', requirePermission('store_billing'), (req, res) => {
   if (!bill) return res.status(404).json({ error: 'Not found' });
   const paymentInfo = db.prepare('SELECT * FROM store_payment_info WHERE store_id = ?').get(bill.store_id);
   res.json({ bill, paymentInfo: maskPaymentInfo(paymentInfo) });
+});
+
+// Every store with its banking details in full, as a spreadsheet — the
+// same super_admin/org_admin-only gate and audit trail as the per-store
+// reveal below, since this is the same sensitive data in bulk. Stores
+// without payment info on file are included (bank columns blank) so the
+// sheet doubles as a "who still hasn't set up payment" list; they sort last.
+router.get('/stores/payment-info/export', requirePermission('store_billing'), (req, res) => {
+  if (!['super_admin', 'org_admin'].includes(req.user.role)) return res.status(403).json({ error: 'Not permitted' });
+  const rows = db.prepare(`SELECT s.name, s.setup_status, s.address, s.city, s.state, s.zip, s.phone,
+      s.owner_name, s.owner_phone, s.owner_email, s.manager_name, s.manager_phone, s.manager_email, u.email AS login_email,
+      pi.bank_name, pi.name_on_account, pi.address AS bank_address, pi.city AS bank_city, pi.state AS bank_state, pi.zip AS bank_zip,
+      pi.contact_name, pi.contact_cell, pi.account_number, pi.routing_number, pi.updated_at AS payment_info_updated_at
+    FROM stores s LEFT JOIN store_payment_info pi ON pi.store_id = s.id LEFT JOIN users u ON u.id = s.portal_user_id
+    WHERE s.org_id = ? AND s.setup_status != 'inactive' ORDER BY (pi.id IS NULL), s.name`).all(req.user.org_id);
+  logAudit(req.user.org_id, req.user.id, 'export_payment_info', 'store', null, null, { stores: rows.length, with_payment_info: rows.filter(r => r.account_number).length }, req.ip);
+  const out = rows.map(r => ({
+    'Store': r.name, 'Setup Status': r.setup_status, 'Address': r.address, 'City': r.city, 'State': r.state, 'Zip': r.zip, 'Store Phone': r.phone,
+    'Owner': r.owner_name, 'Owner Phone': r.owner_phone, 'Owner Email': r.owner_email, 'Manager': r.manager_name, 'Manager Phone': r.manager_phone, 'Manager Email': r.manager_email, 'Portal Login': r.login_email,
+    'Bank': r.bank_name, 'Name on Account': r.name_on_account, 'Bank Address': [r.bank_address, r.bank_city, r.bank_state, r.bank_zip].filter(Boolean).join(', '),
+    'Billing Contact': r.contact_name, 'Billing Contact Cell': r.contact_cell, 'Account Number': r.account_number, 'Routing Number': r.routing_number, 'Payment Info Updated': r.payment_info_updated_at,
+  }));
+  sendXlsx(res, `store-bank-details-${new Date().toISOString().slice(0, 10)}.xlsx`, out);
 });
 
 // Full, unmasked account/routing numbers — only when an admin is actually

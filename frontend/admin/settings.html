@@ -62,6 +62,12 @@ renderShell('/admin/settings', `
       <button class="btn btn-sm btn-primary" style="margin-top:14px" onclick="saveDocSignedNotifyEmail()">Save</button>
     </div>
     <div class="card" style="margin-top:16px">
+      <h3>Notify on Bounced Email</h3>
+      <p class="small-muted">Optional — when set, an internal email is sent whenever Brevo reports that an email this app sent could not be delivered (bounced, blocked, marked spam, etc). Requires a webhook configured in your Brevo account's dashboard (Transactional &gt; Settings &gt; Webhooks) pointing to this server's <code>/api/email-events/webhook</code> endpoint. Can list multiple addresses, comma-separated. Leave blank to disable.</p>
+      <label>Notify on Bounced Email</label><input id="org-notify_email_bounce_email" placeholder="e.g. office@yourorg.org">
+      <button class="btn btn-sm btn-primary" style="margin-top:14px" onclick="saveEmailBounceNotifyEmail()">Save</button>
+    </div>
+    <div class="card" style="margin-top:16px">
       <h3>Our SMS Number</h3>
       <p class="small-muted">Your SimpleSender sending number. Incoming-message sync (SMS Center &gt; Inbox) uses this to tell replies to you apart from messages you sent — anything addressed to this number is inbound. Update this if the number is ever reassigned.</p>
       <label>SMS Number</label><input id="org-sms_own_number" placeholder="+18555996232">
@@ -100,6 +106,15 @@ renderShell('/admin/settings', `
       <label>Route Invoice Notifications To <span class="small-muted">(comma-separated, blank to disable)</span></label>
       <input id="sb-notify-email" placeholder="billing@example.com">
       <button class="btn btn-sm btn-primary" style="margin-top:14px" onclick="saveStoreBillingSettings()">Save</button>
+      <div class="divider" style="margin:18px 0"></div>
+      <h3 style="font-size:15px">Bank List</h3>
+      <p class="small-muted">The banks a store can pick from on its Payment Information form, one per line, in the order shown. Add, rename or remove freely — "Other / Not Listed" is always kept at the end so a store can still type in a bank that isn't here. Changes apply the next time a store opens the form.</p>
+      <textarea id="sb-banks" rows="12" style="font-family:inherit;font-size:13px" placeholder="Chase&#10;Bank of America&#10;Metropolitan Bank"></textarea>
+      <div style="display:flex;gap:8px;margin-top:10px;align-items:center">
+        <button class="btn btn-sm btn-primary" onclick="saveBankList()">Save Bank List</button>
+        <button class="btn btn-sm btn-outline" onclick="resetBankList()">Reset to Built-in List</button>
+        <span class="small-muted" id="sb-banks-count"></span>
+      </div>
     </div>
     <div class="card" style="margin-top:16px">
       <h3>Application Restrictions</h3>
@@ -246,6 +261,13 @@ window.saveDocSignedNotifyEmail = async () => {
     toast('Saved');
   } catch (err) { toast(err.message, true); }
 };
+async function loadEmailBounceNotifyEmail() {
+  const { settings } = await api('/settings');
+  qs('#org-notify_email_bounce_email').value = settings.notify_email_bounce_email || '';
+}
+window.saveEmailBounceNotifyEmail = async () => {
+  try { await api('/settings', { method: 'PUT', body: { notify_email_bounce_email: qs('#org-notify_email_bounce_email').value.trim() } }); toast('Saved'); } catch (err) { toast(err.message, true); }
+};
 async function loadSmsOwnNumber() {
   const { settings } = await api('/settings');
   qs('#org-sms_own_number').value = settings.sms_own_number || '+18555996232';
@@ -365,7 +387,23 @@ async function loadStoreBillingSettings() {
   qs('#sb-legal-name').value = settings.store_billing_legal_name || '';
   qs('#sb-tax-id').value = settings.store_billing_tax_id || '';
   qs('#sb-notify-email').value = settings.store_billing_notify_email || '';
+  await loadBankList(!!settings.store_billing_banks);
 }
+async function loadBankList(customized) {
+  const { banks } = await api('/store-billing/banks');
+  const editable = banks.filter(b => b !== 'Other / Not Listed');
+  qs('#sb-banks').value = editable.join('\n');
+  qs('#sb-banks-count').textContent = `${editable.length} banks${customized ? ' (customized)' : ' (built-in list)'}`;
+}
+window.saveBankList = async () => {
+  const banks = [...new Set(qs('#sb-banks').value.split('\n').map(s => s.trim()).filter(Boolean))];
+  if (!banks.length) return toast('Enter at least one bank, or use Reset to go back to the built-in list', true);
+  try { await api('/settings', { method: 'PUT', body: { store_billing_banks: JSON.stringify(banks) } }); toast('Bank list saved'); await loadBankList(true); } catch (err) { toast(err.message, true); }
+};
+window.resetBankList = async () => {
+  if (!confirm('Replace your custom bank list with the built-in one?')) return;
+  try { await api('/settings', { method: 'PUT', body: { store_billing_banks: '' } }); toast('Reset to the built-in list'); await loadBankList(false); } catch (err) { toast(err.message, true); }
+};
 window.saveStoreBillingSettings = async () => {
   try {
     await api('/settings', { method: 'PUT', body: {
@@ -460,7 +498,7 @@ window.uploadFullImport = async (input) => {
   input.value = '';
 };
 
-loadOrg(); loadZipRestriction(); loadDefaultReplyTo(); loadNewSignupNotifyEmails(); loadDocSignedNotifyEmail(); loadSmsOwnNumber(); loadDiscountId(); loadPushFields(); loadPopup(); loadShulCardAmountVisible(); loadShulCardStatusVisible(); loadRequiredFields(); loadStoreLinks(); loadStoreBillingSettings();
+loadOrg(); loadZipRestriction(); loadDefaultReplyTo(); loadNewSignupNotifyEmails(); loadDocSignedNotifyEmail(); loadEmailBounceNotifyEmail(); loadSmsOwnNumber(); loadDiscountId(); loadPushFields(); loadPopup(); loadShulCardAmountVisible(); loadShulCardStatusVisible(); loadRequiredFields(); loadStoreLinks(); loadStoreBillingSettings();
 </script>
 </body>
 </html>

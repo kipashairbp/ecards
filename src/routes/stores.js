@@ -8,7 +8,7 @@ import { requirePermission, redact } from '../middleware/permissions.js';
 import { sendMailChecked, renderSystemTemplate, notifyNewSignup, renderSignupDetails } from '../services/mail.js';
 import { sendXlsx } from '../services/xlsx.js';
 import { normalizePhone, isValidPhone } from '../utils/phone.js';
-import { normalizeEmail } from '../utils/email.js';
+import { normalizeEmail, looksLikeSingleEmail } from '../utils/email.js';
 import { validateBySchema, getEffectiveSchema } from '../utils/formValidation.js';
 import { logAudit, logMassAudit, getEntityHistory } from '../services/audit.js';
 import { hardDeleteStore, captureStoreSnapshot } from '../utils/entityDelete.js';
@@ -22,6 +22,37 @@ const billUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize:
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 const BILLS_DIR = join(DATA_DIR, 'store-bills');
 
+// Keeps a store's portal login pointed at whatever owner_email/manager_email
+// now says, whenever either changes — ensureStorePortalUser (inviteStoreToPortal)
+// only ever reads these at invite time, so without this, editing (or
+// correcting) them afterward had zero effect on an already-issued login:
+// the OLD address stayed as users.email — the actual login/verification-code
+// destination — indefinitely, even once the store record itself looked
+// right. This used to just deactivate the login instead of updating it
+// (same bug shuls.js's syncPortalEmailForShul already fixed for shuls);
+// deactivating is still the fallback for a genuinely unusable new value
+// (blank, or colliding with another account's login — users.email is NOT
+// NULL/UNIQUE), but a normal correction now follows through to the login
+// instead of silently breaking it. Called from both PUT /:id (admin edit)
+// and PUT /:id/onboarding (the store's own self-service wizard) — missing
+// it from either is exactly how "I fixed the email but it's still going to
+// the old address" would keep recurring.
+function syncPortalEmailForStore(orgId, actingUserId, portalUserId, newOwnerEmail, newManagerEmail, ip) {
+  if (!portalUserId) return;
+  const portalUser = db.prepare('SELECT * FROM users WHERE id = ?').get(portalUserId);
+  if (!portalUser) return;
+  const currentEmails = [newOwnerEmail, newManagerEmail].filter(Boolean).map(normalizeEmail);
+  if (currentEmails.includes(normalizeEmail(portalUser.email))) return;
+  const newEmail = normalizeEmail(newOwnerEmail) || normalizeEmail(newManagerEmail);
+  const clash = newEmail ? db.prepare('SELECT id FROM users WHERE email = ? COLLATE NOCASE AND id != ?').get(newEmail, portalUser.id) : null;
+  if (newEmail && !clash) {
+    db.prepare('UPDATE users SET email = ? WHERE id = ?').run(newEmail, portalUser.id);
+  } else if (portalUser.is_active) {
+    db.prepare('UPDATE users SET is_active = 0, token_version = token_version + 1 WHERE id = ?').run(portalUser.id);
+    logAudit(orgId, actingUserId, 'update', 'user', portalUser.id, { is_active: 1 }, { is_active: 0 }, ip);
+  }
+}
+
 // Public: store self-application (mirrors the shul public form) — spec #9 says
 // stores can be added by admin OR sign up themselves. Starts at setup_status
 // 'pending'; admin reviews and invites to the portal same as an admin-added
@@ -33,6 +64,9 @@ router.post('/apply', async (req, res) => {
   const errors = validateBySchema(getEffectiveSchema('store_application'), b, { isAdmin: false });
   if (errors.length) return res.status(400).json({ error: errors[0] });
   if (!b.name || !b.owner_email) return res.status(400).json({ error: 'Store name and owner email are required' });
+  for (const [f, label] of [['manager_email', 'Manager Email'], ['owner_email', 'Owner Email']]) {
+    if (!looksLikeSingleEmail(b[f])) return res.status(400).json({ error: `${label} looks like it has more than one address in it — enter just one.` });
+  }
   const id = uuid();
   const samePerson = !!b.same_person;
   db.prepare(`INSERT INTO stores (id, org_id, season_id, name, address, city, state, zip, phone, pos_system, manager_name, manager_phone, manager_email,
@@ -367,6 +401,9 @@ router.post('/', requirePermission('stores', 'can_edit'), (req, res) => {
   for (const [f, label] of [['phone', 'Store Phone'], ['manager_phone', 'Manager Phone'], ['owner_phone', 'Owner Phone']]) {
     if (!isValidPhone(b[f])) return res.status(400).json({ error: `${label} must be a valid phone number (10 digits, or 11 digits starting with 1)` });
   }
+  for (const [f, label] of [['manager_email', 'Manager Email'], ['owner_email', 'Owner Email']]) {
+    if (!looksLikeSingleEmail(b[f])) return res.status(400).json({ error: `${label} looks like it has more than one address in it — enter just one.` });
+  }
   const id = uuid();
   db.prepare(`INSERT INTO stores (id, org_id, season_id, name, address, city, state, zip, phone, pos_system, manager_name, manager_phone, manager_email,
       owner_name, owner_phone, owner_email, same_person, comments, setup_status, has_provider_account, discount)
@@ -398,32 +435,18 @@ router.put('/:id', requirePermission('stores', 'can_edit'), (req, res) => {
   for (const [f, label] of [['phone', 'Store Phone'], ['manager_phone', 'Manager Phone'], ['owner_phone', 'Owner Phone']]) {
     if (!isValidPhone(b[f])) return res.status(400).json({ error: `${label} must be a valid phone number (10 digits, or 11 digits starting with 1)` });
   }
+  for (const [f, label] of [['manager_email', 'Manager Email'], ['owner_email', 'Owner Email']]) {
+    if (!looksLikeSingleEmail(b[f])) return res.status(400).json({ error: `${label} looks like it has more than one address in it — enter just one.` });
+  }
   const sets = fields.filter(f => b[f] !== undefined);
   if (sets.length) {
     const vals = sets.map(f => (f === 'has_provider_account' || f === 'same_person' || f === 'disccard_setup_complete') ? (b[f] ? 1 : 0) : b[f]);
     db.prepare(`UPDATE stores SET ${sets.map(f=>`${f}=?`).join(',')} WHERE id=?`).run(...vals, store.id);
     logAudit(req.user.org_id, req.user.id, 'update', 'store', store.id, Object.fromEntries(sets.map(f => [f, store[f]])), Object.fromEntries(sets.map((f,i) => [f, vals[i]])), req.ip);
   }
-  // Editing (or blanking) owner_email/manager_email here used to have zero
-  // effect on an already-issued portal login — inviteStoreToPortal only
-  // ever reads these fields at invite time, so a login's users.email is
-  // independent of them from then on. That meant "removing" a store's
-  // email in this form never actually revoked the access it was granted
-  // under: the old login kept working with the old address indefinitely.
-  // This route is never called by the store role itself (can_edit defaults
-  // to 0 for that role — store-portal self-service goes through its own
-  // dedicated onboarding routes, not this one), so there's no self-edit
-  // case to protect here the way shuls.js's PUT /:id has to — every caller
-  // is an admin, so revoking is always the right call, not a session they
-  // might be mid-edit of themselves.
   if (store.portal_user_id && (sets.includes('owner_email') || sets.includes('manager_email'))) {
     const updatedStore = db.prepare('SELECT owner_email, manager_email FROM stores WHERE id = ?').get(store.id);
-    const portalUser = db.prepare('SELECT * FROM users WHERE id = ?').get(store.portal_user_id);
-    const currentEmails = [updatedStore.owner_email, updatedStore.manager_email].filter(Boolean).map(normalizeEmail);
-    if (portalUser && portalUser.is_active && !currentEmails.includes(normalizeEmail(portalUser.email))) {
-      db.prepare('UPDATE users SET is_active = 0, token_version = token_version + 1 WHERE id = ?').run(portalUser.id);
-      logAudit(req.user.org_id, req.user.id, 'update', 'user', portalUser.id, { is_active: 1 }, { is_active: 0 }, req.ip);
-    }
+    syncPortalEmailForStore(req.user.org_id, req.user.id, store.portal_user_id, updatedStore.owner_email, updatedStore.manager_email, req.ip);
   }
   res.json({ store: db.prepare('SELECT * FROM stores WHERE id = ?').get(store.id) });
 });
@@ -797,9 +820,16 @@ router.put('/:id/onboarding', (req, res) => {
     for (const [f, label] of [['phone', 'Store Phone'], ['manager_phone', 'Manager Phone'], ['owner_phone', 'Owner Phone']]) {
       if (!isValidPhone(info[f])) return res.status(400).json({ error: `${label} must be a valid phone number (10 digits, or 11 digits starting with 1)` });
     }
+    for (const [f, label] of [['manager_email', 'Manager Email'], ['owner_email', 'Owner Email']]) {
+      if (!looksLikeSingleEmail(info[f])) return res.status(400).json({ error: `${label} looks like it has more than one address in it — enter just one.` });
+    }
     const fields = ['name', 'address', 'city', 'state', 'zip', 'phone', 'manager_name', 'manager_phone', 'manager_email', 'owner_name', 'owner_phone', 'owner_email'];
     const sets = fields.filter(f => info[f] !== undefined);
     if (sets.length) db.prepare(`UPDATE stores SET ${sets.map(f => `${f}=?`).join(',')} WHERE id=?`).run(...sets.map(f => info[f]), store.id);
+    if (store.portal_user_id && (sets.includes('owner_email') || sets.includes('manager_email'))) {
+      const updatedStore = db.prepare('SELECT owner_email, manager_email FROM stores WHERE id = ?').get(store.id);
+      syncPortalEmailForStore(req.user.org_id, req.user.id, store.portal_user_id, updatedStore.owner_email, updatedStore.manager_email, req.ip);
+    }
   }
   if (agree_terms) db.prepare(`UPDATE stores SET agreed_terms_at = datetime('now') WHERE id = ?`).run(store.id);
 

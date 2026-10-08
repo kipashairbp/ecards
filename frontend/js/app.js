@@ -1693,9 +1693,14 @@ function initSignaturePad(canvasId) {
   const ctx = canvas.getContext('2d');
   function resize() { const ratio = window.devicePixelRatio || 1; canvas.width = canvas.clientWidth * ratio; canvas.height = canvas.clientHeight * ratio; ctx.scale(ratio, ratio); ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.strokeStyle = '#241a15'; }
   resize();
+  // The Draw canvas starts display:none (Type is the default mode), so the
+  // sizing above sees clientWidth 0 and the bitmap stays 0x0 — every stroke
+  // would land outside it and the "signature" came out blank. Re-measure
+  // on the first stroke, once the canvas is actually visible.
+  let sized = canvas.clientWidth > 0;
   let drawing = false, hasDrawn = false;
   const pos = (e) => { const r = canvas.getBoundingClientRect(); const p = e.touches ? e.touches[0] : e; return { x: p.clientX - r.left, y: p.clientY - r.top }; };
-  const start = (e) => { drawing = true; hasDrawn = true; const p = pos(e); ctx.beginPath(); ctx.moveTo(p.x, p.y); e.preventDefault(); };
+  const start = (e) => { if (!sized && canvas.clientWidth > 0) { resize(); sized = true; } drawing = true; hasDrawn = true; const p = pos(e); ctx.beginPath(); ctx.moveTo(p.x, p.y); e.preventDefault(); };
   const move = (e) => { if (!drawing) return; const p = pos(e); ctx.lineTo(p.x, p.y); ctx.stroke(); e.preventDefault(); };
   const end = () => drawing = false;
   canvas.addEventListener('mousedown', start); canvas.addEventListener('mousemove', move); window.addEventListener('mouseup', end);

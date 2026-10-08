@@ -39,7 +39,19 @@ router.post('/accept-invite', (req, res) => {
   const user = db.prepare('SELECT * FROM users WHERE invite_token = ?').get(token);
   if (!user) return res.status(404).json({ error: 'Invalid or expired invite link' });
   if (user.invite_expires && new Date(user.invite_expires) < new Date()) return res.status(410).json({ error: 'This invite link has expired' });
-  db.prepare(`UPDATE users SET password_hash = ?, invite_token = NULL, invite_expires = NULL, is_active = 1 WHERE id = ?`)
+  // A deactivated login (e.g. a store whose owner/manager email no longer
+  // matches — see stores.js's syncPortalEmailForStore) must stay deactivated
+  // until an admin re-invites it, not silently switch itself back on just
+  // because an old, still-unexpired invite/reset token happens to exist.
+  // This used to unconditionally force is_active = 1 here, which is exactly
+  // how that happened. A brand-new invite is already is_active = 1 by
+  // table default, so this check never blocks the normal first-time case.
+  if (!user.is_active) return res.status(403).json({ error: 'This account has been deactivated. Contact your administrator to be re-invited.' });
+  // token_version bump logs out any session still holding an old JWT under
+  // this login — change-password and admin Set Password already do this;
+  // accepting an invite/reset previously didn't, so a password reset didn't
+  // actually revoke whatever was already logged in with the old password.
+  db.prepare(`UPDATE users SET password_hash = ?, invite_token = NULL, invite_expires = NULL, token_version = token_version + 1 WHERE id = ?`)
     .run(bcrypt.hashSync(password, 10), user.id);
   const fresh = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
   res.json({ token: signToken(fresh), user: safeUser(fresh), permissions: computePermissionMap(fresh) });
@@ -48,8 +60,12 @@ router.post('/accept-invite', (req, res) => {
 router.post('/forgot-password', async (req, res) => {
   const { email } = req.body || {};
   const user = db.prepare('SELECT * FROM users WHERE email = ? COLLATE NOCASE').get(String(email || '').trim().toLowerCase());
-  // Always respond 200 to avoid leaking which emails exist.
-  if (user) {
+  // Always respond 200 to avoid leaking which emails exist. A deactivated
+  // login (see stores.js's syncPortalEmailForStore / shuls.js's
+  // syncPortalEmailForShul) gets no reset email at all — accept-invite
+  // would refuse it anyway now, but there's no reason to even issue a
+  // token for an account that's deliberately locked out.
+  if (user && user.is_active) {
     const token = uuid();
     const expires = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
     db.prepare('UPDATE users SET invite_token = ?, invite_expires = ? WHERE id = ?').run(token, expires, user.id);
@@ -76,7 +92,12 @@ router.post('/impersonate/:token', (req, res) => {
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(row.user_id);
   if (!user || !user.is_active) return res.status(404).json({ error: 'This account is no longer active' });
   db.prepare('UPDATE impersonation_tokens SET used_at = datetime(\'now\') WHERE token = ?').run(row.token);
-  res.json({ token: signToken(user), user: safeUser(user), permissions: computePermissionMap(user) });
+  // row.created_by is baked into the issued JWT itself (see signToken /
+  // middleware/auth.js) so every later request on this session can tell
+  // it's an impersonated one — e.g. Store Billing's email-verification
+  // gate skips the code requirement for an impersonating admin, since
+  // they can't read the store's own inbox anyway.
+  res.json({ token: signToken(user, row.created_by), user: safeUser(user), permissions: computePermissionMap(user) });
 });
 
 router.post('/change-password', auth, (req, res) => {
