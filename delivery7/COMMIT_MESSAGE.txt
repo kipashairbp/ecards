@@ -1,0 +1,17 @@
+Make the store-portal bank list admin-editable and add a full bank-details export
+
+- Bank picker list now comes from GET /store-billing/banks: the built-in
+  list (usbanks.js, now including Metropolitan Bank) unless an admin has
+  saved their own under the store_billing_banks setting. Editable from
+  Settings > Store Billing > Bank List (one per line, reset to built-in);
+  "Other / Not Listed" is always kept last since it unlocks the free-text
+  bank name field.
+- Store Billing gets a "Download Store Bank Details (Excel)" button: every
+  store with its payment info in full (account + routing numbers), gated
+  to super_admin/org_admin exactly like the per-store reveal and audited
+  as export_payment_info. Stores without payment info are included with
+  blank bank columns, sorted last.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012xZutnBTXxVHZBLN37CM1H
+
