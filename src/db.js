@@ -1378,5 +1378,35 @@ db.prepare(`UPDATE store_bill_submissions SET status = 'completed' WHERE status 
 safeAlter(`ALTER TABLE emails_sent ADD COLUMN message_id TEXT`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_emails_sent_message_id ON emails_sent(message_id)`);
 
+// Re-sync every shul/store portal login's users.email to the email its
+// shul/store record currently has on file. users.email is a snapshot taken
+// when the login was created; routes/shuls.js and routes/stores.js now keep
+// it in step on every edit, but anything edited BEFORE that existed (or
+// whose edit skipped the sync because the new address clashed at the time)
+// is still pointing at the old address — and password resets, verification
+// codes etc. kept going there. Runs at every boot, idempotent: only rows
+// that actually differ are touched; blank, multi-address ("a@x.com,
+// b@y.com") or already-taken addresses are left alone and logged.
+{
+  const single = (e) => { const s = String(e || '').trim().toLowerCase(); return s && /^[^\s,;]+@[^\s,;@]+$/.test(s) ? s : null; };
+  const rows = db.prepare(`
+    SELECT u.id, u.email, u.role,
+      COALESCE(NULLIF(TRIM(st.owner_email), ''), st.manager_email) AS store_email, sh.gabai_email
+    FROM users u
+    LEFT JOIN stores st ON st.id = u.store_id AND u.role = 'store'
+    LEFT JOIN shuls sh ON sh.id = u.shul_id AND u.role = 'shul'
+    WHERE u.role IN ('store', 'shul')`).all();
+  const taken = db.prepare('SELECT id FROM users WHERE email = ? COLLATE NOCASE AND id != ?');
+  const update = db.prepare('UPDATE users SET email = ? WHERE id = ?');
+  let fixed = 0, skipped = 0;
+  for (const r of rows) {
+    const want = single(r.role === 'store' ? r.store_email : r.gabai_email);
+    if (!want || want === String(r.email || '').toLowerCase()) continue;
+    if (taken.get(want, r.id)) { skipped++; console.warn(`[db] login ${r.email} not re-synced to ${want}: that address already belongs to another account`); continue; }
+    update.run(want, r.id); fixed++;
+  }
+  if (fixed || skipped) console.log(`[db] portal login emails re-synced to the shul/store record: ${fixed} updated, ${skipped} skipped`);
+}
+
 export const DEFAULT_ORG_ID = defaultOrgId;
 export function uuid() { return randomUUID(); }

@@ -41,6 +41,19 @@ function getBanks(orgId) {
 }
 router.get('/banks', (req, res) => res.json({ banks: getBanks(req.user.org_id) }));
 
+// Where store-facing email goes: the store's CURRENT owner/manager email,
+// never the login row's copy. users.email is a denormalized snapshot taken
+// when the portal login was created — if the store's email was edited since
+// (and the sync didn't apply, e.g. the new address clashed with another
+// account at the time), the login row goes stale while the store record is
+// what the admin actually sees and maintains. Falls back to the login email
+// only when the store has no contact email on file at all.
+function storeContactEmail(storeId) {
+  const row = db.prepare('SELECT s.owner_email, s.manager_email, u.email AS login_email FROM stores s LEFT JOIN users u ON u.id = s.portal_user_id WHERE s.id = ?').get(storeId);
+  if (!row) return null;
+  return [row.owner_email, row.manager_email, row.login_email].map(e => String(e || '').trim().toLowerCase()).find(Boolean) || null;
+}
+
 function periodLabel(startDate, endDate) {
   const fmt = (d) => { try { return new Date(d + 'T00:00:00Z').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' }); } catch { return d; } };
   return `${fmt(startDate)} – ${fmt(endDate)}`;
@@ -128,13 +141,14 @@ router.post('/verify/start', async (req, res) => {
   if (!['payment_info', 'invoice_submit'].includes(purpose)) return res.status(400).json({ error: 'Invalid purpose' });
   const code = randomCode8();
   const id = uuid();
+  const to = storeContactEmail(req.user.store_id) || req.user.email;
   db.prepare(`INSERT INTO billing_verification_codes (id, org_id, store_id, purpose, code, email, session_iat, expires_at)
     VALUES (?,?,?,?,?,?,?, datetime('now', '+10 minutes'))`)
-    .run(id, req.user.org_id, req.user.store_id, purpose, code, req.user.email, req.tokenIat || null);
+    .run(id, req.user.org_id, req.user.store_id, purpose, code, to, req.tokenIat || null);
   const purposeText = purpose === 'payment_info' ? 'set up or update your payment information' : 'submit your invoice';
   const tmpl = renderSystemTemplate(req.user.org_id, 'billingVerificationCode', { code, purposeText });
-  const { emailError } = await sendMailChecked(req.user.org_id, req.user.email, tmpl.subject, tmpl.body, { replyTo: tmpl.replyTo, relatedEntityType: 'store', relatedEntityId: req.user.store_id, sentBy: req.user.id });
-  res.json({ ok: true, sentTo: maskEmail(req.user.email), emailError });
+  const { emailError } = await sendMailChecked(req.user.org_id, to, tmpl.subject, tmpl.body, { replyTo: tmpl.replyTo, relatedEntityType: 'store', relatedEntityId: req.user.store_id, sentBy: req.user.id });
+  res.json({ ok: true, sentTo: maskEmail(to), emailError });
 });
 
 router.post('/verify/confirm', (req, res) => {
@@ -227,7 +241,7 @@ router.post('/my/invoices', invoiceUpload.single('file'), async (req, res) => {
   const amountFmt = '$' + amountNum.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
   const toStore = renderSystemTemplate(req.user.org_id, 'storeInvoiceSubmitted', { storeName: store.name, amount: amountFmt, period: period || 'N/A', submittedAt });
-  await sendMailChecked(req.user.org_id, req.user.email, toStore.subject, toStore.body, { replyTo: toStore.replyTo, relatedEntityType: 'store', relatedEntityId: store.id, sentBy: req.user.id });
+  await sendMailChecked(req.user.org_id, storeContactEmail(store.id) || req.user.email, toStore.subject, toStore.body, { replyTo: toStore.replyTo, relatedEntityType: 'store', relatedEntityId: store.id, sentBy: req.user.id });
 
   const notifyTo = db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'store_billing_notify_email'`).get(req.user.org_id)?.value;
   if (notifyTo) {
@@ -273,11 +287,13 @@ router.post('/periods', requirePermission('store_billing', 'can_edit'), async (r
   const label = periodLabel(start_date, end_date);
   for (const storeId of store_ids) {
     const store = db.prepare(`SELECT s.*, u.email AS login_email FROM stores s LEFT JOIN users u ON u.id = s.portal_user_id WHERE s.id = ? AND s.org_id = ? AND s.setup_status = 'active'`).get(storeId, req.user.org_id);
-    if (!store || !store.login_email) { skipped++; continue; }
+    // a portal login is still required (they need it to submit), but the email goes to the store's current contact address
+    const to = store ? storeContactEmail(store.id) : null;
+    if (!store || !store.login_email || !to) { skipped++; continue; }
     const portalUrl = `${process.env.APP_URL || ''}/store-portal/billing`;
     const subject = substitute(email_subject, { storeName: store.name, startDate: start_date, endDate: end_date, period: label, portalUrl });
     const body = substitute(email_body, { storeName: store.name, startDate: start_date, endDate: end_date, period: label, portalUrl });
-    const { emailError } = await sendMailChecked(req.user.org_id, store.login_email, subject, body, { relatedEntityType: 'store', relatedEntityId: store.id, sentBy: req.user.id });
+    const { emailError } = await sendMailChecked(req.user.org_id, to, subject, body, { relatedEntityType: 'store', relatedEntityId: store.id, sentBy: req.user.id });
     db.prepare(`INSERT INTO billing_period_invites (id, billing_period_id, store_id, email_status) VALUES (?,?,?,?)`)
       .run(uuid(), id, store.id, emailError ? 'failed' : 'sent');
     if (emailError) failed++; else sent++;
@@ -389,8 +405,8 @@ router.post('/invoices/:id/complete', requirePermission('store_billing', 'can_ed
       payment_note = ?, admin_notes = ?, reviewed_at = datetime('now') WHERE id = ?`)
     .run(amountNum, paymentInfo.bank_name, last4, payment_date, payment_note || null, admin_notes || null, bill.id);
   const store = db.prepare('SELECT * FROM stores WHERE id = ?').get(bill.store_id);
-  const storeUser = store?.portal_user_id ? db.prepare('SELECT email FROM users WHERE id = ?').get(store.portal_user_id) : null;
-  if (storeUser?.email) {
+  const storeTo = store ? storeContactEmail(store.id) : null;
+  if (storeTo) {
     const amountFmt = '$' + amountNum.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     // payment_note is admin-written but store-visible (it goes out in this
     // email) — escaped since it's free text, same as every other
@@ -398,7 +414,7 @@ router.post('/invoices/:id/complete', requirePermission('store_billing', 'can_ed
     // admin_notes never leaves this response/the admin UI.
     const noteBlock = payment_note ? `<p style="color:#8a7c63;font-size:13.5px">${escapeHtml(payment_note).replace(/\n/g, '<br>')}</p>` : '';
     const tmpl = renderSystemTemplate(req.user.org_id, 'storeInvoicePaymentSent', { storeName: bill.store_name, amount: amountFmt, bankName: paymentInfo.bank_name, last4, period: bill.period || 'N/A', noteBlock });
-    await sendMailChecked(req.user.org_id, storeUser.email, tmpl.subject, tmpl.body, { replyTo: tmpl.replyTo, relatedEntityType: 'store', relatedEntityId: bill.store_id, sentBy: req.user.id });
+    await sendMailChecked(req.user.org_id, storeTo, tmpl.subject, tmpl.body, { replyTo: tmpl.replyTo, relatedEntityType: 'store', relatedEntityId: bill.store_id, sentBy: req.user.id });
   }
   logAudit(req.user.org_id, req.user.id, 'complete_invoice_payment', 'store', bill.store_id, { status: bill.status }, { status: 'completed', payment_amount: amountNum, payment_date }, req.ip);
   res.json({ bill: db.prepare('SELECT * FROM store_bill_submissions WHERE id = ?').get(bill.id) });
