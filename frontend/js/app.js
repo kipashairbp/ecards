@@ -1183,7 +1183,7 @@ window.openStoreInvoiceModal = async (id, onDone) => {
     `;
     const footer = `
       ${canEdit && bill.status === 'pending' ? `<button class="btn btn-outline btn-sm" style="color:#b71c1c;border-color:#b71c1c" onclick="rejectStoreInvoice('${bill.id}')">Reject</button>
-      <button class="btn btn-primary btn-sm" onclick="openStoreCompletePayment('${bill.id}', ${bill.amount}, '${(bill.period || '').replace(/'/g, "\\'")}')">Mark Payment Sent</button>` : ''}
+      <button class="btn btn-primary btn-sm" onclick="openStoreCompletePayment('${bill.id}', ${bill.approved_for_payment && bill.approved_amount != null ? bill.approved_amount : bill.amount}, '${(bill.period || '').replace(/'/g, "\\'")}')">Mark Payment Sent</button>` : ''}
       ${canEdit ? `<button class="btn btn-outline btn-sm" onclick="editStoreInvoiceNote('${bill.id}', '${(bill.admin_notes || '').replace(/'/g, "\\'").replace(/\n/g, '\\n')}')">${bill.admin_notes ? 'Edit' : 'Add'} Internal Note</button>` : ''}
       ${isTopAdmin ? `<button class="btn btn-outline btn-sm" style="color:#b71c1c;border-color:#b71c1c" onclick="deleteStoreInvoice('${bill.id}')">Delete</button>` : ''}
     `;

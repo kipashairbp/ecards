@@ -317,10 +317,53 @@ router.get('/invoices', requirePermission('store_billing'), (req, res) => {
   const params = [req.user.org_id];
   if (status) { where += ' AND b.status = ?'; params.push(status); }
   if (store_id) { where += ' AND b.store_id = ?'; params.push(store_id); }
-  const bills = db.prepare(`SELECT b.*, s.name AS store_name, bp.start_date AS period_start, bp.end_date AS period_end
+  const bills = db.prepare(`SELECT b.*, s.name AS store_name, bp.start_date AS period_start, bp.end_date AS period_end,
+      TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS approved_by_name
     FROM store_bill_submissions b JOIN stores s ON s.id = b.store_id LEFT JOIN billing_periods bp ON bp.id = b.billing_period_id
+    LEFT JOIN users u ON u.id = b.approved_by
     WHERE ${where} ORDER BY b.submitted_at DESC`).all(...params);
   res.json({ bills: bills.map(b => ({ ...b, period_label: b.period_start ? periodLabel(b.period_start, b.period_end) : (b.period || '') })) });
+});
+
+// Reviewer sign-off: "this invoice is approved for payment, for this
+// amount." Every change (checking, unchecking, editing the amount) is
+// stamped with who did it and when — that's the signature — and audited.
+// Only meaningful while the invoice is still pending; once a payment has
+// been sent or it's been rejected, the record is frozen.
+router.post('/invoices/:id/approve-for-payment', requirePermission('store_billing', 'can_edit'), (req, res) => {
+  const bill = db.prepare('SELECT * FROM store_bill_submissions WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
+  if (!bill) return res.status(404).json({ error: 'Not found' });
+  if (bill.status !== 'pending') return res.status(400).json({ error: 'Only a pending invoice can be approved for payment' });
+  const b = req.body || {};
+  const approved = b.approved === undefined ? !!bill.approved_for_payment : !!b.approved;
+  let amount = b.amount === undefined || b.amount === null || b.amount === '' ? (bill.approved_amount ?? bill.amount) : +b.amount;
+  if (!Number.isFinite(amount) || amount < 0) return res.status(400).json({ error: 'A valid amount is required' });
+  amount = Math.round(amount * 100) / 100;
+  db.prepare(`UPDATE store_bill_submissions SET approved_for_payment = ?, approved_amount = ?, approved_by = ?, approved_at = datetime('now') WHERE id = ?`)
+    .run(approved ? 1 : 0, amount, req.user.id, bill.id);
+  logAudit(req.user.org_id, req.user.id, approved ? 'approve_invoice_for_payment' : 'unapprove_invoice_for_payment', 'store', bill.store_id,
+    { approved_for_payment: bill.approved_for_payment, approved_amount: bill.approved_amount }, { approved_for_payment: approved ? 1 : 0, approved_amount: amount, invoice_id: bill.id }, req.ip);
+  const row = db.prepare(`SELECT b.*, TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS approved_by_name FROM store_bill_submissions b LEFT JOIN users u ON u.id = b.approved_by WHERE b.id = ?`).get(bill.id);
+  res.json({ bill: row });
+});
+
+// Headline tiles for the Store Billing page, across every invoice regardless
+// of the list's status filter. "Outstanding" is what is still owed to stores:
+// every pending invoice, at its approved amount once a reviewer has signed
+// off on one (partial approvals count at the approved figure), otherwise at
+// the submitted amount. "Paid" is money actually recorded as sent.
+router.get('/invoices/summary', requirePermission('store_billing'), (req, res) => {
+  const s = db.prepare(`SELECT
+      COALESCE(SUM(CASE WHEN status = 'completed' THEN COALESCE(payment_amount, amount) END), 0) AS paid_amount,
+      SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS paid_count,
+      COALESCE(SUM(CASE WHEN status = 'pending' THEN CASE WHEN approved_for_payment = 1 AND approved_amount IS NOT NULL THEN approved_amount ELSE amount END END), 0) AS outstanding_amount,
+      SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS outstanding_count,
+      COALESCE(SUM(CASE WHEN status = 'pending' AND approved_for_payment = 1 THEN COALESCE(approved_amount, amount) END), 0) AS approved_amount,
+      SUM(CASE WHEN status = 'pending' AND approved_for_payment = 1 THEN 1 ELSE 0 END) AS approved_count,
+      SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected_count
+    FROM store_bill_submissions WHERE org_id = ?`).get(req.user.org_id);
+  const money = v => Math.round((Number(v) || 0) * 100) / 100;
+  res.json({ summary: { ...s, paid_amount: money(s.paid_amount), outstanding_amount: money(s.outstanding_amount), approved_amount: money(s.approved_amount) } });
 });
 
 router.get('/invoices/:id', requirePermission('store_billing'), (req, res) => {

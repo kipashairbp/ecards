@@ -279,8 +279,33 @@ router.get('/transactions/reconcile', requirePermission('cards', 'can_view'), (r
   const start = season?.start_date ? String(season.start_date).slice(0, 10) : null;
   const end = season?.end_date ? String(season.end_date).slice(0, 10) : null;
   const seen = new Map();
+  // Which rule made a row a refund (mirrors services/cardSync.js's
+  // classification exactly). disccardpromos' own total nets out fewer
+  // refunds than ours whenever one of these rules is broader than theirs —
+  // e.g. a VOIDED sale carries a positive amount and status "voided": we
+  // currently book it as money back, they may simply not count it at all.
+  // Splitting refunds by the rule that fired makes that visible per rule.
+  const refundWord = /\b(refund|refunded|reversal|reversed|void|voided|chargeback)\b/i;
+  const refundReasons = new Map();
+  const refundReason = (raw) => {
+    if (!raw) return 'No provider payload stored (legacy row)';
+    const rawAmount = raw.disccardPaid ?? raw.cartAmount ?? raw.amount;
+    if (Number(rawAmount) < 0) return 'Negative amount from disccardpromos';
+    if (raw.is_refund === true || raw.refund === true) return 'Explicit refund flag from disccardpromos';
+    for (const f of ['type', 'kind', 'transaction_type', 'status', 'description', 'note', 'vendor']) {
+      const m = typeof raw[f] === 'string' && raw[f].match(refundWord);
+      if (m) return `"${m[1].toLowerCase()}" in ${f}${f === 'status' || f === 'type' || f === 'kind' ? ` (${raw[f]})` : ''}`;
+    }
+    return 'Sign convention only (no marker in payload)';
+  };
   for (const r of rows) {
-    if (r.amount < 0) add(purchases, r); else if (r.amount > 0) add(refunds, r);
+    if (r.amount < 0) add(purchases, r); else if (r.amount > 0) {
+      add(refunds, r);
+      let rawR = null; try { rawR = JSON.parse(r.raw_payload); } catch {}
+      const reason = refundReason(rawR);
+      if (!refundReasons.has(reason)) refundReasons.set(reason, { reason, ...bucket() });
+      add(refundReasons.get(reason), r);
+    }
     const day = String(r.occurred_at || '').slice(0, 10);
     if (r.amount < 0 && day && ((start && day < start) || (end && day > end))) add(outOfWindow, r);
     let raw = null; try { raw = JSON.parse(r.raw_payload); } catch {}
@@ -310,7 +335,7 @@ router.get('/transactions/reconcile', requirePermission('cards', 'can_view'), (r
   res.json({
     season: season ? { id: season.id, name: season.name, start_date: season.start_date, end_date: season.end_date } : null,
     rowsConsidered: rows.length,
-    purchases, refunds, netAfterRefunds: money(purchases.amount - refunds.amount), totalSpent: money(purchases.amount - refunds.amount),
+    purchases, refunds, refundReasons: [...refundReasons.values()].sort((a, b) => b.amount - a.amount), netAfterRefunds: money(purchases.amount - refunds.amount), totalSpent: money(purchases.amount - refunds.amount),
     outOfSeasonWindow: outOfWindow, disccardPaidMissing: paidMissing, cartAmountDiffersFromPaid: cartDiffers,
     onDeletedApplicant: deletedApplicant, onDeactivatedCard: deactivatedCard, likelyDuplicates: duplicates,
     unattributed,

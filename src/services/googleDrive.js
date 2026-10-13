@@ -109,7 +109,7 @@ export async function connectWithCode(orgId, code) {
 // Access tokens are short-lived (~1hr) and this integration is used
 // intermittently, not on a hot path — a fresh one is fetched per call
 // rather than maintaining a cache that would need its own expiry bookkeeping.
-async function getAccessToken(orgId) {
+export async function getAccessToken(orgId) {
   const refreshToken = getSetting(orgId, 'google_oauth_refresh_token');
   if (!refreshToken) throw new Error('No Google account connected — connect one from the Library page first.');
   const body = new URLSearchParams({

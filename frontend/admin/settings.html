@@ -68,6 +68,22 @@ renderShell('/admin/settings', `
       <button class="btn btn-sm btn-primary" style="margin-top:14px" onclick="saveEmailBounceNotifyEmail()">Save</button>
     </div>
     <div class="card" style="margin-top:16px">
+      <h3>Google Sheet (read-only copy of system data)</h3>
+      <p class="small-muted">A Google Sheet, owned by the Google account connected on the <a href="/admin/library">Library</a> page, with a tab each for Shuls, Applicants, Stores, Cards and Store Invoices. Every sync rewrites the whole sheet from the database, so it's a read-only window — people you share it with get view access only, and anything typed into it is overwritten. Bank account numbers, passwords and tokens are never included.</p>
+      <div id="gs-status" class="small-muted" style="margin-bottom:10px">Loading&hellip;</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <button class="btn btn-sm btn-primary" id="gs-sync-btn" onclick="googleSheetSync()">Sync Now</button>
+        <a class="btn btn-sm btn-outline" id="gs-open" href="#" target="_blank" rel="noopener" style="display:none">Open Sheet</a>
+        <label style="margin:0 0 0 8px">Auto-sync</label>
+        <select id="gs-interval" onchange="googleSheetInterval(this.value)" style="width:auto"><option value="off">Off</option><option value="hourly">Every hour</option><option value="daily">Daily</option></select>
+      </div>
+      <div style="margin-top:14px">
+        <label>Share (view only) with</label>
+        <div style="display:flex;gap:8px"><input id="gs-share-email" placeholder="someone@example.com" style="flex:1"><button class="btn btn-sm btn-outline" onclick="googleSheetShare()">Share</button></div>
+        <div id="gs-shared" class="small-muted" style="margin-top:6px"></div>
+      </div>
+    </div>
+    <div class="card" style="margin-top:16px">
       <h3>Our SMS Number</h3>
       <p class="small-muted">Your SimpleSender sending number. Incoming-message sync (SMS Center &gt; Inbox) uses this to tell replies to you apart from messages you sent — anything addressed to this number is inbound. Update this if the number is ever reassigned.</p>
       <label>SMS Number</label><input id="org-sms_own_number" placeholder="+18555996232">
@@ -267,6 +283,36 @@ async function loadEmailBounceNotifyEmail() {
 }
 window.saveEmailBounceNotifyEmail = async () => {
   try { await api('/settings', { method: 'PUT', body: { notify_email_bounce_email: qs('#org-notify_email_bounce_email').value.trim() } }); toast('Saved'); } catch (err) { toast(err.message, true); }
+};
+async function loadGoogleSheet() {
+  try {
+    const s = await api('/google-sheet/status');
+    const el = qs('#gs-status');
+    if (!s.connected) { el.innerHTML = 'No Google account is connected yet — connect one on the <a href="/admin/library">Library</a> page, then come back here.'; qs('#gs-sync-btn').disabled = true; return; }
+    qs('#gs-sync-btn').disabled = false;
+    el.innerHTML = `Connected as <strong>${esc(s.email)}</strong>. ${s.spreadsheetId ? `Sheet created. Last synced: <strong>${s.lastSync ? esc(fmtDateTime(s.lastSync.replace('T', ' ').slice(0, 19))) : 'never'}</strong>.` : 'No sheet yet — click Sync Now to create it.'}${s.lastError ? `<br><span style="color:var(--danger)">Last error: ${esc(s.lastError)}</span>` : ''}`;
+    const open = qs('#gs-open'); open.style.display = s.url ? 'inline-flex' : 'none'; if (s.url) open.href = s.url;
+    qs('#gs-interval').value = s.interval || 'off';
+    renderGsShared(s.sharedWith);
+  } catch (err) { qs('#gs-status').textContent = err.message; }
+}
+function renderGsShared(list) {
+  qs('#gs-shared').innerHTML = (list || []).length ? 'Shared (view only) with: ' + list.map(x => `${esc(x.email)} <a href="#" onclick="googleSheetUnshare('${esc(x.email)}');return false;" title="Remove access">&times;</a>`).join(', ') : 'Not shared with anyone yet.';
+}
+window.googleSheetSync = async () => {
+  const btn = qs('#gs-sync-btn'); btn.disabled = true; btn.textContent = 'Syncing…';
+  try { const r = await api('/google-sheet/sync', { method: 'POST' }); toast(`${r.created ? 'Sheet created and synced' : 'Synced'}: ${Object.entries(r.counts).map(([k, v]) => `${v} ${k.toLowerCase()}`).join(', ')}`); }
+  catch (err) { toast(err.message, true); }
+  finally { btn.disabled = false; btn.textContent = 'Sync Now'; loadGoogleSheet(); }
+};
+window.googleSheetInterval = async (interval) => { try { await api('/google-sheet/settings', { method: 'PUT', body: { interval } }); toast('Saved'); } catch (err) { toast(err.message, true); } };
+window.googleSheetShare = async () => {
+  const email = qs('#gs-share-email').value.trim(); if (!email) return;
+  try { const { sharedWith } = await api('/google-sheet/share', { method: 'POST', body: { email } }); qs('#gs-share-email').value = ''; renderGsShared(sharedWith); toast(`Shared with ${email} (view only)`); } catch (err) { toast(err.message, true); }
+};
+window.googleSheetUnshare = async (email) => {
+  if (!confirm(`Remove ${email}'s access to the sheet?`)) return;
+  try { const { sharedWith } = await api(`/google-sheet/share?email=${encodeURIComponent(email)}`, { method: 'DELETE' }); renderGsShared(sharedWith); toast('Access removed'); } catch (err) { toast(err.message, true); }
 };
 async function loadSmsOwnNumber() {
   const { settings } = await api('/settings');
@@ -498,7 +544,7 @@ window.uploadFullImport = async (input) => {
   input.value = '';
 };
 
-loadOrg(); loadZipRestriction(); loadDefaultReplyTo(); loadNewSignupNotifyEmails(); loadDocSignedNotifyEmail(); loadEmailBounceNotifyEmail(); loadSmsOwnNumber(); loadDiscountId(); loadPushFields(); loadPopup(); loadShulCardAmountVisible(); loadShulCardStatusVisible(); loadRequiredFields(); loadStoreLinks(); loadStoreBillingSettings();
+loadOrg(); loadZipRestriction(); loadDefaultReplyTo(); loadNewSignupNotifyEmails(); loadDocSignedNotifyEmail(); loadEmailBounceNotifyEmail(); loadGoogleSheet(); loadSmsOwnNumber(); loadDiscountId(); loadPushFields(); loadPopup(); loadShulCardAmountVisible(); loadShulCardStatusVisible(); loadRequiredFields(); loadStoreLinks(); loadStoreBillingSettings();
 </script>
 </body>
 </html>

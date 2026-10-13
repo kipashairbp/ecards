@@ -42,6 +42,8 @@ import systemExportRoutes from './routes/systemExport.js';
 import documentRoutes from './routes/documents.js';
 import emailRoutes from './routes/emails.js';
 import emailEventsRoutes from './routes/emailEvents.js';
+import googleSheetRoutes from './routes/googleSheet.js';
+import { syncIfDue as syncGoogleSheetIfDue } from './services/googleSheetSync.js';
 import smsRoutes from './routes/sms.js';
 import updateRoutes from './routes/updates.js';
 import auditRoutes from './routes/audit.js';
@@ -155,6 +157,7 @@ app.use('/api/system-export', systemExportRoutes);
 app.use('/api/documents', documentRoutes);
 app.use('/api/emails', emailRoutes);
 app.use('/api/email-events', emailEventsRoutes);
+app.use('/api/google-sheet', googleSheetRoutes);
 app.use('/api/sms', smsRoutes);
 app.use('/api/updates', updateRoutes);
 app.use('/api/audit', auditRoutes);
@@ -214,6 +217,11 @@ setTimeout(() => { sendDueTaskReminders().catch(e => console.error('[reminders] 
 const CARD_SYNC_INTERVAL_MS = 15 * 60 * 1000;
 setInterval(() => { syncAllCards(DEFAULT_ORG_ID).catch(e => console.error('[cardSync] sweep failed', e.message)); }, CARD_SYNC_INTERVAL_MS);
 setTimeout(() => { syncAllCards(DEFAULT_ORG_ID).catch(e => console.error('[cardSync] sweep failed', e.message)); }, 20 * 1000);
+
+// Read-only Google Sheet mirror (Settings > Google Sheet): checked every 15
+// minutes, actually syncs only when the configured interval (hourly/daily)
+// has elapsed — see services/googleSheetSync.js's syncIfDue.
+setInterval(() => { syncGoogleSheetIfDue(DEFAULT_ORG_ID).catch(e => console.error('[googleSheet] scheduled sync failed', e.message)); }, 15 * 60 * 1000);
 
 // Automatic disccardpromos match — keeps "approved here" and "active there"
 // identical without anyone clicking anything: every approved applicant

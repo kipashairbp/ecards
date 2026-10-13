@@ -7,6 +7,7 @@
 <link rel="icon" type="image/png" sizes="32x32" href="/img/favicon-32.png">
 <link rel="apple-touch-icon" href="/img/apple-touch-icon.png">
 <link rel="stylesheet" href="/css/portal-theme.css">
+<link rel="stylesheet" href="/css/exec-dashboard.css">
 <style>
   .sb-store-picker { max-height: 320px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; padding: 8px; margin-top: 8px; }
   .sb-store-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; }
@@ -24,6 +25,7 @@ const canEdit = Auth.can('store_billing', 'can_edit');
 
 renderShell('/admin/store-billing', `
   <h2>Store Billing</h2>
+  <div class="exec-kpi-grid" id="sb-summary"><div class="small-muted">Loading&hellip;</div></div>
   <div class="tabs" id="sb-tabs">
     <button class="active" data-t="invoices">Invoices</button>
     <button data-t="periods">Billing Periods</button>
@@ -37,11 +39,20 @@ renderShell('/admin/store-billing', `
         <option value="rejected">Rejected</option>
         <option value="">All</option>
       </select>
+      <input id="sb-search" placeholder="Search store, period, amount, approver&hellip;" style="min-width:260px" oninput="renderInvoices()">
       ${['super_admin', 'org_admin'].includes(Auth.user()?.role) ? `<button class="btn btn-sm btn-outline" style="margin-left:auto" title="Every store with its full bank account and routing numbers — treat the file as confidential" onclick="downloadAuthed('/store-billing/stores/payment-info/export', 'store-bank-details.xlsx')">Download Store Bank Details (Excel)</button>` : ''}
     </div>
     <div class="card" style="padding:0;overflow-x:auto">
-      <table><thead><tr><th>Store</th><th>Period</th><th>Amount</th><th>Submitted</th><th>Attachment</th><th>Status</th><th></th></tr></thead>
-      <tbody id="tbody-invoices"><tr><td colspan="7" class="empty-state">Loading&hellip;</td></tr></tbody></table>
+      <table><thead><tr>
+        <th class="sb-sort" data-k="store_name" onclick="sortInvoices('store_name')">Store</th>
+        <th class="sb-sort" data-k="period_start" onclick="sortInvoices('period_start')">Period</th>
+        <th class="sb-sort" data-k="amount" onclick="sortInvoices('amount')">Amount</th>
+        <th class="sb-sort" data-k="submitted_at" onclick="sortInvoices('submitted_at')">Submitted</th>
+        <th>Attachment</th>
+        <th class="sb-sort" data-k="status" onclick="sortInvoices('status')">Status</th>
+        <th class="sb-sort" data-k="approved_for_payment" onclick="sortInvoices('approved_for_payment')">Approved for Payment</th>
+        <th></th></tr></thead>
+      <tbody id="tbody-invoices"><tr><td colspan="8" class="empty-state">Loading&hellip;</td></tr></tbody></table>
     </div>
   </div>
 
@@ -61,18 +72,79 @@ qsa('#sb-tabs button').forEach(b => b.addEventListener('click', () => {
   if (b.dataset.t === 'periods') loadPeriods(); else loadInvoices();
 }));
 
+let allBills = [];
+const sortState = { key: 'submitted_at', dir: -1 };
+// Same card markup/stylesheet as the main Dashboard's KPI tiles (exec-dashboard.css).
+const SB_ICONS = {
+  paid: '<svg viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>',
+  outstanding: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
+  approved: '<svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18M7 15h4"/></svg>',
+  invoices: '<svg viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M8 13h8M8 17h8"/></svg>',
+};
+function kpiCard(label, num, accent, icon) {
+  return `<div class="exec-kpi-card" style="--kpi-accent:${accent}">
+    <div class="exec-kpi-icon">${icon}</div>
+    <div class="exec-kpi-num">${esc(num)}</div>
+    <div class="exec-kpi-label">${esc(label)}</div>
+  </div>`;
+}
+async function loadSummary() {
+  try {
+    const { summary: s } = await api('/store-billing/invoices/summary');
+    const n = (c, w) => `${c} ${w}${c === 1 ? '' : 's'}`;
+    qs('#sb-summary').innerHTML = [
+      kpiCard(`Total Paid · ${n(s.paid_count, 'invoice')}`, fmtMoney(s.paid_amount), '#2e7d32', SB_ICONS.paid),
+      kpiCard(`Total Outstanding · ${n(s.outstanding_count, 'pending invoice')}`, fmtMoney(s.outstanding_amount), '#c77d10', SB_ICONS.outstanding),
+      kpiCard(`Approved, Awaiting Payment · ${s.approved_count} of ${s.outstanding_count}`, fmtMoney(s.approved_amount), '#1565c0', SB_ICONS.approved),
+      kpiCard('Invoices Pending Review', String(s.outstanding_count - s.approved_count), '#6a1b9a', SB_ICONS.invoices),
+    ].join('');
+  } catch (err) { toast(err.message, true); }
+}
 async function loadInvoices() {
   try {
     const status = qs('#sb-status-filter').value;
-    const { bills } = await api(`/store-billing/invoices${status ? `?status=${status}` : ''}`);
-    qs('#tbody-invoices').innerHTML = bills.length ? bills.map(b => `<tr>
-        <td>${esc(b.store_name)}</td><td>${esc(b.period_label || '')}</td><td>${fmtMoney(b.amount)}</td><td>${fmtDateTime(b.submitted_at)}</td>
-        <td>${b.file_name ? `<a href="#" onclick="downloadStoreInvoiceFile('${b.id}');return false;">${esc(b.file_name)}</a>` : '<span class="small-muted">&mdash;</span>'}</td>
-        <td>${badge(b.status, b.status === 'completed' ? 'active' : b.status)}</td>
-        <td><button class="btn btn-outline btn-sm" onclick="openStoreInvoiceModal('${b.id}', loadInvoices)">View</button></td>
-      </tr>`).join('') : '<tr><td colspan="7" class="empty-state">No invoices here.</td></tr>';
+    ({ bills: allBills } = await api(`/store-billing/invoices${status ? `?status=${status}` : ''}`));
+    renderInvoices();
+    loadSummary();
   } catch (err) { toast(err.message, true); }
 }
+window.sortInvoices = (key) => {
+  if (sortState.key === key) sortState.dir = -sortState.dir; else { sortState.key = key; sortState.dir = key === 'amount' || key === 'submitted_at' || key === 'approved_for_payment' ? -1 : 1; }
+  renderInvoices();
+};
+function approvalCell(b) {
+  const editable = canEdit && b.status === 'pending';
+  const amount = b.approved_amount != null ? b.approved_amount : b.amount;
+  const who = b.approved_at ? `<div class="small-muted" style="margin-top:3px">${b.approved_for_payment ? 'Approved' : 'Unapproved'} by ${esc(b.approved_by_name || 'unknown')} &middot; ${fmtDateTime(b.approved_at)}</div>` : '';
+  return `<div style="display:flex;align-items:center;gap:8px;white-space:nowrap">
+      <input type="checkbox" title="Approved for payment" ${b.approved_for_payment ? 'checked' : ''} ${editable ? '' : 'disabled'} onchange="setApproved('${b.id}', this.checked)">
+      <span class="small-muted">$</span><input type="number" step="0.01" min="0" value="${Number(amount).toFixed(2)}" ${editable ? '' : 'disabled'} style="width:110px;padding:4px 6px" title="Amount approved for payment" onchange="setApprovedAmount('${b.id}', this.value)">
+    </div>${who}`;
+}
+function renderInvoices() {
+  const q = (qs('#sb-search')?.value || '').trim().toLowerCase();
+  qsa('.sb-sort').forEach(th => { th.textContent = th.textContent.replace(/ [▲▼]$/, ''); if (th.dataset.k === sortState.key) th.textContent += sortState.dir > 0 ? ' ▲' : ' ▼'; });
+  const rows = allBills
+    .filter(b => !q || [b.store_name, b.period_label, b.period, String(b.amount), fmtMoney(b.amount), b.status, b.approved_by_name, b.file_name].some(v => String(v || '').toLowerCase().includes(q)))
+    .sort((a, b) => { const k = sortState.key; let x = a[k], y = b[k]; if (k === 'amount' || k === 'approved_for_payment') { x = +x || 0; y = +y || 0; } else { x = String(x || '').toLowerCase(); y = String(y || '').toLowerCase(); } return (x < y ? -1 : x > y ? 1 : 0) * sortState.dir; });
+  qs('#tbody-invoices').innerHTML = rows.length ? rows.map(b => `<tr>
+      <td><a href="/admin/stores?id=${b.store_id}" title="Open store profile">${esc(b.store_name)}</a></td><td>${esc(b.period_label || '')}</td><td>${fmtMoney(b.amount)}</td><td>${fmtDateTime(b.submitted_at)}</td>
+      <td>${b.file_name ? `<a href="#" onclick="downloadStoreInvoiceFile('${b.id}');return false;">${esc(b.file_name)}</a>` : '<span class="small-muted">&mdash;</span>'}</td>
+      <td>${badge(b.status, b.status === 'completed' ? 'active' : b.status)}</td>
+      <td>${approvalCell(b)}</td>
+      <td><button class="btn btn-outline btn-sm" onclick="openStoreInvoiceModal('${b.id}', loadInvoices)">View</button></td>
+    </tr>`).join('') : `<tr><td colspan="8" class="empty-state">${allBills.length ? 'No invoices match your search.' : 'No invoices here.'}</td></tr>`;
+}
+async function saveApproval(id, body) {
+  try {
+    const { bill } = await api(`/store-billing/invoices/${id}/approve-for-payment`, { method: 'POST', body });
+    const i = allBills.findIndex(b => b.id === id); if (i >= 0) allBills[i] = { ...allBills[i], ...bill };
+    renderInvoices(); loadSummary();
+    toast(bill.approved_for_payment ? `Approved for payment: ${fmtMoney(bill.approved_amount)}` : 'Approval removed');
+  } catch (err) { toast(err.message, true); renderInvoices(); }
+}
+window.setApproved = (id, checked) => saveApproval(id, { approved: checked });
+window.setApprovedAmount = (id, value) => saveApproval(id, { amount: value });
 
 // ===================== Billing Periods =====================
 

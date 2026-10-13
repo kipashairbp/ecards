@@ -1408,5 +1408,15 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_emails_sent_message_id ON emails_sent(me
   if (fixed || skipped) console.log(`[db] portal login emails re-synced to the shul/store record: ${fixed} updated, ${skipped} skipped`);
 }
 
+// Store Billing "Approved for payment": a reviewer's sign-off on a pending
+// invoice, with the amount they approved (defaults to the invoice amount,
+// editable — e.g. partial approval), recorded against who did it and when.
+// Separate from the later "Mark Payment Sent" step (payment_* columns),
+// which is the money actually going out and prefills from approved_amount.
+safeAlter(`ALTER TABLE store_bill_submissions ADD COLUMN approved_for_payment INTEGER DEFAULT 0`);
+safeAlter(`ALTER TABLE store_bill_submissions ADD COLUMN approved_amount REAL`);
+safeAlter(`ALTER TABLE store_bill_submissions ADD COLUMN approved_by TEXT REFERENCES users(id)`);
+safeAlter(`ALTER TABLE store_bill_submissions ADD COLUMN approved_at TEXT`);
+
 export const DEFAULT_ORG_ID = defaultOrgId;
 export function uuid() { return randomUUID(); }
