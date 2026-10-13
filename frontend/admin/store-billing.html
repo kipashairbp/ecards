@@ -114,7 +114,7 @@ window.sortInvoices = (key) => {
 };
 function approvalCell(b) {
   const editable = canEdit && b.status === 'pending';
-  const amount = b.approved_amount != null ? b.approved_amount : b.amount;
+  const amount = b.approved_amount != null ? b.approved_amount : (b.payable_amount ?? b.amount);
   const who = b.approved_at ? `<div class="small-muted" style="margin-top:3px">${b.approved_for_payment ? 'Approved' : 'Unapproved'} by ${esc(b.approved_by_name || 'unknown')} &middot; ${fmtDateTime(b.approved_at)}</div>` : '';
   return `<div style="display:flex;align-items:center;gap:8px;white-space:nowrap">
       <input type="checkbox" title="Approved for payment" ${b.approved_for_payment ? 'checked' : ''} ${editable ? '' : 'disabled'} onchange="setApproved('${b.id}', this.checked)">
@@ -128,7 +128,8 @@ function renderInvoices() {
     .filter(b => !q || [b.store_name, b.period_label, b.period, String(b.amount), fmtMoney(b.amount), b.status, b.approved_by_name, b.file_name].some(v => String(v || '').toLowerCase().includes(q)))
     .sort((a, b) => { const k = sortState.key; let x = a[k], y = b[k]; if (k === 'amount' || k === 'approved_for_payment') { x = +x || 0; y = +y || 0; } else { x = String(x || '').toLowerCase(); y = String(y || '').toLowerCase(); } return (x < y ? -1 : x > y ? 1 : 0) * sortState.dir; });
   qs('#tbody-invoices').innerHTML = rows.length ? rows.map(b => `<tr>
-      <td><a href="/admin/stores?id=${b.store_id}" title="Open store profile">${esc(b.store_name)}</a></td><td>${esc(b.period_label || '')}</td><td>${fmtMoney(b.amount)}</td><td>${fmtDateTime(b.submitted_at)}</td>
+      <td><a href="/admin/stores?id=${b.store_id}" title="Open store profile">${esc(b.store_name)}</a></td><td>${esc(b.period_label || '')}</td>
+      <td>${fmtMoney(b.amount)}${b.fee_percent ? `<div class="small-muted" style="white-space:nowrap">${b.fee_waived ? 'Fee overridden' : `To pay ${fmtMoney(b.payable_amount)} <span title="${b.fee_percent}% processing fee">(&minus;${fmtMoney(b.fee_amount)})</span>`}</div>` : ''}</td><td>${fmtDateTime(b.submitted_at)}</td>
       <td>${b.file_name ? `<a href="#" onclick="downloadStoreInvoiceFile('${b.id}');return false;">${esc(b.file_name)}</a>` : '<span class="small-muted">&mdash;</span>'}</td>
       <td>${badge(b.status, b.status === 'completed' ? 'active' : b.status)}</td>
       <td>${approvalCell(b)}</td>

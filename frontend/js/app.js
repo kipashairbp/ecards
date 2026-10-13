@@ -1147,6 +1147,34 @@ async function loadHistoryTab(entityType, entityId, containerId) {
 // list it's showing — stashed on window rather than threaded through every
 // inline onclick string, since the sub-action functions below are called
 // from markup built fresh each time this opens.
+// Invoice popup's "what do we actually pay" box: invoice amount minus the
+// org-wide processing fee (Settings > Store Billing), with a per-invoice
+// switch to not deduct it. The server computes fee_amount/payable_amount
+// (routes/storeBilling.js's withPayable) so this only lays them out.
+function renderInvoiceCalculator(bill, editable) {
+  const pct = Number(bill.fee_percent) || 0;
+  const waived = !!bill.fee_waived;
+  const row = (label, value, opts = {}) => `<div style="display:flex;justify-content:space-between;align-items:baseline;gap:16px;padding:7px 0;${opts.style || ''}"><span>${label}</span><span style="font-variant-numeric:tabular-nums;${opts.valueStyle || ''}">${value}</span></div>`;
+  let inner;
+  if (!pct) inner = row('Invoice amount', `<strong style="font-size:18px">${fmtMoney(bill.amount)}</strong>`);
+  else inner = `
+    ${row('Invoice amount', fmtMoney(bill.amount))}
+    ${row(`Processing fee <span class="small-muted">(${pct}%)</span>`, waived ? `<span class="small-muted">not deducted</span>` : `&minus;${fmtMoney(bill.fee_amount)}`, { style: 'border-top:1px dashed var(--border)' })}
+    ${row('<strong>Total to pay</strong>', waived ? `<strong style="color:var(--brand-gold-dark)">Fee overridden</strong>` : `<strong style="font-size:20px">${fmtMoney(bill.payable_amount)}</strong>`, { style: 'border-top:2px solid var(--brand-gold-dark);margin-top:2px;padding-top:9px' })}
+    ${waived ? `<div class="small-muted" style="margin-top:2px">Full invoice amount of ${fmtMoney(bill.amount)} is payable${bill.fee_waived_by_name ? ` &middot; fee overridden by ${esc(bill.fee_waived_by_name)}${bill.fee_waived_at ? ' on ' + fmtDateTime(bill.fee_waived_at) : ''}` : ''}.</div>` : ''}`;
+  const toggle = pct ? `<label class="checkbox-row" style="margin-top:10px;font-size:13px"><input type="checkbox" id="inv-fee-waive" ${waived ? 'checked' : ''} ${editable ? '' : 'disabled'} onchange="toggleInvoiceFeeWaiver('${bill.id}', this.checked)"><span>Don't deduct the processing fee for this invoice</span></label>` : '';
+  const approved = bill.approved_for_payment ? `<div class="small-muted" style="margin-top:8px">&#10003; Approved for payment: <strong>${fmtMoney(bill.approved_amount ?? bill.payable_amount)}</strong>${bill.approved_by_name ? ` by ${esc(bill.approved_by_name)}` : ''}${bill.approved_at ? ` &middot; ${fmtDateTime(bill.approved_at)}` : ''}</div>` : '';
+  return `<div id="inv-calc" style="margin-top:12px;background:var(--brand-panel-2);border:1px solid var(--border);border-radius:10px;padding:12px 16px">${inner}${toggle}${approved}</div>`;
+}
+window.toggleInvoiceFeeWaiver = async (id, waived) => {
+  try {
+    await api(`/store-billing/invoices/${id}/fee-waiver`, { method: 'POST', body: { waived } });
+    toast(waived ? 'Fee overridden for this invoice' : 'Processing fee will be deducted');
+    openStoreInvoiceModal(id, window.__storeInvoiceOnDone);
+    window.__storeInvoiceOnDone?.();
+  } catch (err) { toast(err.message, true); const cb = document.getElementById('inv-fee-waive'); if (cb) cb.checked = !waived; }
+};
+
 window.openStoreInvoiceModal = async (id, onDone) => {
   window.__storeInvoiceOnDone = onDone;
   try {
@@ -1168,10 +1196,10 @@ window.openStoreInvoiceModal = async (id, onDone) => {
       </div>
       <div class="grid-2" style="margin-top:10px">
         <div><strong>Period</strong><br>${esc(bill.period || 'N/A')}</div>
-        <div><strong>Amount</strong><br>${fmtMoney(bill.amount)}</div>
+        <div><strong>Submitted</strong><br>${fmtDateTime(bill.submitted_at)}</div>
       </div>
-      <p style="margin-top:10px"><strong>Submitted</strong><br>${fmtDateTime(bill.submitted_at)}</p>
-      ${bill.description ? `<p><strong>Description</strong><br>${esc(bill.description)}</p>` : ''}
+      ${renderInvoiceCalculator(bill, canEdit && bill.status === 'pending')}
+      ${bill.description ? `<p style="margin-top:10px"><strong>Description</strong><br>${esc(bill.description)}</p>` : ''}
       <p>${bill.file_name ? `<a href="#" onclick="downloadStoreInvoiceFile('${bill.id}');return false;">&#128206; ${esc(bill.file_name)}</a>` : '<span class="small-muted">No attachment</span>'}</p>
       <div class="divider"></div>
       ${payBlock}
@@ -1183,7 +1211,7 @@ window.openStoreInvoiceModal = async (id, onDone) => {
     `;
     const footer = `
       ${canEdit && bill.status === 'pending' ? `<button class="btn btn-outline btn-sm" style="color:#b71c1c;border-color:#b71c1c" onclick="rejectStoreInvoice('${bill.id}')">Reject</button>
-      <button class="btn btn-primary btn-sm" onclick="openStoreCompletePayment('${bill.id}', ${bill.approved_for_payment && bill.approved_amount != null ? bill.approved_amount : bill.amount}, '${(bill.period || '').replace(/'/g, "\\'")}')">Mark Payment Sent</button>` : ''}
+      <button class="btn btn-primary btn-sm" onclick="openStoreCompletePayment('${bill.id}', ${bill.approved_for_payment && bill.approved_amount != null ? bill.approved_amount : (bill.payable_amount ?? bill.amount)}, '${(bill.period || '').replace(/'/g, "\\'")}')">Mark Payment Sent</button>` : ''}
       ${canEdit ? `<button class="btn btn-outline btn-sm" onclick="editStoreInvoiceNote('${bill.id}', '${(bill.admin_notes || '').replace(/'/g, "\\'").replace(/\n/g, '\\n')}')">${bill.admin_notes ? 'Edit' : 'Add'} Internal Note</button>` : ''}
       ${isTopAdmin ? `<button class="btn btn-outline btn-sm" style="color:#b71c1c;border-color:#b71c1c" onclick="deleteStoreInvoice('${bill.id}')">Delete</button>` : ''}
     `;

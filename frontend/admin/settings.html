@@ -121,6 +121,9 @@ renderShell('/admin/settings', `
       </div>
       <label>Route Invoice Notifications To <span class="small-muted">(comma-separated, blank to disable)</span></label>
       <input id="sb-notify-email" placeholder="billing@example.com">
+      <label style="margin-top:10px">Processing Fee to Deduct <span class="small-muted">(% of each invoice — e.g. 1 means a $100 invoice pays out $99; 0 or blank for none)</span></label>
+      <div style="display:flex;align-items:center;gap:8px"><input id="sb-fee-percent" type="number" min="0" max="100" step="0.01" placeholder="0" style="width:140px"><span>%</span></div>
+      <p class="small-muted" style="margin-top:2px">Shown as a calculator on every invoice (Store Billing &gt; View). An admin can switch the deduction off for an individual invoice from that popup.</p>
       <button class="btn btn-sm btn-primary" style="margin-top:14px" onclick="saveStoreBillingSettings()">Save</button>
       <div class="divider" style="margin:18px 0"></div>
       <h3 style="font-size:15px">Bank List</h3>
@@ -433,6 +436,7 @@ async function loadStoreBillingSettings() {
   qs('#sb-legal-name').value = settings.store_billing_legal_name || '';
   qs('#sb-tax-id').value = settings.store_billing_tax_id || '';
   qs('#sb-notify-email').value = settings.store_billing_notify_email || '';
+  qs('#sb-fee-percent').value = settings.store_billing_fee_percent || '';
   await loadBankList(!!settings.store_billing_banks);
 }
 async function loadBankList(customized) {
@@ -456,6 +460,7 @@ window.saveStoreBillingSettings = async () => {
       store_billing_legal_name: qs('#sb-legal-name').value.trim(),
       store_billing_tax_id: qs('#sb-tax-id').value.trim(),
       store_billing_notify_email: qs('#sb-notify-email').value.trim(),
+      store_billing_fee_percent: String(Math.max(0, Math.min(100, parseFloat(qs('#sb-fee-percent').value) || 0)) || ''),
     } });
     toast('Saved');
   } catch (err) { toast(err.message, true); }

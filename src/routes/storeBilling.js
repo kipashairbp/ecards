@@ -48,6 +48,21 @@ router.get('/banks', (req, res) => res.json({ banks: getBanks(req.user.org_id) }
 // account at the time), the login row goes stale while the store record is
 // what the admin actually sees and maintains. Falls back to the login email
 // only when the store has no contact email on file at all.
+// Org-wide processing fee (Settings > Store Billing, store_billing_fee_percent)
+// deducted from an invoice to get the amount actually paid out, unless the
+// invoice has its fee waived. Every bill handed to the admin UI carries
+// fee_percent / fee_amount / payable_amount so the list, the popup's
+// calculator, the approval default and the totals all agree.
+const money = v => Math.round((Number(v) || 0) * 100) / 100;
+function feePercent(orgId) {
+  const v = parseFloat(db.prepare(`SELECT value FROM settings WHERE org_id = ? AND key = 'store_billing_fee_percent'`).get(orgId)?.value);
+  return Number.isFinite(v) && v > 0 ? Math.min(v, 100) : 0;
+}
+function withPayable(bill, pct) {
+  const fee = bill.fee_waived ? 0 : money(bill.amount * pct / 100);
+  return { ...bill, fee_percent: pct, fee_amount: fee, payable_amount: money(bill.amount - fee) };
+}
+
 function storeContactEmail(storeId) {
   const row = db.prepare('SELECT s.owner_email, s.manager_email, u.email AS login_email FROM stores s LEFT JOIN users u ON u.id = s.portal_user_id WHERE s.id = ?').get(storeId);
   if (!row) return null;
@@ -322,7 +337,29 @@ router.get('/invoices', requirePermission('store_billing'), (req, res) => {
     FROM store_bill_submissions b JOIN stores s ON s.id = b.store_id LEFT JOIN billing_periods bp ON bp.id = b.billing_period_id
     LEFT JOIN users u ON u.id = b.approved_by
     WHERE ${where} ORDER BY b.submitted_at DESC`).all(...params);
-  res.json({ bills: bills.map(b => ({ ...b, period_label: b.period_start ? periodLabel(b.period_start, b.period_end) : (b.period || '') })) });
+  const pct = feePercent(req.user.org_id);
+  res.json({ bills: bills.map(b => withPayable({ ...b, period_label: b.period_start ? periodLabel(b.period_start, b.period_end) : (b.period || '') }, pct)) });
+});
+
+// Per-invoice "don't deduct the processing fee" switch. If the invoice was
+// already approved for exactly the old payable figure, the approved amount
+// follows the new one — the reviewer approved "what's payable," not a number
+// that happened to include a fee that's now being waived (or vice versa).
+router.post('/invoices/:id/fee-waiver', requirePermission('store_billing', 'can_edit'), (req, res) => {
+  const bill = db.prepare('SELECT * FROM store_bill_submissions WHERE id = ? AND org_id = ?').get(req.params.id, req.user.org_id);
+  if (!bill) return res.status(404).json({ error: 'Not found' });
+  if (bill.status !== 'pending') return res.status(400).json({ error: 'Only a pending invoice can be changed' });
+  const pct = feePercent(req.user.org_id);
+  const waived = !!req.body?.waived;
+  const before = withPayable(bill, pct), after = withPayable({ ...bill, fee_waived: waived ? 1 : 0 }, pct);
+  db.prepare(`UPDATE store_bill_submissions SET fee_waived = ?, fee_waived_by = ?, fee_waived_at = datetime('now') WHERE id = ?`).run(waived ? 1 : 0, req.user.id, bill.id);
+  if (bill.approved_for_payment && bill.approved_amount != null && money(bill.approved_amount) === before.payable_amount) {
+    db.prepare('UPDATE store_bill_submissions SET approved_amount = ? WHERE id = ?').run(after.payable_amount, bill.id);
+  }
+  logAudit(req.user.org_id, req.user.id, waived ? 'waive_invoice_fee' : 'reinstate_invoice_fee', 'store', bill.store_id, { fee_waived: bill.fee_waived, payable: before.payable_amount }, { fee_waived: waived ? 1 : 0, payable: after.payable_amount, invoice_id: bill.id }, req.ip);
+  const row = db.prepare(`SELECT b.*, TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS approved_by_name, TRIM(COALESCE(w.first_name, '') || ' ' || COALESCE(w.last_name, '')) AS fee_waived_by_name
+    FROM store_bill_submissions b LEFT JOIN users u ON u.id = b.approved_by LEFT JOIN users w ON w.id = b.fee_waived_by WHERE b.id = ?`).get(bill.id);
+  res.json({ bill: withPayable(row, pct) });
 });
 
 // Reviewer sign-off: "this invoice is approved for payment, for this
@@ -336,7 +373,7 @@ router.post('/invoices/:id/approve-for-payment', requirePermission('store_billin
   if (bill.status !== 'pending') return res.status(400).json({ error: 'Only a pending invoice can be approved for payment' });
   const b = req.body || {};
   const approved = b.approved === undefined ? !!bill.approved_for_payment : !!b.approved;
-  let amount = b.amount === undefined || b.amount === null || b.amount === '' ? (bill.approved_amount ?? bill.amount) : +b.amount;
+  let amount = b.amount === undefined || b.amount === null || b.amount === '' ? (bill.approved_amount ?? withPayable(bill, feePercent(req.user.org_id)).payable_amount) : +b.amount;
   if (!Number.isFinite(amount) || amount < 0) return res.status(400).json({ error: 'A valid amount is required' });
   amount = Math.round(amount * 100) / 100;
   db.prepare(`UPDATE store_bill_submissions SET approved_for_payment = ?, approved_amount = ?, approved_by = ?, approved_at = datetime('now') WHERE id = ?`)
@@ -353,24 +390,30 @@ router.post('/invoices/:id/approve-for-payment', requirePermission('store_billin
 // off on one (partial approvals count at the approved figure), otherwise at
 // the submitted amount. "Paid" is money actually recorded as sent.
 router.get('/invoices/summary', requirePermission('store_billing'), (req, res) => {
-  const s = db.prepare(`SELECT
-      COALESCE(SUM(CASE WHEN status = 'completed' THEN COALESCE(payment_amount, amount) END), 0) AS paid_amount,
-      SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS paid_count,
-      COALESCE(SUM(CASE WHEN status = 'pending' THEN CASE WHEN approved_for_payment = 1 AND approved_amount IS NOT NULL THEN approved_amount ELSE amount END END), 0) AS outstanding_amount,
-      SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS outstanding_count,
-      COALESCE(SUM(CASE WHEN status = 'pending' AND approved_for_payment = 1 THEN COALESCE(approved_amount, amount) END), 0) AS approved_amount,
-      SUM(CASE WHEN status = 'pending' AND approved_for_payment = 1 THEN 1 ELSE 0 END) AS approved_count,
-      SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected_count
-    FROM store_bill_submissions WHERE org_id = ?`).get(req.user.org_id);
-  const money = v => Math.round((Number(v) || 0) * 100) / 100;
-  res.json({ summary: { ...s, paid_amount: money(s.paid_amount), outstanding_amount: money(s.outstanding_amount), approved_amount: money(s.approved_amount) } });
+  const pct = feePercent(req.user.org_id);
+  const rows = db.prepare(`SELECT status, amount, approved_for_payment, approved_amount, payment_amount, fee_waived FROM store_bill_submissions WHERE org_id = ?`).all(req.user.org_id);
+  const s = { paid_amount: 0, paid_count: 0, outstanding_amount: 0, outstanding_count: 0, approved_amount: 0, approved_count: 0, rejected_count: 0, fee_percent: pct, fees_deducted: 0 };
+  for (const r of rows) {
+    const p = withPayable(r, pct);
+    if (r.status === 'completed') { s.paid_count++; s.paid_amount += Number(r.payment_amount ?? r.amount) || 0; }
+    else if (r.status === 'pending') {
+      const owed = r.approved_for_payment && r.approved_amount != null ? Number(r.approved_amount) : p.payable_amount;
+      s.outstanding_count++; s.outstanding_amount += owed; s.fees_deducted += p.fee_amount;
+      if (r.approved_for_payment) { s.approved_count++; s.approved_amount += owed; }
+    } else if (r.status === 'rejected') s.rejected_count++;
+  }
+  for (const k of ['paid_amount', 'outstanding_amount', 'approved_amount', 'fees_deducted']) s[k] = money(s[k]);
+  res.json({ summary: s });
 });
 
 router.get('/invoices/:id', requirePermission('store_billing'), (req, res) => {
-  const bill = db.prepare(`SELECT b.*, s.name AS store_name FROM store_bill_submissions b JOIN stores s ON s.id = b.store_id WHERE b.id = ? AND b.org_id = ?`).get(req.params.id, req.user.org_id);
+  const bill = db.prepare(`SELECT b.*, s.name AS store_name,
+      TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS approved_by_name, TRIM(COALESCE(w.first_name, '') || ' ' || COALESCE(w.last_name, '')) AS fee_waived_by_name
+    FROM store_bill_submissions b JOIN stores s ON s.id = b.store_id LEFT JOIN users u ON u.id = b.approved_by LEFT JOIN users w ON w.id = b.fee_waived_by
+    WHERE b.id = ? AND b.org_id = ?`).get(req.params.id, req.user.org_id);
   if (!bill) return res.status(404).json({ error: 'Not found' });
   const paymentInfo = db.prepare('SELECT * FROM store_payment_info WHERE store_id = ?').get(bill.store_id);
-  res.json({ bill, paymentInfo: maskPaymentInfo(paymentInfo) });
+  res.json({ bill: withPayable(bill, feePercent(req.user.org_id)), paymentInfo: maskPaymentInfo(paymentInfo) });
 });
 
 // Every store with its banking details in full, as a spreadsheet — the

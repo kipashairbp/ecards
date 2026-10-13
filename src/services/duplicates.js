@@ -22,6 +22,70 @@ const SHUL_MERGE_FIELDS = ['name_en', 'name_he', 'address', 'city', 'state', 'zi
   'ruv_first_name', 'ruv_last_name', 'ruv_phone', 'ruv_address', 'ruv_city', 'ruv_state', 'ruv_zip',
   'gabai_first_name', 'gabai_last_name', 'gabai_cell', 'gabai_email', 'gabai_address', 'gabai_city', 'gabai_state', 'gabai_zip'];
 
+// One disccardpromos account must belong to ONE person. The same person can
+// legitimately appear as several applicant rows — a merge group (the same
+// family submitted by more than one shul), a carry-forward into a new
+// season, or a re-enrolment keeping the same applicant ID — and those rows
+// are meant to share the account. Anyone else holding it is a conflict:
+// disccardpromos matched a new customer onto an existing one (same phone
+// or email on their side) and we were about to link two different people
+// to one balance. Returns the other person's row, or null.
+export function findProviderAccountConflict(orgId, accountId, applicantId) {
+  const clean = String(accountId ?? '').trim().replace(/\.0$/, '');
+  if (!clean) return null;
+  const me = db.prepare('SELECT id, merge_group_id, carried_from_applicant_id, external_id FROM applicants WHERE id = ?').get(applicantId);
+  const myGroup = me?.merge_group_id || applicantId;
+  const rows = db.prepare(`SELECT id, first_name, last_name, shul_id, season_id, merge_group_id, carried_from_applicant_id, external_id
+    FROM applicants WHERE org_id = ? AND id != ? AND provider_account_id IN (?, ?)`).all(orgId, applicantId, clean, clean + '.0');
+  for (const o of rows) {
+    if ((o.merge_group_id || o.id) === myGroup) continue;
+    if (me?.carried_from_applicant_id === o.id || o.carried_from_applicant_id === applicantId) continue;
+    if (me?.carried_from_applicant_id && me.carried_from_applicant_id === o.carried_from_applicant_id) continue;
+    if (me?.external_id && o.external_id && String(me.external_id) === String(o.external_id)) continue;
+    return o;
+  }
+  return null;
+}
+
+// Raises the standard duplicate flag for a conflict found above (same
+// Duplicates panel, same Compare & Resolve / merge flow — merging IS the fix
+// when it really is one person), pauses both, and records it. Idempotent
+// per pair. Returns the flag row.
+export function flagProviderAccountConflict(orgId, applicantId, other, accountId) {
+  const existingOpen = db.prepare(`SELECT * FROM duplicate_flags WHERE org_id = ? AND entity_type = 'applicant' AND status = 'open'
+      AND ((entity_id = ? AND matched_entity_id = ?) OR (entity_id = ? AND matched_entity_id = ?))`).get(orgId, applicantId, other.id, other.id, applicantId);
+  if (existingOpen) return existingOpen;
+  const id = uuid();
+  const clean = String(accountId ?? '').trim().replace(/\.0$/, '');
+  db.prepare(`INSERT INTO duplicate_flags (id, org_id, entity_type, entity_id, matched_entity_id, reason, status) VALUES (?,?,'applicant',?,?,?,'open')`)
+    .run(id, orgId, applicantId, other.id, `Same disccardpromos account (#${clean})`);
+  db.prepare(`UPDATE applicants SET duplicate_status = 'flagged', duplicate_of_applicant_id = ? WHERE id = ?`).run(other.id, applicantId);
+  pauseAccountsFor('applicant', applicantId, other.id);
+  console.warn(`[duplicates] disccardpromos account #${clean} is held by two different applicants (${applicantId}, ${other.id}) — flagged for review`);
+  return db.prepare('SELECT * FROM duplicate_flags WHERE id = ?').get(id);
+}
+
+// Existing data: every account currently held by more than one person gets
+// flagged the same way, so anything that slipped through before the guard
+// existed surfaces in the Duplicates panel. Runs from Recheck All and at boot.
+export function sweepProviderAccountConflicts(orgId) {
+  const shared = db.prepare(`SELECT REPLACE(provider_account_id, '.0', '') AS acct FROM applicants
+    WHERE org_id = ? AND provider_account_id IS NOT NULL AND provider_account_id != ''
+    GROUP BY REPLACE(provider_account_id, '.0', '') HAVING COUNT(*) > 1`).all(orgId);
+  let flagged = 0;
+  for (const { acct } of shared) {
+    const holders = db.prepare(`SELECT id FROM applicants WHERE org_id = ? AND provider_account_id IN (?, ?) ORDER BY created_at`).all(orgId, acct, acct + '.0');
+    for (const h of holders) {
+      const other = findProviderAccountConflict(orgId, acct, h.id);
+      if (!other) continue;
+      const before = db.prepare(`SELECT COUNT(*) c FROM duplicate_flags WHERE status = 'open'`).get().c;
+      flagProviderAccountConflict(orgId, h.id, other, acct);
+      if (db.prepare(`SELECT COUNT(*) c FROM duplicate_flags WHERE status = 'open'`).get().c > before) flagged++;
+    }
+  }
+  return flagged;
+}
+
 // Freezes both the newly-created record's owning account AND the matched record's
 // owning account (per spec: "pause both accounts from doing any action or using
 // the card until the duplicate is fixed or bypassed").
@@ -335,6 +399,7 @@ export function unpauseIfNoLongerFlagged(entityType, ids) {
 // within a season); pass 1 always runs org-wide since a spurious flag from
 // this bug could be sitting in any season.
 export function recheckAllApplicantDuplicates(orgId, seasonId) {
+  sweepProviderAccountConflicts(orgId);
   const spurious = db.prepare(`
     SELECT f.* FROM duplicate_flags f JOIN applicants a ON a.id = f.entity_id
     WHERE f.org_id = ? AND f.entity_type = 'applicant' AND f.status = 'open' AND a.approval_status = 'incomplete'

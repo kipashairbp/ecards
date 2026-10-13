@@ -3,7 +3,7 @@ import multer from 'multer';
 import { db, uuid, DEFAULT_ORG_ID } from '../db.js';
 import { auth, requireAdmin } from '../middleware/auth.js';
 import { requirePermission, redact } from '../middleware/permissions.js';
-import { detectAndFlag, resolveFlag, getMergeGroupIds, mergeApplicants, applicantsSharePhone, reconcileAccountsForGroup, reconcileAllMergedAccounts, recheckAllApplicantDuplicates, collapseAllMergedApplicantGroups, unpauseIfNoLongerFlagged } from '../services/duplicates.js';
+import { detectAndFlag, resolveFlag, getMergeGroupIds, mergeApplicants, applicantsSharePhone, reconcileAccountsForGroup, reconcileAllMergedAccounts, recheckAllApplicantDuplicates, collapseAllMergedApplicantGroups, unpauseIfNoLongerFlagged, findProviderAccountConflict, flagProviderAccountConflict } from '../services/duplicates.js';
 import { sendMailChecked, renderSystemTemplate, escapeHtml } from '../services/mail.js';
 import { sendSmsChecked } from '../services/sms.js';
 import * as giftcard from '../services/giftcard.js';
@@ -221,6 +221,14 @@ async function ensureProviderAccount(orgId, applicant, index) {
     const existingHint = index ? (opts.externalId ? (index.byExt.get(String(opts.externalId)) || null) : null) : undefined;
     const result = await giftcard.upsertAccountForApproval(applicant.season_id, opts, existingHint);
     if (!result.accountId) { scheduleProviderEnforceSoon(orgId, `no account id for applicant ${applicant.id}`); return { error: 'disccardpromos returned no account id' }; }
+    // disccardpromos can hand back an EXISTING customer (matched on their
+    // side by phone/email) — if that account already belongs to a different
+    // person here, never link it: two people would be spending one balance.
+    const conflict = findProviderAccountConflict(orgId, result.accountId, applicant.id);
+    if (conflict) {
+      flagProviderAccountConflict(orgId, applicant.id, conflict, result.accountId);
+      return { error: `disccardpromos account #${result.accountId} already belongs to ${conflict.first_name} ${conflict.last_name} — not linked; both applicants are paused and flagged under Duplicates for review` };
+    }
     db.prepare('UPDATE applicants SET provider_account_id = ? WHERE id = ?').run(result.accountId, applicant.id);
     // Every other member of the group without an account links to this one
     // (a member that already holds a DIFFERENT real account is left alone —
@@ -877,7 +885,12 @@ async function runProviderAudit(orgId, seasonId, job) {
       details.error.push({ applicantIds: [r.id], accountId: null, names: describe(r), message: listError });
     } else {
       const found = r.external_id ? byExt.get(String(r.external_id)) : null;
-      if (found?.id) {
+      const foundConflict = found?.id ? findProviderAccountConflict(orgId, cleanProviderId(found.id), r.id) : null;
+      if (foundConflict) {
+        flagProviderAccountConflict(orgId, r.id, foundConflict, cleanProviderId(found.id));
+        counts.error++; setCheck.run('error', now, r.id);
+        details.error.push({ applicantIds: [r.id, foundConflict.id], accountId: cleanProviderId(found.id), names: describe(r), message: `disccardpromos account already belongs to ${foundConflict.first_name} ${foundConflict.last_name} — not linked, flagged as a duplicate` });
+      } else if (found?.id) {
         const id = cleanProviderId(found.id);
         db.prepare('UPDATE applicants SET provider_account_id = ? WHERE id = ?').run(id, r.id);
         reconcileAccountsForGroup(r.id);
@@ -904,7 +917,11 @@ async function runProviderAudit(orgId, seasonId, job) {
       const ext = c.external_id != null && c.external_id !== '' ? String(c.external_id) : null;
       const match = ext ? rows.find(r => r.external_id && String(r.external_id) === ext) : null;
       const current = match ? db.prepare('SELECT provider_account_id FROM applicants WHERE id = ?').get(match.id) : null;
-      if (match && !current?.provider_account_id && !isMergedSecondary(match)) {
+      const matchConflict = match && !current?.provider_account_id ? findProviderAccountConflict(orgId, id, match.id) : null;
+      if (matchConflict) {
+        flagProviderAccountConflict(orgId, match.id, matchConflict, id);
+        counts.error++; details.error.push({ applicantIds: [match.id, matchConflict.id], accountId: id, names: describe(match), message: `disccardpromos account already belongs to ${matchConflict.first_name} ${matchConflict.last_name} — not linked, flagged as a duplicate` });
+      } else if (match && !current?.provider_account_id && !isMergedSecondary(match)) {
         db.prepare('UPDATE applicants SET provider_account_id = ? WHERE id = ?').run(id, match.id);
         reconcileAccountsForGroup(match.id);
         setCheck.run('relinked', now, match.id);
@@ -1028,7 +1045,12 @@ async function runProviderEnforce(orgId, seasonId, job) {
     if (!cust) for (const m of members) { if (m.provider_account_id && byId.has(cleanProviderId(m.provider_account_id))) { cust = byId.get(cleanProviderId(m.provider_account_id)); break; } }
     if (!cust) for (const ext of [a.external_id, ...members.map(m => m.external_id)].filter(Boolean)) { if (byExt.has(String(ext))) { cust = byExt.get(String(ext)); break; } }
     try {
-      if (cust) {
+      const custConflict = cust && cleanProviderId(a.provider_account_id || '') !== cust._id ? findProviderAccountConflict(orgId, cust._id, a.id) : null;
+      if (custConflict) {
+        flagProviderAccountConflict(orgId, a.id, custConflict, cust._id);
+        unfixable.push({ id: a.id, name: describe(a), reason: `disccardpromos account #${cust._id} already belongs to ${custConflict.first_name} ${custConflict.last_name} — flagged as a duplicate, not linked` });
+        setCheck.run('error', now, a.id);
+      } else if (cust) {
         if (cleanProviderId(a.provider_account_id || '') !== cust._id) {
           db.prepare('UPDATE applicants SET provider_account_id = ? WHERE id = ?').run(cust._id, a.id);
           db.prepare(`UPDATE applicants SET provider_account_id = ? WHERE merge_group_id = ? AND id != ? AND provider_account_id IS NULL`).run(cust._id, a.merge_group_id || a.id, a.id);

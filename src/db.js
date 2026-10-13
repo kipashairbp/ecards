@@ -1417,6 +1417,12 @@ safeAlter(`ALTER TABLE store_bill_submissions ADD COLUMN approved_for_payment IN
 safeAlter(`ALTER TABLE store_bill_submissions ADD COLUMN approved_amount REAL`);
 safeAlter(`ALTER TABLE store_bill_submissions ADD COLUMN approved_by TEXT REFERENCES users(id)`);
 safeAlter(`ALTER TABLE store_bill_submissions ADD COLUMN approved_at TEXT`);
+// Processing-fee waiver: Settings > Store Billing sets an org-wide % that is
+// deducted from every invoice to get the amount actually paid; an admin can
+// switch that off per invoice (signed, like the approval above).
+safeAlter(`ALTER TABLE store_bill_submissions ADD COLUMN fee_waived INTEGER DEFAULT 0`);
+safeAlter(`ALTER TABLE store_bill_submissions ADD COLUMN fee_waived_by TEXT REFERENCES users(id)`);
+safeAlter(`ALTER TABLE store_bill_submissions ADD COLUMN fee_waived_at TEXT`);
 
 export const DEFAULT_ORG_ID = defaultOrgId;
 export function uuid() { return randomUUID(); }
