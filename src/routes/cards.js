@@ -96,12 +96,17 @@ router.get('/by-shul', (req, res) => {
 // than requiring 'stores' too. txn_count included so a $0/no-history row is
 // obviously "nothing synced here yet" rather than "linked but broken."
 router.get('/by-store', (req, res) => {
+  // Attributed (card) and unattributed (unlinked-customer / unmatched-card)
+  // spend at the store are both real money the store honored — one ledger.
   const rows = db.prepare(`SELECT s.id AS store_id, s.name AS store_name, COUNT(t.id) txn_count,
       COALESCE(SUM(CASE WHEN t.type='refund' THEN -t.amount WHEN t.amount < 0 THEN -t.amount ELSE 0 END),0) total_purchases,
       COALESCE(SUM(CASE WHEN t.type='refund' THEN t.amount ELSE 0 END),0) total_refunds
-    FROM stores s LEFT JOIN card_transactions t ON t.store_id = s.id
+    FROM stores s LEFT JOIN (
+      SELECT id, store_id, type, amount FROM card_transactions
+      UNION ALL SELECT id, store_id, type, amount FROM unattributed_transactions WHERE org_id = ?
+    ) t ON t.store_id = s.id
     WHERE s.org_id = ?
-    GROUP BY s.id ORDER BY total_purchases DESC`).all(req.user.org_id);
+    GROUP BY s.id ORDER BY total_purchases DESC`).all(req.user.org_id, req.user.org_id);
   res.json({ stores: rows });
 });
 
@@ -328,14 +333,23 @@ router.get('/transactions/reconcile', requirePermission('cards', 'can_view'), (r
   // card to hang a season off of), and always worth showing regardless of
   // which season is selected — this is the single most likely explanation
   // for "our total is lower than disccardpromos' own number."
-  const unattributedRows = db.prepare(`SELECT u.amount, u.occurred_at, u.store_name, u.provider_txn_id, a.first_name, a.last_name
+  const unattributedRows = db.prepare(`SELECT u.amount, u.type, u.occurred_at, u.store_name, u.provider_txn_id, u.customer_id, u.customer_name, a.id AS linked_applicant_id,
+      COALESCE(a.first_name, u.customer_name, '') AS first_name, COALESCE(a.last_name, CASE WHEN a.id IS NULL AND u.customer_id IS NOT NULL THEN '(disccardpromos customer #' || u.customer_id || ', not linked here)' ELSE '' END) AS last_name
     FROM unattributed_transactions u LEFT JOIN applicants a ON a.id = u.applicant_id WHERE u.org_id = ?`).all(orgId);
   const unattributed = bucket();
-  for (const r of unattributedRows) if (r.amount < 0) add(unattributed, r);
+  let unattributedNetTotal = 0;
+  for (const r of unattributedRows) {
+    if (r.amount < 0) add(unattributed, r);
+    unattributedNetTotal = money(unattributedNetTotal + (r.type === 'refund' ? -Number(r.amount) : (r.amount < 0 ? -Number(r.amount) : 0)));
+  }
+  // distinct disccardpromos customers whose spend is here but who aren't linked to any applicant
+  const unlinkedCustomers = [...new Set(unattributedRows.filter(r => r.customer_id && !r.linked_applicant_id).map(r => r.customer_id))].length;
   res.json({
     season: season ? { id: season.id, name: season.name, start_date: season.start_date, end_date: season.end_date } : null,
     rowsConsidered: rows.length,
-    purchases, refunds, refundReasons: [...refundReasons.values()].sort((a, b) => b.amount - a.amount), netAfterRefunds: money(purchases.amount - refunds.amount), totalSpent: money(purchases.amount - refunds.amount),
+    purchases, refunds, refundReasons: [...refundReasons.values()].sort((a, b) => b.amount - a.amount), netAfterRefunds: money(purchases.amount - refunds.amount),
+    // Total spent = what the dashboard shows: card-attributed net PLUS unattributed net (same as disccardpromos counts it)
+    unattributedNet: unattributedNetTotal, unlinkedCustomers, totalSpent: money(purchases.amount - refunds.amount + unattributedNetTotal),
     outOfSeasonWindow: outOfWindow, disccardPaidMissing: paidMissing, cartAmountDiffersFromPaid: cartDiffers,
     onDeletedApplicant: deletedApplicant, onDeactivatedCard: deactivatedCard, likelyDuplicates: duplicates,
     unattributed,

@@ -3,6 +3,7 @@ import { db } from '../db.js';
 import { auth } from '../middleware/auth.js';
 import { getPermission, requirePermission } from '../middleware/permissions.js';
 import { getActiveSeasonId } from '../utils/formSchedule.js';
+import { unattributedNet, unattributedByStore } from '../services/spendTotals.js';
 
 const router = Router();
 // Internal team only — every count below is computed org-wide (total shuls,
@@ -150,8 +151,16 @@ router.get('/stats', (req, res) => {
     // breakdown inherently can't include spend with no store to attribute
     // it to — but the headline total no longer requires that match.
     const storeCardSeasonClause = seasonId ? ' AND c2.season_id = ?' : '';
-    stats.totalStoreSpend = db.prepare(`SELECT COALESCE(SUM(CASE WHEN t.type = 'refund' THEN -t.amount WHEN t.amount < 0 THEN -t.amount ELSE 0 END),0) total
+    const attributedSpend = db.prepare(`SELECT COALESCE(SUM(CASE WHEN t.type = 'refund' THEN -t.amount WHEN t.amount < 0 THEN -t.amount ELSE 0 END),0) total
       FROM card_transactions t JOIN cards c2 ON c2.id = t.card_id WHERE c2.org_id = ?${storeCardSeasonClause}`).get(orgId, ...seasonParams).total;
+    // Plus spend with no card row here (unlinked disccardpromos customers,
+    // unmatched multi-card charges) — see services/spendTotals.js. Without
+    // it this total is lower than disccardpromos' own by exactly that much.
+    const unattributed = unattributedNet(orgId, { seasonId });
+    stats.totalStoreSpend = Math.round((attributedSpend + unattributed.net) * 100) / 100;
+    stats.unattributedSpend = unattributed.net;
+    const extra = unattributedByStore(orgId, seasonId);
+    if (Object.keys(extra).length) stats.topStores = stats.topStores.map(s => ({ ...s, total_purchases: Math.round((s.total_purchases + (extra[s.id] || 0)) * 100) / 100 })).sort((a, b) => b.total_purchases - a.total_purchases);
   }
   res.json({ stats });
 });

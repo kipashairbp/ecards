@@ -1424,5 +1424,16 @@ safeAlter(`ALTER TABLE store_bill_submissions ADD COLUMN fee_waived INTEGER DEFA
 safeAlter(`ALTER TABLE store_bill_submissions ADD COLUMN fee_waived_by TEXT REFERENCES users(id)`);
 safeAlter(`ALTER TABLE store_bill_submissions ADD COLUMN fee_waived_at TEXT`);
 
+// Unattributed spend now also covers disccardpromos customers that aren't
+// linked to any applicant here at all (cardSync.js's
+// syncUnlinkedCustomers) — their id/name is kept so an admin can see whose
+// money it is and link the account — and carries the resolved store so
+// per-store totals (and store invoices) count it like any other spend.
+safeAlter(`ALTER TABLE unattributed_transactions ADD COLUMN customer_id TEXT`);
+safeAlter(`ALTER TABLE unattributed_transactions ADD COLUMN customer_name TEXT`);
+safeAlter(`ALTER TABLE unattributed_transactions ADD COLUMN store_id TEXT REFERENCES stores(id)`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_unattributed_store ON unattributed_transactions(store_id)`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_unattributed_org_date ON unattributed_transactions(org_id, occurred_at)`);
+
 export const DEFAULT_ORG_ID = defaultOrgId;
 export function uuid() { return randomUUID(); }

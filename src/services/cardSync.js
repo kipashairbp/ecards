@@ -116,8 +116,8 @@ const cleanProviderId = id => String(id).replace(/\.0$/, '');
 // entries (no amount, no date) are simply skipped here — they're already
 // counted as `malformed` by the caller's own catch-all when this throws or
 // returns without inserting.
-function insertUnattributed(orgId, applicantId, t, rawAmount, occurredAt) {
-  if (rawAmount === undefined || occurredAt === undefined) return;
+function insertUnattributed(orgId, applicantId, t, rawAmount, occurredAt, customer = null) {
+  if (rawAmount === undefined || occurredAt === undefined) return 0;
   const storeName = (t.vendor || t.store_name || t.merchant || '').trim();
   const providerTxnId = String(t.id ?? t.transaction_id ?? '');
   const refundWord = /\b(refund|refunded|reversal|reversed|void|voided|chargeback)\b/i;
@@ -125,9 +125,44 @@ function insertUnattributed(orgId, applicantId, t, rawAmount, occurredAt) {
     || t.is_refund === true || t.refund === true
     || [t.type, t.kind, t.transaction_type, t.status, t.description, t.note, t.vendor].some(v => typeof v === 'string' && refundWord.test(v));
   const storedAmount = isRefund ? Math.abs(rawAmount) : -Math.abs(rawAmount);
-  db.prepare(`INSERT OR IGNORE INTO unattributed_transactions (id, org_id, applicant_id, provider_txn_id, type, amount, store_name, occurred_at, raw_payload)
-    VALUES (?,?,?,?,?,?,?,?,?)`)
-    .run(uuid(), orgId, applicantId, providerTxnId || null, isRefund ? 'refund' : 'purchase', storedAmount, storeName, occurredAt, JSON.stringify(t));
+  const customerId = customer?.id != null ? cleanProviderId(customer.id) : null;
+  const customerName = customer ? (`${customer.first_name || ''} ${customer.last_name || ''}`.trim() || customer.name || null) : null;
+  const info = db.prepare(`INSERT OR IGNORE INTO unattributed_transactions (id, org_id, applicant_id, provider_txn_id, type, amount, store_name, store_id, occurred_at, raw_payload, customer_id, customer_name)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(uuid(), orgId, applicantId, providerTxnId || null, isRefund ? 'refund' : 'purchase', storedAmount, storeName, resolveStoreId(orgId, storeName), occurredAt, JSON.stringify(t), customerId, customerName);
+  return info.changes;
+}
+
+// Customers that exist on disccardpromos but aren't linked to ANY applicant
+// here (created straight on their dashboard, approved elsewhere, an id we
+// lost, ...) were invisible to the per-applicant sync — their spend is
+// real on disccardpromos' side and counted in its totals, which is exactly
+// what "our total is lower than theirs" came down to (every missing
+// transaction belonged to such a customer; refunds and amounts all matched).
+// Their transactions are recorded as unattributed — customer id/name kept
+// so an admin can find and link the account from Applicants >
+// Disccardpromos Sync — and counted in every spend total
+// (services/spendTotals.js). Costs no extra API calls: the customer list
+// the sweep already pulled carries each customer's transactions.
+export function syncUnlinkedCustomers(orgId, indexes) {
+  const linked = new Set(db.prepare(`SELECT provider_account_id FROM applicants WHERE org_id = ? AND provider_account_id IS NOT NULL AND provider_account_id != ''`).all(orgId).map(r => cleanProviderId(r.provider_account_id)));
+  let customers = 0, inserted = 0;
+  for (const index of indexes) {
+    if (!index?.list) continue;
+    for (const c of index.list) {
+      if (c?.id == null || linked.has(cleanProviderId(c.id))) continue;
+      const txns = Array.isArray(c.transactions) ? c.transactions
+        : Array.isArray(c.packages) ? c.packages.flatMap(p => Array.isArray(p.transactions) ? p.transactions : []) : [];
+      if (!txns.length) continue;
+      customers++;
+      for (const t of txns) {
+        try { inserted += insertUnattributed(orgId, null, t, t.disccardPaid ?? t.cartAmount ?? t.amount, t.timestamp || t.occurred_at || t.date, c); }
+        catch (e) { console.error('[cardSync] failed to record unlinked customer transaction:', e.message); }
+      }
+    }
+  }
+  if (inserted) console.log(`[cardSync] ${inserted} transaction(s) recorded from ${customers} disccardpromos customer(s) not linked to any applicant`);
+  return { unlinkedCustomers: customers, unlinkedTransactions: inserted };
 }
 
 // manual "Sync Now" button), which falls back to a live per-applicant GET.
@@ -243,6 +278,7 @@ export async function syncApplicantCards(orgId, applicant, index) {
   }
   const insert = db.prepare(`INSERT OR IGNORE INTO card_transactions (id, card_id, provider_txn_id, type, amount, balance_after, store_name, store_id, occurred_at, raw_payload)
     VALUES (?,?,?,?,?,?,?,?,?,?)`);
+  const dropUnattributed = db.prepare(`DELETE FROM unattributed_transactions WHERE org_id = ? AND provider_txn_id = ?`);
   let malformed = 0;
   for (const t of txns) {
     // Each entry is handled in its own try/catch — one transaction whose
@@ -333,6 +369,11 @@ export async function syncApplicantCards(orgId, applicant, index) {
       const storedAmount = isRefund ? Math.abs(rawAmount) : -Math.abs(rawAmount);
       const info = insert.run(uuid(), cardId, providerTxnId, type, storedAmount, t.balance_after ?? null, storeName, resolveStoreId(orgId, storeName), occurredAt, JSON.stringify(t));
       if (info.changes) synced++;
+      // Once a transaction is attributed to a card it must not ALSO sit in
+      // unattributed_transactions (recorded earlier while this customer was
+      // not yet linked to any applicant — see syncUnlinkedCustomers), or
+      // every spend total would count it twice. Same provider id, same org.
+      dropUnattributed.run(orgId, providerTxnId);
     } catch (e) {
       malformed++;
       console.error(`[cardSync] failed to insert a transaction for customer ${customer.id ?? applicant.external_id}:`, e.message, '— raw entry:', JSON.stringify(t));
@@ -378,6 +419,12 @@ export async function syncAllCards(orgId) {
       if (fetchFailed) failed++;
     } catch (e) { console.error('[cardSync] sync failed for applicant', applicant.id, e.message); failed++; }
   }
+  // Same customer lists, one more pass: everyone on disccardpromos that no
+  // applicant here points at. (Seasons whose list pull failed contribute
+  // nothing — their index is null.)
+  let unlinked = { unlinkedCustomers: 0, unlinkedTransactions: 0 };
+  try { unlinked = syncUnlinkedCustomers(orgId, await Promise.all([...indexBySeason.values()])); }
+  catch (e) { console.error('[cardSync] unlinked-customer pass failed:', e.message); }
   const cardsChecked = db.prepare(`SELECT COUNT(*) c FROM cards WHERE org_id = ? AND status IN ('assigned','activated')`).get(orgId).c;
   // When the ONE bulk list pull for a season fails, every applicant in it
   // falls back to its own live per-applicant GET — for an org with many real
@@ -388,5 +435,5 @@ export async function syncAllCards(orgId) {
   // is what makes "the total keeps climbing a little on every re-sync
   // instead of catching up in one pass" diagnosable instead of looking like
   // ordinary incremental progress.
-  return { cardsChecked, transactionsSynced: totalSynced, cardsDiscovered, cardsRemoved, unattributed, malformed, failed, indexPullsFailed };
+  return { cardsChecked, transactionsSynced: totalSynced, cardsDiscovered, cardsRemoved, unattributed, malformed, failed, indexPullsFailed, ...unlinked };
 }
