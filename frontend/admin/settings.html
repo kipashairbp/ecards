@@ -511,7 +511,9 @@ window.openEditEmailTemplate = (key) => {
     <p class="small-muted" style="margin-top:10px">Available placeholders: ${t.vars.map(v => `<code>{{${esc(v)}}}</code>`).join(' ')}</p>
   `;
   openModal(t.label, body, `<button class="btn btn-primary btn-sm" onclick="saveEmailTemplate('${key}')">Save</button>`);
-  etBodyEditor = createRichTextEditor('et-body-rte', t.body);
+  // each {{placeholder}} shows as a labelled pill, not raw braces
+  const nice = (v) => { const w = v.replace(/([A-Z])/g, ' $1').toLowerCase(); return w.charAt(0).toUpperCase() + w.slice(1); };
+  etBodyEditor = createRichTextEditor('et-body-rte', t.body, { fields: t.vars.map(v => ({ key: v, label: nice(v) })) });
 };
 window.saveEmailTemplate = async (key) => {
   const body = { subject: qs('#et-subject').value, body: etBodyEditor.getHtml(), reply_to: qs('#et-replyto').value };

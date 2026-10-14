@@ -62,7 +62,7 @@ export function buildTabs(orgId) {
       (SELECT COALESCE(SUM(CASE WHEN t.type = 'refund' THEN -t.amount WHEN t.amount < 0 THEN -t.amount ELSE 0 END), 0) FROM card_transactions t WHERE t.card_id = c.id) AS spent,
       (SELECT COUNT(*) FROM card_transactions t WHERE t.card_id = c.id AND t.amount < 0) AS purchases
     FROM cards c LEFT JOIN applicants a ON a.id = c.applicant_id LEFT JOIN shuls s ON s.id = a.shul_id LEFT JOIN seasons se ON se.id = c.season_id WHERE c.org_id = ? ORDER BY c.created_at DESC`).all(orgId);
-  const invoices = db.prepare(`SELECT b.*, st.name AS store_name, bp.start_date, bp.end_date,
+  const invoices = db.prepare(`SELECT b.*, st.name AS store_name, COALESCE(b.bill_period_start, bp.start_date) AS start_date, COALESCE(b.bill_period_end, bp.end_date) AS end_date,
       TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS approved_by_name
     FROM store_bill_submissions b JOIN stores st ON st.id = b.store_id LEFT JOIN billing_periods bp ON bp.id = b.billing_period_id LEFT JOIN users u ON u.id = b.approved_by
     WHERE b.org_id = ? ORDER BY b.submitted_at DESC`).all(orgId);

@@ -1435,5 +1435,27 @@ safeAlter(`ALTER TABLE unattributed_transactions ADD COLUMN store_id TEXT REFERE
 db.exec(`CREATE INDEX IF NOT EXISTS idx_unattributed_store ON unattributed_transactions(store_id)`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_unattributed_org_date ON unattributed_transactions(org_id, occurred_at)`);
 
+// Store Billing: "Mark Payment Sent" can correct the billing period this one
+// invoice covers (the shared billing_periods row is left alone — other
+// stores were invited to it too). NULL = use the period it was submitted for.
+safeAlter(`ALTER TABLE store_bill_submissions ADD COLUMN bill_period_start TEXT`);
+safeAlter(`ALTER TABLE store_bill_submissions ADD COLUMN bill_period_end TEXT`);
+// Reusable rich-text "payment is on the way" emails, with the invoice
+// breakdown (invoice amount − processing fee = total) as a placeholder.
+// At most one default per org (partial unique index); the Mark Payment Sent
+// popup starts from it.
+db.exec(`CREATE TABLE IF NOT EXISTS payment_email_templates (
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES organizations(id),
+  name TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  body_html TEXT NOT NULL,
+  is_default INTEGER DEFAULT 0,
+  created_by TEXT REFERENCES users(id),
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+)`);
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_email_templates_default ON payment_email_templates(org_id) WHERE is_default = 1`);
+
 export const DEFAULT_ORG_ID = defaultOrgId;
 export function uuid() { return randomUUID(); }

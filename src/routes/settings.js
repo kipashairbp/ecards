@@ -5,6 +5,7 @@ import { requirePermission } from '../middleware/permissions.js';
 import { isMockMode, getCustomerByExternalId } from '../services/giftcard.js';
 import { SYSTEM_EMAIL_TEMPLATES } from '../services/mail.js';
 import { runBackup, listBackups, backupPath } from '../services/backup.js';
+import { sanitizeEmailHtml } from '../utils/sanitizeEmailHtml.js';
 import { BUILTIN_SCHEMAS } from '../utils/builtinSchemas.js';
 
 const router = Router();
@@ -104,7 +105,7 @@ router.put('/email-templates/:key', requirePermission('settings', 'can_edit'), (
   const replyTo = reply_to !== undefined ? (reply_to || null) : (existing?.reply_to || null);
   db.prepare(`INSERT INTO system_email_templates (id, org_id, key, subject, body, reply_to) VALUES (?,?,?,?,?,?)
     ON CONFLICT(org_id, key) DO UPDATE SET subject=excluded.subject, body=excluded.body, reply_to=excluded.reply_to, updated_at=datetime('now')`)
-    .run(uuid(), req.user.org_id, key, subject, body, replyTo);
+    .run(uuid(), req.user.org_id, key, subject, sanitizeEmailHtml(body), replyTo);
   res.json({ ok: true });
 });
 
