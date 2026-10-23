@@ -13,17 +13,37 @@ import { db } from '../db.js';
 // Only when NO explicit link exists for this exact vendor name does this
 // fall back to the old best-effort name matching, so an org that hasn't
 // linked anything yet keeps behaving as before.
+//
+// PERFORMANCE: a sweep resolves this for every charge it sees (tens of
+// thousands), almost always the same few hundred vendor names. The statements
+// are prepared once and each answer is remembered for 30 seconds (and dropped
+// at once by clearStoreMatchCache(), called whenever a link or store changes),
+// instead of three fresh prepare()+query round trips per charge.
+let stmts = null;
+const memo = new Map();
+let memoAt = 0;
+const MEMO_MS = 30 * 1000;
+export function clearStoreMatchCache() { memo.clear(); memoAt = Date.now(); }
 export function resolveStoreId(orgId, storeName) {
   if (!storeName) return null;
+  const now = Date.now();
+  if (now - memoAt > MEMO_MS) { memo.clear(); memoAt = now; }
+  const key = `${orgId}\u0000${storeName}`;
+  if (memo.has(key)) return memo.get(key);
   // Case/whitespace-insensitive: disccardpromos doesn't always report the
   // exact same vendor name string byte-for-byte between syncs (casing,
   // stray leading/trailing spaces), and an exact match here silently left
   // some of a linked store's own transactions unattributed forever — the
   // store looked "not linking" even though a link genuinely existed.
-  const linked = db.prepare('SELECT store_id FROM store_provider_links WHERE org_id = ? AND LOWER(TRIM(vendor_name)) = LOWER(TRIM(?))').get(orgId, storeName);
-  if (linked) return linked.store_id;
-  const exact = db.prepare('SELECT id FROM stores WHERE org_id = ? AND LOWER(name) = LOWER(?)').get(orgId, storeName);
-  if (exact) return exact.id;
-  const partial = db.prepare('SELECT id FROM stores WHERE org_id = ? AND LOWER(name) LIKE LOWER(?)').get(orgId, `%${storeName}%`);
-  return partial?.id || null;
+  stmts ||= {
+    linked: db.prepare('SELECT store_id FROM store_provider_links WHERE org_id = ? AND LOWER(TRIM(vendor_name)) = LOWER(TRIM(?))'),
+    exact: db.prepare('SELECT id FROM stores WHERE org_id = ? AND LOWER(name) = LOWER(?)'),
+    partial: db.prepare('SELECT id FROM stores WHERE org_id = ? AND LOWER(name) LIKE LOWER(?)'),
+  };
+  const found = stmts.linked.get(orgId, storeName)?.store_id
+    || stmts.exact.get(orgId, storeName)?.id
+    || stmts.partial.get(orgId, `%${storeName}%`)?.id
+    || null;
+  memo.set(key, found);
+  return found;
 }

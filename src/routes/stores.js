@@ -15,6 +15,8 @@ import { hardDeleteStore, captureStoreSnapshot } from '../utils/entityDelete.js'
 import { generateGenericDocumentPdf } from '../services/pdf.js';
 import { resolveEntity } from './documents.js';
 import { getActiveSeasonId } from '../utils/formSchedule.js';
+import { clearStoreMatchCache } from '../services/storeMatch.js';
+import { invalidateAggregates } from '../services/aggCache.js';
 import { parseSpreadsheet, buildXlsxTemplate, STORE_IMPORT_COLUMNS } from '../services/importer.js';
 
 const router = Router();
@@ -365,6 +367,7 @@ router.post('/:id/provider-links', requirePermission('stores', 'can_edit'), (req
   const backfilled = db.prepare(`UPDATE card_transactions SET store_id = ?
     WHERE LOWER(TRIM(store_name)) = LOWER(TRIM(?)) AND card_id IN (SELECT id FROM cards WHERE org_id = ?) AND (store_id IS NULL OR store_id != ?)`)
     .run(store.id, vendorName, req.user.org_id, store.id).changes;
+  clearStoreMatchCache(); invalidateAggregates(); // the link and the re-pointed charges change store totals
   res.json({ ok: true, backfilled });
 });
 
@@ -379,6 +382,7 @@ router.delete('/:id/provider-links/:linkId', requirePermission('stores', 'can_ed
   // belong to anymore — they go back to showing as unmatched, same as
   // before the link ever existed, until re-linked or fuzzy-matched.
   const unlinked = db.prepare(`UPDATE card_transactions SET store_id = NULL WHERE LOWER(TRIM(store_name)) = LOWER(TRIM(?)) AND store_id = ?`).run(link.vendor_name, store.id).changes;
+  clearStoreMatchCache();
   logAudit(req.user.org_id, req.user.id, 'unlink-provider-vendor', 'store', store.id, { vendor_name: link.vendor_name }, null, req.ip);
   res.json({ ok: true, unlinked });
 });

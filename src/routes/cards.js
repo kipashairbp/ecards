@@ -7,6 +7,7 @@ import { sendXlsx } from '../services/xlsx.js';
 import { syncOneCard, syncAllCards, lockApplicantCards } from '../services/cardSync.js';
 import { normalizePhone, isValidPhone } from '../utils/phone.js';
 import { getActiveSeasonId } from '../utils/formSchedule.js';
+import { memo } from '../services/aggCache.js';
 
 const router = Router();
 router.use(auth, requirePermission('cards'));
@@ -74,7 +75,7 @@ router.get('/by-shul', (req, res) => {
   const { season_id } = req.query;
   const seasonClause = season_id ? ' AND a2.season_id = ?' : '';
   const seasonParams = season_id ? [season_id] : [];
-  const rows = db.prepare(`
+  const rows = memo(`byShul:${req.user.org_id}:${season_id || ''}`, () => db.prepare(`
     SELECT s.id AS shul_id, s.name_en AS shul_name,
       COALESCE((SELECT SUM(a2.card_amount) FROM applicants a2
         WHERE a2.shul_id = s.id AND a2.approval_status = 'approved'${seasonClause}), 0) AS allocated,
@@ -85,7 +86,7 @@ router.get('/by-shul', (req, res) => {
     WHERE s.org_id = ?
     GROUP BY s.id
     HAVING allocated > 0
-    ORDER BY allocated DESC`).all(...seasonParams, req.user.org_id, ...seasonParams, req.user.org_id);
+    ORDER BY allocated DESC`).all(...seasonParams, req.user.org_id, ...seasonParams, req.user.org_id));
   res.json({ shuls: rows.map(r => ({ ...r, remaining: r.allocated - r.spent })) });
 });
 
@@ -98,7 +99,7 @@ router.get('/by-shul', (req, res) => {
 router.get('/by-store', (req, res) => {
   // Attributed (card) and unattributed (unlinked-customer / unmatched-card)
   // spend at the store are both real money the store honored — one ledger.
-  const rows = db.prepare(`SELECT s.id AS store_id, s.name AS store_name, COUNT(t.id) txn_count,
+  const rows = memo(`byStore:${req.user.org_id}`, () => db.prepare(`SELECT s.id AS store_id, s.name AS store_name, COUNT(t.id) txn_count,
       COALESCE(SUM(CASE WHEN t.type='refund' THEN -t.amount WHEN t.amount < 0 THEN -t.amount ELSE 0 END),0) total_purchases,
       COALESCE(SUM(CASE WHEN t.type='refund' THEN t.amount ELSE 0 END),0) total_refunds
     FROM stores s LEFT JOIN (
@@ -106,7 +107,7 @@ router.get('/by-store', (req, res) => {
       UNION ALL SELECT id, store_id, type, amount FROM unattributed_transactions WHERE org_id = ?
     ) t ON t.store_id = s.id
     WHERE s.org_id = ?
-    GROUP BY s.id ORDER BY total_purchases DESC`).all(req.user.org_id, req.user.org_id);
+    GROUP BY s.id ORDER BY total_purchases DESC`).all(req.user.org_id, req.user.org_id));
   res.json({ stores: rows });
 });
 
@@ -368,7 +369,7 @@ router.get('/transactions/all', (req, res) => {
   const offset = (Math.max(1, +page) - 1) * +pageSize;
   const rows = db.prepare(`SELECT t.*, a.first_name, a.last_name, c.card_number_masked
     FROM card_transactions t JOIN cards c ON c.id=t.card_id LEFT JOIN applicants a ON a.id=c.applicant_id
-    ${where} ORDER BY t.occurred_at DESC LIMIT ? OFFSET ?`).all(...params, +pageSize, offset);
+    ${where} ORDER BY t.occurred_at DESC, t.id DESC LIMIT ? OFFSET ?`).all(...params, +pageSize, offset); // id breaks ties so a page boundary never repeats or skips a charge
   res.json({ transactions: rows, total, page: +page, pageSize: +pageSize });
 });
 

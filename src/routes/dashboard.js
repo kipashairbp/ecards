@@ -3,7 +3,8 @@ import { db } from '../db.js';
 import { auth } from '../middleware/auth.js';
 import { getPermission, requirePermission } from '../middleware/permissions.js';
 import { getActiveSeasonId } from '../utils/formSchedule.js';
-import { unattributedNet, unattributedByStore } from '../services/spendTotals.js';
+import { unattributedNet, unattributedByStore, attributedNet } from '../services/spendTotals.js';
+import { memo } from '../services/aggCache.js';
 
 const router = Router();
 // Internal team only — every count below is computed org-wide (total shuls,
@@ -133,9 +134,12 @@ router.get('/stats', (req, res) => {
     // a purchase is negative, so it adds; a local 'load' row is positive
     // with no refund type, so it's ignored. disccardpromos' own seasonal
     // figure is net, and counting gross here read over by the refund total.
-    stats.topStores = db.prepare(`SELECT s.id, s.name, COALESCE(SUM(CASE WHEN t.type = 'refund' THEN -t.amount WHEN t.amount < 0 THEN -t.amount ELSE 0 END),0) total_purchases
-      FROM stores s LEFT JOIN card_transactions t ON t.store_id = s.id LEFT JOIN cards c2 ON c2.id = t.card_id
-      WHERE s.org_id = ?${storeSeasonClause} GROUP BY s.id ORDER BY total_purchases DESC LIMIT 5`).all(orgId, ...seasonParams).filter(s => s.total_purchases > 0);
+    // One grouped pass over the charges (cached briefly — see aggCache.js)
+    // instead of stores x charges x cards joined together; the per-store
+    // ranking itself is assembled below once unattributed spend is known.
+    const netByStore = memo(`dashNetByStore:${orgId}:${seasonId || ''}`, () => new Map(db.prepare(`SELECT t.store_id, COALESCE(SUM(CASE WHEN t.type = 'refund' THEN -t.amount WHEN t.amount < 0 THEN -t.amount ELSE 0 END),0) total
+      FROM card_transactions t JOIN cards c2 ON c2.id = t.card_id
+      WHERE t.store_id IS NOT NULL AND c2.org_id = ?${storeSeasonClause} GROUP BY t.store_id`).all(orgId, ...seasonParams).map(r => [r.store_id, r.total])));
     // Genuinely ALL real spend, not just spend attributable to a store
     // that's been added as a "participating store" record here — the
     // headline "Total spent across all participating stores" figure used
@@ -151,8 +155,7 @@ router.get('/stats', (req, res) => {
     // breakdown inherently can't include spend with no store to attribute
     // it to — but the headline total no longer requires that match.
     const storeCardSeasonClause = seasonId ? ' AND c2.season_id = ?' : '';
-    const attributedSpend = db.prepare(`SELECT COALESCE(SUM(CASE WHEN t.type = 'refund' THEN -t.amount WHEN t.amount < 0 THEN -t.amount ELSE 0 END),0) total
-      FROM card_transactions t JOIN cards c2 ON c2.id = t.card_id WHERE c2.org_id = ?${storeCardSeasonClause}`).get(orgId, ...seasonParams).total;
+    const attributedSpend = attributedNet(orgId, seasonId);
     // Plus spend with no card row here (unlinked disccardpromos customers,
     // unmatched multi-card charges) — see services/spendTotals.js. Without
     // it this total is lower than disccardpromos' own by exactly that much.
@@ -160,7 +163,13 @@ router.get('/stats', (req, res) => {
     stats.totalStoreSpend = Math.round((attributedSpend + unattributed.net) * 100) / 100;
     stats.unattributedSpend = unattributed.net;
     const extra = unattributedByStore(orgId, seasonId);
-    if (Object.keys(extra).length) stats.topStores = stats.topStores.map(s => ({ ...s, total_purchases: Math.round((s.total_purchases + (extra[s.id] || 0)) * 100) / 100 })).sort((a, b) => b.total_purchases - a.total_purchases);
+    // top 5 by (card spend + unattributed spend), ranked over ALL stores so a
+    // store whose unattributed spend lifts it into the top 5 is not cut off
+    stats.topStores = db.prepare('SELECT id, name FROM stores WHERE org_id = ?').all(orgId)
+      .map(s => ({ ...s, total_purchases: Math.round(((netByStore.get(s.id) || 0) + (extra[s.id] || 0)) * 100) / 100 }))
+      .filter(s => s.total_purchases > 0)
+      .sort((a, b) => b.total_purchases - a.total_purchases)
+      .slice(0, 5);
   }
   res.json({ stats });
 });

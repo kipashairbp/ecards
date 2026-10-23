@@ -2,6 +2,7 @@ import { db, uuid } from '../db.js';
 import * as giftcard from './giftcard.js';
 import { resolveStoreId } from './storeMatch.js';
 import { scheduleProviderEnforceSoon } from './providerEnforce.js';
+import { invalidateAggregates } from './aggCache.js';
 
 // Pulls fresh transaction history for the one applicant this card belongs
 // to and syncs everything for them in one shot — disccardpromos has no
@@ -15,6 +16,7 @@ export async function syncOneCard(orgId, card) {
   const applicant = db.prepare('SELECT * FROM applicants WHERE id = ?').get(card.applicant_id);
   if (!applicant) return 0;
   const { synced } = await syncApplicantCards(orgId, applicant);
+  invalidateAggregates(); // totals/dashboards re-read the new charges at once
   return synced;
 }
 
@@ -166,7 +168,17 @@ export function syncUnlinkedCustomers(orgId, indexes) {
 }
 
 // manual "Sync Now" button), which falls back to a live per-applicant GET.
-export async function syncApplicantCards(orgId, applicant, index) {
+//
+// ctx (optional, supplied by syncAllCards — see its comment): { knownTxnIds,
+// batch }. knownTxnIds is the set of provider charge ids ALREADY held in
+// card_transactions, loaded once per sweep: a charge in it is skipped outright
+// (no store lookup, no payload serialising, no insert attempt) — at tens of
+// thousands of charges re-checked every sweep that was most of its cost and
+// froze the whole server while it ran. batch=true skips rewriting a card whose
+// balance did not change and leaves the last_synced_at touch to one statement
+// at the end of the sweep. Left empty (the manual "Sync Now" click) it behaves
+// exactly as before.
+export async function syncApplicantCards(orgId, applicant, index, ctx = {}) {
   if (!applicant.provider_account_id || applicant.provider_exempt) return { discovered: 0, removed: 0, synced: 0, unattributed: 0, malformed: 0, fetchFailed: false };
   let customer;
   if (index) {
@@ -191,7 +203,7 @@ export async function syncApplicantCards(orgId, applicant, index) {
   }
   if (!customer) return { discovered: 0, removed: 0, synced: 0, unattributed: 0, malformed: 0, fetchFailed: false };
   const remoteMasked = new Set(Array.isArray(customer.active_cards) ? customer.active_cards : []);
-  const localActive = db.prepare(`SELECT id, card_number_masked FROM cards WHERE applicant_id = ? AND status IN ('assigned','activated')`).all(applicant.id);
+  const localActive = db.prepare(`SELECT id, card_number_masked, amount FROM cards WHERE applicant_id = ? AND status IN ('assigned','activated')`).all(applicant.id);
   // Matched by trailing digits, not exact string equality. routes/cards.js's
   // /assign only gets disccardpromos' OWN masked format when their PATCH
   // response happens to already reflect the just-added card in active_cards
@@ -241,7 +253,12 @@ export async function syncApplicantCards(orgId, applicant, index) {
   // forever after, regardless of real spend-down or later top-ups.
   if (localActive.length) {
     const updateAmount = db.prepare(`UPDATE cards SET amount = ? WHERE id = ?`);
-    for (const local of localActive) updateAmount.run(balance, local.id);
+    for (const local of localActive) {
+      // Unchanged balance: nothing to write (a sweep used to rewrite every card
+      // every time — thousands of commits for no change at all).
+      if (ctx.batch && local.amount != null && Math.abs(Number(local.amount) - balance) < 0.005) continue;
+      updateAmount.run(balance, local.id);
+    }
   }
 
   // Every local card this applicant has (including one just discovered
@@ -280,7 +297,10 @@ export async function syncApplicantCards(orgId, applicant, index) {
     VALUES (?,?,?,?,?,?,?,?,?,?)`);
   const dropUnattributed = db.prepare(`DELETE FROM unattributed_transactions WHERE org_id = ? AND provider_txn_id = ?`);
   let malformed = 0;
+  const known = ctx.knownTxnIds;
   for (const t of txns) {
+    // Already stored as a real card charge: nothing to do (see ctx above).
+    if (known) { const tid = t && (t.id ?? t.transaction_id); if (tid != null && known.has(cleanProviderId(tid))) continue; }
     // Each entry is handled in its own try/catch — one transaction whose
     // shape doesn't match anything guessed below (an older/legacy entry
     // kind, a refund/adjustment shape we haven't seen yet, ...) must never
@@ -369,6 +389,7 @@ export async function syncApplicantCards(orgId, applicant, index) {
       const storedAmount = isRefund ? Math.abs(rawAmount) : -Math.abs(rawAmount);
       const info = insert.run(uuid(), cardId, providerTxnId, type, storedAmount, t.balance_after ?? null, storeName, resolveStoreId(orgId, storeName), occurredAt, JSON.stringify(t));
       if (info.changes) synced++;
+      if (known) known.add(cleanProviderId(providerTxnId));
       // Once a transaction is attributed to a card it must not ALSO sit in
       // unattributed_transactions (recorded earlier while this customer was
       // not yet linked to any applicant — see syncUnlinkedCustomers), or
@@ -379,7 +400,7 @@ export async function syncApplicantCards(orgId, applicant, index) {
       console.error(`[cardSync] failed to insert a transaction for customer ${customer.id ?? applicant.external_id}:`, e.message, '— raw entry:', JSON.stringify(t));
     }
   }
-  if (allLocal.length) db.prepare(`UPDATE cards SET last_synced_at = datetime('now') WHERE applicant_id = ?`).run(applicant.id);
+  if (allLocal.length && !ctx.batch) db.prepare(`UPDATE cards SET last_synced_at = datetime('now') WHERE applicant_id = ?`).run(applicant.id);
 
   return { discovered, removed, synced, unattributed, malformed, fetchFailed: false };
 }
@@ -411,20 +432,33 @@ export async function syncAllCards(orgId) {
     return indexBySeason.get(seasonId);
   };
   let totalSynced = 0, cardsDiscovered = 0, cardsRemoved = 0, unattributed = 0, malformed = 0, failed = 0;
+  // PERFORMANCE: at production size a sweep used to take ~16s and freeze every
+  // request for most of it. (1) every charge already stored is skipped via one
+  // in-memory set; (2) unchanged cards are not rewritten; (3) the loop hands
+  // control back to the event loop every few applicants, so page requests are
+  // answered between chunks instead of waiting out the whole sweep. No database
+  // transaction is held open across those pauses.
+  const ctx = { batch: true, knownTxnIds: new Set(db.prepare(`SELECT provider_txn_id id FROM card_transactions WHERE provider_txn_id IS NOT NULL`).all().map(r => cleanProviderId(r.id))) };
+  const yieldNow = () => new Promise(resolve => setImmediate(resolve));
+  let sinceYield = 0;
   for (const applicant of applicants) {
     try {
       const index = await getIndex(applicant.season_id);
-      const { discovered, removed, synced, unattributed: u, malformed: m, fetchFailed } = await syncApplicantCards(orgId, applicant, index);
+      const { discovered, removed, synced, unattributed: u, malformed: m, fetchFailed } = await syncApplicantCards(orgId, applicant, index, ctx);
       cardsDiscovered += discovered; cardsRemoved += removed; totalSynced += synced; unattributed += u; malformed += m;
       if (fetchFailed) failed++;
     } catch (e) { console.error('[cardSync] sync failed for applicant', applicant.id, e.message); failed++; }
+    if (++sinceYield >= 25) { sinceYield = 0; await yieldNow(); }
   }
+  // one statement instead of one commit per applicant
+  db.prepare(`UPDATE cards SET last_synced_at = datetime('now') WHERE applicant_id IN (SELECT id FROM applicants WHERE org_id = ? AND provider_account_id IS NOT NULL AND provider_exempt = 0)`).run(orgId);
   // Same customer lists, one more pass: everyone on disccardpromos that no
   // applicant here points at. (Seasons whose list pull failed contribute
   // nothing — their index is null.)
   let unlinked = { unlinkedCustomers: 0, unlinkedTransactions: 0 };
   try { unlinked = syncUnlinkedCustomers(orgId, await Promise.all([...indexBySeason.values()])); }
   catch (e) { console.error('[cardSync] unlinked-customer pass failed:', e.message); }
+  invalidateAggregates();
   const cardsChecked = db.prepare(`SELECT COUNT(*) c FROM cards WHERE org_id = ? AND status IN ('assigned','activated')`).get(orgId).c;
   // When the ONE bulk list pull for a season fails, every applicant in it
   // falls back to its own live per-applicant GET — for an org with many real

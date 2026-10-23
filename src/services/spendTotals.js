@@ -8,6 +8,7 @@
 // no card to carry a season); a season without dates, or no season, means
 // everything.
 import { db } from '../db.js';
+import { memo } from './aggCache.js';
 
 const NET = `CASE WHEN type = 'refund' THEN -amount WHEN amount < 0 THEN -amount ELSE 0 END`;
 
@@ -42,4 +43,16 @@ export function unattributedByStore(orgId, seasonId = null) {
   sql += windowClause(orgId, seasonId, params);
   sql += ' GROUP BY store_id';
   return Object.fromEntries(db.prepare(sql).all(...params).map(r => [r.store_id, Math.round((Number(r.net) || 0) * 100) / 100]));
+}
+
+// Net spend on cards that exist here (card_transactions), for an org and
+// optionally one season (through the card the charge was made on). A
+// whole-table scan, so it is cached briefly (see aggCache.js — every sync and
+// audited change drops the cache). Total spent everywhere = this + unattributedNet().
+export function attributedNet(orgId, seasonId) {
+  return memo(`attributedNet:${orgId}:${seasonId || ''}`, () => {
+    const r = db.prepare(`SELECT COALESCE(SUM(CASE WHEN t.type = 'refund' THEN -t.amount WHEN t.amount < 0 THEN -t.amount ELSE 0 END), 0) net
+      FROM card_transactions t JOIN cards c ON c.id = t.card_id WHERE c.org_id = ?${seasonId ? ' AND c.season_id = ?' : ''}`).get(orgId, ...(seasonId ? [seasonId] : []));
+    return Math.round((Number(r.net) || 0) * 100) / 100;
+  });
 }
